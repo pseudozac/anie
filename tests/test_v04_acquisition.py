@@ -64,6 +64,30 @@ class TestOfflineBootstrap(unittest.TestCase):
         self.assertEqual(chosen.origin, "synthetic:rdap-bootstrap")
         self.assertEqual(routes.route_count, 2)
 
+    def test_real_iana_style_https_http_alternatives_use_https_only(self):
+        # IANA IPv4 bootstrap has historically paired these ARIN URLs.
+        fixture = self.registry([
+            [["8.0.0.0/8"], [
+                "https://rdap.arin.net/registry/",
+                "http://rdap.arin.net/registry/",
+            ]]
+        ])
+        selected = OfflineRdapBootstrap(fixture, family=4).select("8.8.8.8")
+        self.assertEqual(selected.base_urls, ("https://rdap.arin.net/registry/",))
+        bad = self.registry([
+            [["8.0.0.0/8"], ["http://rdap.arin.net/registry/"]]
+        ])
+        with self.assertRaisesRegex(ValueError, "lacks HTTPS"):
+            OfflineRdapBootstrap(bad, family=4)
+        bad = self.registry([
+            [["8.0.0.0/8"], [
+                "https://rdap.arin.net/registry/",
+                "http://different-rdap.example.org/registry/",
+            ]]
+        ])
+        with self.assertRaisesRegex(ValueError, "unpaired HTTP"):
+            OfflineRdapBootstrap(bad, family=4)
+
     def test_unmatched_fails_closed_without_fallback(self):
         routes = OfflineRdapBootstrap(self.registry(), family=4)
         self.assertIsNone(routes.select("192.0.2.1"))

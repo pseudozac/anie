@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.4.1 — exact-scope manual DNS pilot preflight (2026-11-12)
+
+- Fix compatibility with official IANA-style RDAP bootstrap records containing matched HTTPS/HTTP alternatives; never select HTTP.
+- Add pure RFC 8484 DNS wire A/AAAA query and fail-closed response handling with negative SOA proof and distinct errors.
+- Add manually opt-in, one-shot HTTPS DoH adapter for `example.com` A/AAAA only; two requests max per invocation, TLS verified, socket IP pinned and public, no redirects/retries/storage/publication. CI dry-run only.
+- Add adversarial offline and mocked transport tests and documented real-world pilot terms/scope.
+
+
 ## 0.4.0 — offline acquisition and cache planning (Phase A, 2026-11-12)
 
 - Parse bounded synthetic IANA-style RDAP IPv4/IPv6 bootstrap registries with longest-prefix matching and untrusted URL hygiene.

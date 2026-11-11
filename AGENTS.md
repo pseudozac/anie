@@ -73,3 +73,7 @@ For `src/anie/signed_release.py`, read [release trust design](docs/RELEASE_TRUST
 ## v0.4 acquisition planning boundary
 
 `src/anie/rdap_bootstrap.py` parses **offline IANA-format fixtures**; the returned service URLs are data and are not authorization to contact them. `src/anie/offline_scheduler.py` accepts `OfflineCollector` (and therefore `FixtureTransport`) only. It caches synthetic responses without modifying historical observation timestamps or evidence IDs. Before changing the offline acquisition engine, read [v0.4 design and NO-GO](docs/ACQUISITION_V04.md) and run `python tools/offline_acquisition_report.py`. No live transport implementation, socket calls, scanning or hosted jobs may be enabled without a separate approved operational gate.
+
+## Real-world DNS pilot exception — exact manual scope only
+
+`src/anie/live_dns_pilot.py` is an explicitly scoped **operator-invoked** HTTPS client for `example.com` A/AAAA only, via fixed Cloudflare DoH endpoint, maximum two GETs per invocation. It is **never** run in CI, and cannot be called by other ANIE collections or models. `python tools/live_dns_pilot.py` is dry-run by default. Manual `--execute` plus exact `--ack` phrase is mandatory and must follow [the approved pilot scope and provider terms](docs/REAL_WORLD_PILOT.md). Never enable scheduled use, arbitrary targets, provider crawling, real-data publication, network access in tests or direct AEGIS changes without separate review and authorization. This limited manual pilot is not approval for general live collection.

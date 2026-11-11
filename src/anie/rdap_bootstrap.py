@@ -91,7 +91,21 @@ class OfflineRdapBootstrap:
             if (not isinstance(prefixes, list) or not 1 <= len(prefixes) <= MAX_PREFIXES_PER_SERVICE
                     or not isinstance(urls, list) or not 1 <= len(urls) <= MAX_URLS_PER_SERVICE):
                 raise ValueError("invalid RDAP prefix or URL list")
-            normalized_urls = tuple(_safe_base_url(url) for url in urls)
+            # RFC 9224 allows HTTP alternatives in the IANA registry.
+            # Never select or return HTTP: accept only when its exact HTTPS
+            # equivalent is present, and otherwise reject the service.
+            if any(not isinstance(url, str) for url in urls):
+                raise ValueError("invalid RDAP bootstrap URL")
+            https_urls = [url for url in urls if url.startswith("https://")]
+            if not https_urls:
+                raise ValueError("RDAP service lacks HTTPS endpoint")
+            for url in urls:
+                if url.startswith("http://"):
+                    if "https://" + url[len("http://"):] not in https_urls:
+                        raise ValueError("unpaired HTTP RDAP service URL")
+                elif not url.startswith("https://"):
+                    raise ValueError("unexpected RDAP service URL scheme")
+            normalized_urls = tuple(_safe_base_url(url) for url in https_urls)
             if len(set(normalized_urls)) != len(normalized_urls):
                 raise ValueError("duplicate RDAP service URL")
             for prefix in prefixes:
