@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "anie-intelligence"
+version = "0.1.0"
+description = "Offline-first, evidence-linked, AI-native internet intelligence research engine"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [{name = "ANIE Contributors"}]
+keywords = ["cybersecurity", "internet-measurement", "osint", "anomaly-detection"]
+dependencies = []
+
+[project.scripts]
+anie = "anie.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

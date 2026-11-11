@@ -1,0 +1,172 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:anie:intelligence:v1",
+  "title": "ANIE v1 evidence-linked intelligence record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "indicator",
+    "finding",
+    "assessment",
+    "features",
+    "evidence_ids",
+    "last_observed_at",
+    "assessed_at",
+    "recheck_required",
+    "synthetic"
+  ],
+  "properties": {
+    "schema": {
+      "const": "anie.intelligence.v1"
+    },
+    "indicator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "value"
+      ],
+      "properties": {
+        "type": {
+          "enum": [
+            "ip",
+            "domain"
+          ]
+        },
+        "value": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 253
+        }
+      }
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "statement",
+        "classification",
+        "maliciousness"
+      ],
+      "properties": {
+        "type": {
+          "enum": [
+            "dns_infrastructure_change",
+            "dns_observation_context",
+            "registration_and_reverse_dns_context"
+          ]
+        },
+        "statement": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "classification": {
+          "const": "context"
+        },
+        "maliciousness": {
+          "const": "undetermined"
+        }
+      }
+    },
+    "assessment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "freshness",
+        "confidence",
+        "ai"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "evidence_observed",
+            "insufficient_history"
+          ]
+        },
+        "freshness": {
+          "enum": [
+            "recent",
+            "stale"
+          ]
+        },
+        "confidence": {
+          "type": "null"
+        },
+        "ai": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "model_version",
+            "status",
+            "novelty_distance",
+            "threshold",
+            "baseline_size"
+          ],
+          "properties": {
+            "model_version": {
+              "const": "anie.robust-knn-novelty.v0.1"
+            },
+            "status": {
+              "enum": [
+                "outlier",
+                "within_cohort",
+                "insufficient_history",
+                "insufficient_cohort",
+                "not_applicable"
+              ]
+            },
+            "novelty_distance": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "threshold": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "baseline_size": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        }
+      }
+    },
+    "features": {
+      "type": "object",
+      "minProperties": 1
+    },
+    "evidence_ids": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^obs_[0-9a-f]{64}$"
+      }
+    },
+    "last_observed_at": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "assessed_at": {
+      "type": "string"
+    },
+    "recheck_required": {
+      "type": "boolean"
+    },
+    "synthetic": {
+      "const": true
+    }
+  }
+}

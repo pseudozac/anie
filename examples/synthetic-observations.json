@@ -1,0 +1,44 @@
+[
+  {
+    "subject": "baseline-01.example.test",
+    "kind": "dns_a",
+    "observed_at": "2026-11-09T08:00:00Z",
+    "values": [
+      "192.0.2.1"
+    ],
+    "status": "ok",
+    "source_id": "synthetic:demo",
+    "method": "synthetic",
+    "synthetic": true,
+    "ttl_seconds": 300,
+    "error_code": null
+  },
+  {
+    "subject": "baseline-01.example.test",
+    "kind": "dns_a",
+    "observed_at": "2026-11-10T08:00:00Z",
+    "values": [
+      "192.0.2.1"
+    ],
+    "status": "ok",
+    "source_id": "synthetic:demo",
+    "method": "synthetic",
+    "synthetic": true,
+    "ttl_seconds": 300,
+    "error_code": null
+  },
+  {
+    "subject": "baseline-01.example.test",
+    "kind": "dns_a",
+    "observed_at": "2026-11-11T08:00:00Z",
+    "values": [
+      "192.0.2.1"
+    ],
+    "status": "ok",
+    "source_id": "synthetic:demo",
+    "method": "synthetic",
+    "synthetic": true,
+    "ttl_seconds": 300,
+    "error_code": null
+  }
+]
