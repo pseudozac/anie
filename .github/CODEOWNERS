@@ -1,0 +1,8 @@
+# Review ownership; actual enforcement requires branch protection settings.
+* @pseudozac
+/AGENTS.md @pseudozac
+/.github/ @pseudozac
+/.agents/ @pseudozac
+/schemas/ @pseudozac
+/src/anie/publish.py @pseudozac
+/src/anie/ml.py @pseudozac

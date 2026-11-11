@@ -1,0 +1,35 @@
+name: Feature or research proposal
+description: Design an intelligence feature, model evaluation or safe future collector.
+title: "[Proposal] "
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: Research question and user benefit
+      description: What intelligence question does this address?
+    validations:
+      required: true
+  - type: textarea
+    id: contract
+    attributes:
+      label: Evidence and output contract
+      description: Define observations, AI inferences, uncertainty and consumer compatibility.
+    validations:
+      required: true
+  - type: dropdown
+    id: risk
+    attributes:
+      label: Risk
+      options:
+        - Low — offline code or docs
+        - Medium — model, schema or dependencies
+        - High — network, real data, cloud or publication
+    validations:
+      required: true
+  - type: textarea
+    id: controls
+    attributes:
+      label: Tests, authorization, privacy, licensing and cost
+      description: A proposal does not grant permission to perform live collection.
+    validations:
+      required: true

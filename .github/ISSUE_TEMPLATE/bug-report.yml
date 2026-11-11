@@ -1,0 +1,27 @@
+name: Bug report (synthetic/offline)
+description: Report a reproducible prototype defect without disclosing real IOC or private data.
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: "Do not include credentials, real targets, customer data, browser traces or security vulnerabilities. See SECURITY.md."
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed and expected behavior
+      placeholder: "What did you observe and what did you expect?"
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Synthetic offline reproduction
+      description: Minimal code or commands using test-only domains and reserved addresses.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: ANIE version or commit
+    validations:
+      required: true
