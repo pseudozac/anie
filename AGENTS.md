@@ -65,3 +65,7 @@ See `docs/RELEASE_PROCESS.md` before proposing tags/releases, and `SECURITY.md` 
 ## Model benchmark gate
 
 Before modifying `src/anie/ml.py`, `src/anie/temporal.py`, novelty labels, thresholds or user-facing model claims, read [Temporal Benchmark methodology](docs/TEMPORAL_BENCHMARK.md), run `PYTHONPATH=src python tools/benchmark_report.py --check benchmarks/expected_snapshot.json`, and compare against all non-ML baselines. Do not tune to the fixed synthetic holdout or silently replace the snapshot. Preserve independent prospective validation and abstention. The benchmark never provides evidence of real-world maliciousness.
+
+## Synthetic cryptographic release verification
+
+For `src/anie/signed_release.py`, read [release trust design](docs/RELEASE_TRUST_DESIGN.md), test with `python -m pip install -e '.[signing]'` and the offline signed-release demo. **Never commit, export or provision an operational signing key**, substitute untrusted artifact-bundled keys for operator-held trust roots, or call a valid signature evidence of a real-world publisher identity. Preserve manual source/data approval gates.

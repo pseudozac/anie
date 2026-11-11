@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.3.0 — offline synthetic release signature verification (2026-11-12)
+
+- Add optional PyCA cryptography Ed25519 signature verification; core runtime remains standard-library only.
+- Domain-separated authenticated payload binds manifest hash, source commit, repository, builder, release sequence and expiry.
+- Operator-pinned key, local revocation and validity checks, monotonic sequence and tamper/replay regression tests.
+- Offline ephemeral signing demonstration; no production key, authenticated GitHub identity, public release, AEGIS modification or live data.
+
+
 - Offline synthetic-only consumer manifest pin verification and provenance metadata checks (not publisher authentication).
 - Authenticated release, signing, licensing, cost, AEGIS rollback and revocation design; no real-data publication.
 

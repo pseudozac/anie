@@ -31,7 +31,9 @@ jobs:
       - name: Compile Python
         run: python -m compileall -q src tests tools
       - name: Install local package
-        run: python -m pip install --disable-pip-version-check -e .
+        run: python -m pip install --disable-pip-version-check -e '.[signing]'
+      - name: Check Ed25519 dependency is available
+        run: python -c "from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey; print('Ed25519 available')"
       - name: Offline unit tests
         run: python -m unittest discover -s tests -v
       - name: Synthetic replay and consumer verification
@@ -40,5 +42,6 @@ jobs:
           python -m anie verify --dir ./local-data/ci/publication
           python examples/aegis_readonly_consumer.py ./local-data/ci/publication
           python examples/offline_collection_demo.py
+          python examples/offline_signed_release_demo.py
       - name: Synthetic temporal benchmark report (training past only)
         run: python tools/benchmark_report.py --check benchmarks/expected_snapshot.json
