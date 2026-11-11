@@ -94,3 +94,13 @@ This is **not yet an AEGIS API integration**; it demonstrates the independent co
 - [Contributing](CONTRIBUTING.md), [community conduct](CODE_OF_CONDUCT.md), [security](SECURITY.md) and [changelog](CHANGELOG.md) apply to the public project.
 
 Before opening a PR, run `PYTHONPATH=src python -m unittest discover -s tests -v` and `python tools/check_repo.py`. The public repository includes **only offline/synthetic collection** at this stage. No workflow publishes datasets, provisions cloud resources or automatically deploys services.
+
+## Synthetic temporal ML benchmark
+
+ANIE includes a **chronological, replayable evaluation** comparing its unsupervised kNN novelty distance with two no-ML baselines on fabricated infrastructure patterns. It reports precision, recall, false alarms, abstentions and Python memory/timing diagnostics. Synthetic novelty is **not** evidence of attack or maliciousness.
+
+```bash
+PYTHONPATH=src python tools/benchmark_report.py --print-snapshot
+```
+
+See [Temporal Benchmark methodology](docs/TEMPORAL_BENCHMARK.md). The committed deterministic reference in `benchmarks/expected_snapshot.json` is checked by CI once established. This is a fixed synthetic time-split test, not a real-world accuracy claim.
