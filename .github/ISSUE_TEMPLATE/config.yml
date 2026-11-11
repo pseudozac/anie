@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security reporting policy
+    url: https://github.com/pseudozac/anie/blob/main/SECURITY.md
+    about: Do not post vulnerabilities in public issues; follow private disclosure guidance.
+  - name: Engineering workflow
+    url: https://github.com/pseudozac/anie/blob/main/docs/DEVELOPMENT_WORKFLOW.md
+    about: Understand authorization and testing gates before requesting changes.

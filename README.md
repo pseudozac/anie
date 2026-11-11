@@ -76,3 +76,12 @@ PYTHONPATH=src python examples/aegis_readonly_consumer.py local-data/demo/public
 ```
 
 This is **not yet an AEGIS API integration**; it demonstrates the independent consumer contract without touching private cases or existing correlation rules.
+
+## Repository development and governance
+
+- [Agent instructions](AGENTS.md) and [specialized agents](.github/agents/) help contributors and coding agents follow the same evidence-first boundaries.
+- [Task-specific Agent Skills](.agents/skills/) cover observation contracts, model evaluation, collector threat modeling, and releases.
+- [Development workflow](docs/DEVELOPMENT_WORKFLOW.md), [threat model](docs/THREAT_MODEL.md), [public data policy](docs/DATA_PUBLICATION_POLICY.md) and [release process](docs/RELEASE_PROCESS.md) document mandatory review gates.
+- [Contributing](CONTRIBUTING.md), [community conduct](CODE_OF_CONDUCT.md), [security](SECURITY.md) and [changelog](CHANGELOG.md) apply to the public project.
+
+Before opening a PR, run `PYTHONPATH=src python -m unittest discover -s tests -v` and `python tools/check_repo.py`. The public repository includes **only offline/synthetic collection** at this stage. No workflow publishes datasets, provisions cloud resources or automatically deploys services.

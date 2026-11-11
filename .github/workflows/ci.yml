@@ -5,23 +5,37 @@ on:
     branches: [main]
 permissions:
   contents: read
+concurrency:
+  group: anie-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   test:
+    name: offline-python-${{ matrix.python-version }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.10", "3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout reviewed candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install (no runtime dependencies)
-        run: python -m pip install -e .
-      - name: Offline tests
+      - name: Repository governance checks
+        run: python tools/check_repo.py
+      - name: Compile Python
+        run: python -m compileall -q src tests tools
+      - name: Install local package
+        run: python -m pip install --disable-pip-version-check -e .
+      - name: Offline unit tests
         run: python -m unittest discover -s tests -v
-      - name: Synthetic end-to-end demonstration
+      - name: Synthetic replay and consumer verification
         run: |
           python -m anie demo --out ./local-data/ci
           python -m anie verify --dir ./local-data/ci/publication
+          python examples/aegis_readonly_consumer.py ./local-data/ci/publication
