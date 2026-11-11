@@ -6,7 +6,7 @@ Read this file before editing any code. It is authoritative for this repository'
 
 ANIE is an independent **AI-native internet intelligence producer**. It aims to create evidence-linked, temporal, machine-readable intelligence that future security platforms, including private AEGIS, can consume. ANIE's public data must never be derived from private AEGIS investigations, SNOOP browser observations, customer telemetry, credentials, or user browsing history without a separately documented authorization and declassification review.
 
-**v0.1 is an offline, synthetic-only research prototype.** It has no live collectors, network scanning, web crawler, authenticated data pipeline, cloud deployment, or approved real-data publication. Do not imply otherwise. No autonomous cloud or external network activity is authorized by this repository.
+**v0.2 is an offline, synthetic-only research prototype.** It has fixture-only DNS/RDAP parsers and policy predicates, but no live collectors, network scanning, web crawler, authenticated data pipeline, cloud deployment, or approved real-data publication. Do not imply otherwise. No autonomous cloud or external network activity is authorized by this repository.
 
 ## Non-negotiable invariants
 
@@ -22,6 +22,7 @@ ANIE is an independent **AI-native internet intelligence producer**. It aims to 
 ## Repository map
 
 - `src/anie/observations.py`: normalized observation contract; `collectors.py` is synthetic parsers only
+- `src/anie/collection_policy.py`: exact offline scope/budget and simulated destination checks; `collection_pipeline.py`: synthetic fixture-only parsing; `collection_ledger.py`: independent event history
 - `src/anie/store.py`: append-only SQLite prototype; `temporal.py`: bounded temporal features
 - `src/anie/ml.py`: unsupervised novelty *distance*; `engine.py`: evidence-linked records
 - `src/anie/publish.py`: local synthetic-only JSONL/gzip manifest and integrity verification
@@ -39,6 +40,7 @@ PYTHONPATH=src python -m unittest discover -s tests -v
 PYTHONPATH=src python -m anie demo --out ./local-data/demo
 PYTHONPATH=src python -m anie verify --dir ./local-data/demo/publication
 python tools/check_repo.py
+PYTHONPATH=src python examples/offline_collection_demo.py
 ```
 
 The demo output directory must be new/empty. Do not commit `local-data/`. CI may use `python -m pip install -e .`, but it must not require commercial APIs or secrets.

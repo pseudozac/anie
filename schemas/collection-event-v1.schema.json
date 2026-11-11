@@ -1,0 +1,146 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:anie:collection-event:v1",
+  "title": "ANIE offline collection event v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "request",
+    "response_code",
+    "observation",
+    "raw_sha256",
+    "source_id"
+  ],
+  "properties": {
+    "schema": {
+      "const": "anie.collection-event.v1"
+    },
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "subject",
+        "observed_at"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "dns_a",
+            "dns_aaaa",
+            "dns_ptr",
+            "rdap_network"
+          ]
+        },
+        "subject": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 253
+        },
+        "observed_at": {
+          "type": "string",
+          "minLength": 20,
+          "maxLength": 30
+        }
+      }
+    },
+    "response_code": {
+      "enum": [
+        "ANSWER",
+        "NXDOMAIN",
+        "NODATA",
+        "SERVFAIL",
+        "REFUSED",
+        "NOTIMP",
+        "FORMERR",
+        "TIMEOUT",
+        "RATE_LIMITED",
+        "UNAVAILABLE",
+        "HTTP_200",
+        "HTTP_404",
+        "HTTP_429",
+        "HTTP_5XX",
+        "HTTP_ERROR",
+        "INVALID_RESPONSE"
+      ]
+    },
+    "observation": {
+      "type": "object",
+      "required": [
+        "observation_id",
+        "subject",
+        "kind",
+        "observed_at",
+        "values",
+        "status",
+        "source_id",
+        "method",
+        "synthetic",
+        "ttl_seconds",
+        "error_code"
+      ],
+      "properties": {
+        "observation_id": {
+          "type": "string",
+          "pattern": "^obs_[0-9a-f]{64}$"
+        },
+        "subject": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "observed_at": {
+          "type": "string"
+        },
+        "values": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "string"
+          }
+        },
+        "status": {
+          "enum": [
+            "ok",
+            "empty",
+            "error"
+          ]
+        },
+        "source_id": {
+          "type": "string"
+        },
+        "method": {
+          "const": "synthetic"
+        },
+        "synthetic": {
+          "const": true
+        },
+        "ttl_seconds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 604800
+        },
+        "error_code": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "raw_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "source_id": {
+      "type": "string",
+      "pattern": "^synthetic:"
+    }
+  }
+}
