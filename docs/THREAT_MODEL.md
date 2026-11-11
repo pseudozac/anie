@@ -32,3 +32,7 @@ v0.2 is offline, synthetic only. It adds strict synthetic fixture parser, explic
 Before adding *any* live collection: document source and terms, target scope, geographies if relevant, host/path permissions, response rate, consent, identity, egress isolation, IP rebinding defenses, budget, retention, complaints/opt-out and test evidence. Any high-impact response or active probing requires a separate explicit authorization.
 
 Before connecting AEGIS: review immutable dataset provenance, verification keys, schema compatibility, unsafe/unexpected URLs, resource bounds, fail-closed behavior and the consumer's local policy. AEGIS must never interpret an ANIE model anomaly as an automatic customer verdict or response authorization.
+
+## v0.4 offline acquisition design limitations
+
+`OfflineRdapBootstrap` parses untrusted *synthetic* IANA-style bootstrap metadata with bounded size and HTTPS-only URL syntax checks; it cannot authenticate a registry feed, resolve a hostname or validate the socket destination. `OfflineCollectionScheduler` enforces local cache and synthetic query budgets but is not a durable cross-worker rate limiter, a network egress sandbox or a production DNS resolver. Future live activation requires separately documented permitted endpoints, source terms, real TLS and IP routing controls, rate compliance, opt-out, retention, and an explicit operational decision. See [v0.4 design](ACQUISITION_V04.md).

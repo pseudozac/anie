@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.4.0 — offline acquisition and cache planning (Phase A, 2026-11-12)
+
+- Parse bounded synthetic IANA-style RDAP IPv4/IPv6 bootstrap registries with longest-prefix matching and untrusted URL hygiene.
+- Add deterministic TTL-aware offline DNS/RDAP scheduler with per-target/global quotas, negative/failure cooldown semantics, bounded memory and persistent append-only evidence snapshots.
+- Preserve original timestamps and evidence IDs on cache hits; no live socket clients, real data, or network publication.
+- Add adversarial fixtures, resource-count reporting and go/no-go acquisition design.
+
+
 ## 0.3.0 — offline synthetic release signature verification (2026-11-12)
 
 - Add optional PyCA cryptography Ed25519 signature verification; core runtime remains standard-library only.

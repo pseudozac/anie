@@ -6,7 +6,7 @@ Read this file before editing any code. It is authoritative for this repository'
 
 ANIE is an independent **AI-native internet intelligence producer**. It aims to create evidence-linked, temporal, machine-readable intelligence that future security platforms, including private AEGIS, can consume. ANIE's public data must never be derived from private AEGIS investigations, SNOOP browser observations, customer telemetry, credentials, or user browsing history without a separately documented authorization and declassification review.
 
-**v0.2 is an offline, synthetic-only research prototype.** It has fixture-only DNS/RDAP parsers and policy predicates, but no live collectors, network scanning, web crawler, authenticated data pipeline, cloud deployment, or approved real-data publication. Do not imply otherwise. No autonomous cloud or external network activity is authorized by this repository.
+**v0.4 remains an offline, synthetic-only research prototype.** It has fixture-only DNS/RDAP parsers and policy predicates, but no live collectors, network scanning, web crawler, authenticated data pipeline, cloud deployment, or approved real-data publication. Do not imply otherwise. No autonomous cloud or external network activity is authorized by this repository.
 
 ## Non-negotiable invariants
 
@@ -69,3 +69,7 @@ Before modifying `src/anie/ml.py`, `src/anie/temporal.py`, novelty labels, thres
 ## Synthetic cryptographic release verification
 
 For `src/anie/signed_release.py`, read [release trust design](docs/RELEASE_TRUST_DESIGN.md), test with `python -m pip install -e '.[signing]'` and the offline signed-release demo. **Never commit, export or provision an operational signing key**, substitute untrusted artifact-bundled keys for operator-held trust roots, or call a valid signature evidence of a real-world publisher identity. Preserve manual source/data approval gates.
+
+## v0.4 acquisition planning boundary
+
+`src/anie/rdap_bootstrap.py` parses **offline IANA-format fixtures**; the returned service URLs are data and are not authorization to contact them. `src/anie/offline_scheduler.py` accepts `OfflineCollector` (and therefore `FixtureTransport`) only. It caches synthetic responses without modifying historical observation timestamps or evidence IDs. Before changing the offline acquisition engine, read [v0.4 design and NO-GO](docs/ACQUISITION_V04.md) and run `python tools/offline_acquisition_report.py`. No live transport implementation, socket calls, scanning or hosted jobs may be enabled without a separate approved operational gate.

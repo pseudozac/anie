@@ -26,3 +26,7 @@ The v0.2 synthetic fixture-only parser and policy are implemented as a safety ba
 ## 2026-11-11 — temporal ML baseline validation
 
 The fixed-seed synthetic time-split benchmark evaluates existing kNN novelty against a naive any-change rule and an explicit deterministic large-change/fanout rule. It tracks abstention, false alarms and no-future-training proof and reports resource diagnostics. The benchmark is not real-world model validation and does not infer threat intent or domain ownership. See [TEMPORAL_BENCHMARK.md](TEMPORAL_BENCHMARK.md).
+
+## v0.4 offline acquisition Phase A
+
+Implemented bounded IANA-style RDAP bootstrap fixture parsing and deterministic in-memory query caches that preserve append-only evidence in SQLite. No internet contact, real-world telemetry or licensing clearance. See [acquisition design and remaining live-pilot gates](ACQUISITION_V04.md). Issue #12 remains open.
