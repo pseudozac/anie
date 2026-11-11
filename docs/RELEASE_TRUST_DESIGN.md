@@ -97,3 +97,5 @@ For key rotation, authenticate and distribute the new public key through an inde
 There is no independently established long-lived publisher identity or key custody system, no trusted key distribution or revocation feed, no Sigstore certificate/transparency validation, no consumer-side durable rollback database, and no real-world public-data approval. **A valid synthetic Ed25519 signature is not authorization to publish real IOC data, connect AEGIS or take automated security action.** The private AEGIS project remains unchanged.
 
 Research references: [PyCA Ed25519 interface](https://cryptography.io/en/latest/hazmat/primitives/asymmetric/ed25519/), [Sigstore verification trust model](https://docs.sigstore.dev/about/overview/).
+
+**Fail-closed API refinement:** `SignedReleaseTrust` now *requires* an explicit `last_accepted_sequence`, `key_valid_from`, and `key_valid_until` for every verification, even for a synthetic demo. The accepted sequence and key validity data must be maintained independently; these defaults cannot be inferred from a downloaded attestation.

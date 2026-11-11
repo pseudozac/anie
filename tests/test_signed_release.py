@@ -36,7 +36,12 @@ class TestSignedSyntheticRelease(unittest.TestCase):
             encoding=serialization.Encoding.Raw,
             format=serialization.PublicFormat.Raw,
         )
-        self.root = SignedReleaseTrust(self.public_raw, expected_source_commit=COMMIT)
+        self.root = SignedReleaseTrust(
+            public_key_raw=self.public_raw, expected_source_commit=COMMIT,
+            last_accepted_sequence=0,
+            key_valid_from="2026-11-01T00:00:00Z",
+            key_valid_until="2026-12-01T00:00:00Z",
+        )
 
     def _fixture(self, tmp):
         directory = Path(tmp) / "release"
@@ -197,6 +202,14 @@ class TestSignedSyntheticRelease(unittest.TestCase):
             self._sign(directory)
             with self.assertRaises(FileExistsError):
                 self._sign(directory)
+
+    def test_requires_explicit_trust_state_and_expiration(self):
+        with self.assertRaises(TypeError):
+            SignedReleaseTrust(self.public_raw, expected_source_commit=COMMIT)
+        with self.assertRaisesRegex(ValueError, "invalid key validity"):
+            replace(self.root, key_valid_from="2026-12-02T00:00:00Z")
+        with self.assertRaisesRegex(ValueError, "invalid accepted release sequence"):
+            replace(self.root, last_accepted_sequence=True)
 
     def test_unrecognized_builder_and_repo_rejected(self):
         with TemporaryDirectory() as tmp:

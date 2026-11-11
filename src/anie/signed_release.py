@@ -78,10 +78,10 @@ class SignedReleaseTrust:
     """
     public_key_raw: bytes
     expected_source_commit: str
-    last_accepted_sequence: int = 0
+    last_accepted_sequence: int
+    key_valid_from: str
+    key_valid_until: str
     max_age_seconds: int = 30 * 86400
-    key_valid_from: str = "2020-01-01T00:00:00Z"
-    key_valid_until: str = "2100-01-01T00:00:00Z"
     revoked_fingerprints: frozenset[str] = field(default_factory=frozenset)
     expected_repository: str = _REPOSITORY
     expected_builder: str = _BUILDER

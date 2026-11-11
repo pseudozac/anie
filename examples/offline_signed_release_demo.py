@@ -38,6 +38,8 @@ def main() -> None:
             public_key_raw=raw_public,
             expected_source_commit=commit,
             last_accepted_sequence=0,
+            key_valid_from="2026-11-01T00:00:00Z",
+            key_valid_until="2026-12-01T00:00:00Z",
         )
         result = verify_signed_synthetic_release(
             target, trust, now="2026-11-11T11:00:00Z"
