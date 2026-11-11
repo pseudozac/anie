@@ -104,3 +104,7 @@ PYTHONPATH=src python tools/benchmark_report.py --print-snapshot
 ```
 
 See [Temporal Benchmark methodology](docs/TEMPORAL_BENCHMARK.md). The committed deterministic reference in `benchmarks/expected_snapshot.json` is checked by CI once established. This is a fixed synthetic time-split test, not a real-world accuracy claim.
+
+## Offline release trust design
+
+Issue #6 adds a separate operator-pinned manifest integrity check and documented future signature/attestation gates. **This does not sign artifacts or publish any dataset.** See [release trust design](docs/RELEASE_TRUST_DESIGN.md).

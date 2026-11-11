@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Offline synthetic-only consumer manifest pin verification and provenance metadata checks (not publisher authentication).
+- Authenticated release, signing, licensing, cost, AEGIS rollback and revocation design; no real-data publication.
+
+
 - Add deterministic chronological synthetic infrastructure-novelty benchmark, two non-ML baselines, abstention/uncertainty regression tests, model predictions fingerprint and memory/timing reporting. No live data or production verdict changes.
 
 

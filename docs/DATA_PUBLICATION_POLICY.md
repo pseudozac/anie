@@ -24,3 +24,7 @@ Never publish private AEGIS, SNOOP, customer, account, cookie, form, email, case
 - **Private or organization data:** out of scope for public ANIE; never auto-export.
 
 There is currently no signed publishing infrastructure, no provenance trust root, no live collector consent record and no real-data release approval. SHA-256 manifest consistency checks are **not** authenticity.
+
+## Future signed distribution
+
+Release authenticity, legal redistribution rights and consumer freshness are separate gates. See [release trust design](RELEASE_TRUST_DESIGN.md). Out-of-band pinned checksums are not publisher signatures. Public real-world datasets remain denied.

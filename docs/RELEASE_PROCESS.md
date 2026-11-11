@@ -24,3 +24,7 @@ This document is a checklist and release design, not permission for unattended G
 Automatic dataset publisher, GitHub Releases workflow, PyPI trusted publishing, cloud runtime, managed signing keys, release artifact attestation, live real-data feeds.
 
 Once a public dataset pipeline is approved, keep source code, low-churn manifests, and bulk data snapshots separate. Avoid committing rapidly changing databases to Git history or relying on GitHub Actions as a continuous internet crawler.
+
+## Authenticated consumer design (Issue #6)
+
+See [independent release trust design](RELEASE_TRUST_DESIGN.md). The current offline verifier uses a separately pinned manifest digest, **not a publisher signature**. No release signing, deployment or public real-data distribution is enabled.
