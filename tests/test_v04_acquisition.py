@@ -99,7 +99,9 @@ class TestOfflineBootstrap(unittest.TestCase):
 
     def test_block_untrusted_url_forms(self):
         invalid = [
-            "http://registry.example.org/", "https://127.0.0.1/",
+            "http://registry.example.org/", "https://127.0.0.1/", "https://127.1/",
+            "https://127.000.000.001/", "https://metadata.local/",
+            "https://registry.example.test/",
             "https://user:password@registry.example.org/",
             "https://registry.example.org:8443/",
             "https://registry.example.org/#fragment",

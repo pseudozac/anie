@@ -46,6 +46,19 @@ def _safe_base_url(value: object) -> str:
             raise ValueError("invalid RDAP bootstrap URL characters")
         if normalized_domain(hostname) != hostname:
             raise ValueError("noncanonical RDAP hostname")
+        # Reject literal IPs and all-numeric dotted spellings (including
+        # ambiguous legacy IPv4 forms). No network operation exists here.
+        try:
+            ipaddress.ip_address(hostname)
+        except ValueError:
+            pass
+        else:
+            raise ValueError("IP literal RDAP endpoint is not approved")
+        if all(label.isdigit() for label in hostname.split(".")):
+            raise ValueError("ambiguous numeric IP endpoint")
+        if hostname.endswith((".local", ".localhost", ".internal", ".home.arpa",
+                              ".test", ".invalid", ".example")):
+            raise ValueError("special-use RDAP endpoint")
     except (ValueError, UnicodeError) as exc:
         raise ValueError("invalid RDAP bootstrap URL") from exc
     return value
