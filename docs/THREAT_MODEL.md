@@ -36,3 +36,7 @@ Before connecting AEGIS: review immutable dataset provenance, verification keys,
 ## v0.4 offline acquisition design limitations
 
 `OfflineRdapBootstrap` parses untrusted *synthetic* IANA-style bootstrap metadata with bounded size and HTTPS-only URL syntax checks; it cannot authenticate a registry feed, resolve a hostname or validate the socket destination. `OfflineCollectionScheduler` enforces local cache and synthetic query budgets but is not a durable cross-worker rate limiter, a network egress sandbox or a production DNS resolver. Future live activation requires separately documented permitted endpoints, source terms, real TLS and IP routing controls, rate compliance, opt-out, retention, and an explicit operational decision. See [v0.4 design](ACQUISITION_V04.md).
+
+## v0.4.1 — exact-scope manual DoH pilot
+
+The fixed `example.com` A/AAAA pilot uses an independently tested RFC 8484 wire parser, single fixed Cloudflare DoH HTTPS hostname, verified TLS hostname/SNI, socket pinned to one validated publicly routable DNS-resolved address, strict byte/time limits, no redirects, no retries, no unattended scheduling and no persistence. It requires explicit operator confirmation; the CI path is dry-run. Risk remains for endpoint/provider outages, service terms and future repeated manual invocations because **no durable global cross-run quota exists**. No general network collector, active scanning, RDAP endpoint fetching or real-data publishing is authorized. See [pilot scope](REAL_WORLD_PILOT.md).

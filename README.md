@@ -116,3 +116,7 @@ An optional `signing` extra (`cryptography`) supports Ed25519 signing and indepe
 ## ANIE v0.4 offline acquisition planner
 
 A new offline IANA-style RDAP bootstrap parser and TTL-aware DNS/RDAP fixture scheduler reduce duplicate synthetic queries while preserving append-only history and original collection timestamps. `python tools/offline_acquisition_report.py` reports local synthetic cache reuse and resources; it makes **zero** network calls. **No real collectors or live pilot are active.** [Scope, retention, costs and limitations](docs/ACQUISITION_V04.md).
+
+## Real-world DNS pilot (explicit opt-in only)
+
+ANIE now includes a bounded, manually activated public DNS-over-HTTPS pilot for **only `example.com` A and AAAA**, via Cloudflare's documented resolver. Run `python tools/live_dns_pilot.py` to inspect the dry-run plan with **zero network requests**. An explicit acknowledgment is required before the actual two-request pilot. No live DNS runs in CI, no real results are stored/published, and RDAP network collection remains disabled. Read [exact target limits, terms and activation process](docs/REAL_WORLD_PILOT.md) before manual use.

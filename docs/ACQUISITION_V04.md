@@ -59,3 +59,7 @@ The 100-lookup synthetic report uses TTL=60 and deterministic virtual time. Expe
 5. **Acceptance:** adversarial sandbox tests, real service rate/terms verification, zero/limited monetary budget, explicit limited pilot activation scope and operator sign-off.
 
 **Decision:** GO for offline fixtures and design tests. NO-GO for real-world collection and publication. No AEGIS or SNOOP access.
+
+## v0.4.1 — bounded *manual* public DNS pilot
+
+A new **manually acknowledged** exactly-two-query DoH pilot may be invoked separately from ANIE's offline engine; see [real-world pilot scope and security limits](REAL_WORLD_PILOT.md). This does not enable RDAP service querying, discovery, routine collection, cloud jobs or dataset publication. The default dry-run and GitHub CI remain network-free.
