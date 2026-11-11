@@ -201,6 +201,29 @@ class TestPilot(unittest.TestCase):
                         _fetch_doh(request_plan()[0])
                 self.assertTrue(conn.closed)
 
+
+    def test_cli_dry_run_requires_no_network_access(self):
+        """CI/CLI default execution must never contact the network."""
+        import contextlib
+        from io import StringIO
+        import json
+        from pathlib import Path
+        import runpy
+
+        cli = Path(__file__).resolve().parents[1] / "tools" / "live_dns_pilot.py"
+        captured = StringIO()
+        with patch("sys.argv", [str(cli)]), patch(
+            "anie.live_dns_pilot._fetch_doh",
+            side_effect=AssertionError("live DNS forbidden in default CLI"),
+        ), contextlib.redirect_stdout(captured):
+            with self.assertRaises(SystemExit) as status:
+                runpy.run_path(str(cli), run_name="__main__")
+        self.assertEqual(status.exception.code, 0)
+        payload = json.loads(captured.getvalue())
+        self.assertEqual(payload["mode"], "DRY_RUN")
+        self.assertEqual(payload["network_requests"], 0)
+        self.assertEqual(payload["max_requests"], 2)
+
     def test_fixed_source_cannot_expand_targets(self):
         invalid = replace(request_plan()[0], domain="other.example.com")
         with self.assertRaises(ScopeDenied):
