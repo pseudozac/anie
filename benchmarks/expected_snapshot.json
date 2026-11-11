@@ -1,0 +1,89 @@
+{
+  "abstention_reasons": {
+    "conflicting_sources": 4,
+    "contradictory_same_source": 4,
+    "insufficient_comparable_evidence": 6,
+    "stale_or_no_evidence": 6
+  },
+  "dataset_type": "synthetic_only",
+  "eval_as_of": "2026-11-11T12:00:00Z",
+  "guardrails": {
+    "external_collection_requests": 0,
+    "malicious_verdicts_issued": 0,
+    "maliciousness_labels_used_for_training": 0,
+    "owner_attribution_inferred": 0
+  },
+  "heldout_observation_sha256": "88a7d9fc84bfe75afe7c913aa14a871981f25817d266059badde7bb1ef5a35d3",
+  "holdout_window_days": 7,
+  "methods": {
+    "deterministic_large_change": {
+      "abstained_negative": 20,
+      "abstained_positive": 0,
+      "coverage": 0.782609,
+      "false_positive_count": 0,
+      "false_positive_rate_evaluated": 0,
+      "fn": 0,
+      "fp": 0,
+      "precision": 1,
+      "recall_all_positive_cases": 1,
+      "recall_on_evaluated_cases": 1,
+      "tn": 56,
+      "tp": 16
+    },
+    "ml_knn_novelty": {
+      "abstained_negative": 20,
+      "abstained_positive": 0,
+      "coverage": 0.782609,
+      "false_positive_count": 0,
+      "false_positive_rate_evaluated": 0,
+      "fn": 0,
+      "fp": 0,
+      "precision": 1,
+      "recall_all_positive_cases": 1,
+      "recall_on_evaluated_cases": 1,
+      "tn": 56,
+      "tp": 16
+    },
+    "naive_any_dns_change": {
+      "abstained_negative": 20,
+      "abstained_positive": 0,
+      "coverage": 0.782609,
+      "false_positive_count": 14,
+      "false_positive_rate_evaluated": 0.25,
+      "fn": 8,
+      "fp": 14,
+      "precision": 0.363636,
+      "recall_all_positive_cases": 0.5,
+      "recall_on_evaluated_cases": 0.5,
+      "tn": 42,
+      "tp": 8
+    }
+  },
+  "model_version": "anie.robust-knn-novelty.v0.1",
+  "observations": {
+    "all": 622,
+    "heldout": 346,
+    "train": 276
+  },
+  "per_case_predictions_sha256": "1523f1a8f857e6d54a4f87e0fbf2f4c0bb92862fc9f3cfe92509cb371a28fc60",
+  "scenario_counts": {
+    "cross_source_disagreement": 4,
+    "intermittent_errors": 8,
+    "owner_transfer_unobservable": 6,
+    "rapid_rotation": 8,
+    "routine_migration": 8,
+    "same_source_contradiction": 4,
+    "shared_hosting": 10,
+    "sparse": 6,
+    "stable": 24,
+    "stale": 6,
+    "unusual_fanout": 8
+  },
+  "schema": "anie.temporal-benchmark.v1",
+  "seed": 20261111,
+  "synthetic_negative_cases": 76,
+  "synthetic_positive_cases": 16,
+  "train_as_of": "2026-11-01T12:00:00Z",
+  "train_observation_sha256": "8fff77820aed045402ad9d89d732fb54564d51c75a8e87e85011c7d35bdcf07a",
+  "training_entities": 92
+}
