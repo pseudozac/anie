@@ -112,3 +112,7 @@ Issue #6 adds a separate operator-pinned manifest integrity check and documented
 ## v0.3 cryptographically signed synthetic release verification
 
 An optional `signing` extra (`cryptography`) supports Ed25519 signing and independently pinned-key verification of **offline synthetic demo** releases. The core ANIE runtime still has no third-party dependencies. Run `python -m pip install -e '.[signing]'` and `PYTHONPATH=src python examples/offline_signed_release_demo.py` to exercise an **ephemeral test key**. No signing credential or real dataset is committed, uploaded or deployed. [Threat model and limitations](docs/RELEASE_TRUST_DESIGN.md).
+
+## ANIE v0.4 offline acquisition planner
+
+A new offline IANA-style RDAP bootstrap parser and TTL-aware DNS/RDAP fixture scheduler reduce duplicate synthetic queries while preserving append-only history and original collection timestamps. `python tools/offline_acquisition_report.py` reports local synthetic cache reuse and resources; it makes **zero** network calls. **No real collectors or live pilot are active.** [Scope, retention, costs and limitations](docs/ACQUISITION_V04.md).

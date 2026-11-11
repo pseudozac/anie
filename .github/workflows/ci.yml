@@ -43,5 +43,6 @@ jobs:
           python examples/aegis_readonly_consumer.py ./local-data/ci/publication
           python examples/offline_collection_demo.py
           python examples/offline_signed_release_demo.py
+          python tools/offline_acquisition_report.py
       - name: Synthetic temporal benchmark report (training past only)
         run: python tools/benchmark_report.py --check benchmarks/expected_snapshot.json
