@@ -28,7 +28,7 @@ RESPONSE = {
 def main() -> None:
     policy = CollectionPolicy(
         targets=frozenset({DOMAIN}), kinds=frozenset({"dns_a"}),
-        max_requests=1000, max_requests_per_target=1000,
+        max_requests=100, max_requests_per_target=100,
     )
     with TemporaryDirectory(prefix="anie-v04-report-") as root:
         db = CollectionLedger(Path(root) / "events.sqlite")
