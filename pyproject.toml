@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "anie-intelligence"
-version = "0.2.0"
+version = "0.3.0"
 description = "Offline-first, evidence-linked, AI-native internet intelligence research engine"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -12,6 +12,10 @@ license = "Apache-2.0"
 authors = [{name = "ANIE Contributors"}]
 keywords = ["cybersecurity", "internet-measurement", "osint", "anomaly-detection"]
 dependencies = []
+
+[project.optional-dependencies]
+# Ed25519 is an opt-in capability; regular ANIE runtime stays stdlib-only.
+signing = ["cryptography>=46,<51"]
 
 [project.scripts]
 anie = "anie.cli:main"

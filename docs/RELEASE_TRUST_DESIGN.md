@@ -69,3 +69,31 @@ Default decision: **do not deploy distribution infrastructure**. Stay with offli
 6. Cost ceiling, storage and bandwidth forecasts approved; no uncontrolled public endpoint.
 
 **Decision: NO-GO for authenticated real-world dataset publication. GO for offline design tests only.**
+
+## v0.3 offline Ed25519 reference implementation (Issue #10)
+
+`src/anie/signed_release.py` adds **actual Ed25519 signature verification** through PyCA `cryptography`, an optional dependency. The signature is over a domain-separated, canonical signed payload containing the exact `manifest.json` digest, repository identity (`pseudozac/anie`), full source commit, builder identity (`local-offline`), dataset type (`synthetic_demo_only`), monotonically increasing release sequence and issue/expiry timestamps. It does **not** modify the v0.1 manifest format.
+
+A verifier MUST receive the expected Ed25519 **public key bytes** and exact source commit through a separate trusted channel, never from the downloaded release. It checks the signature before treating the signed metadata as authoritative, then revalidates the entire manifest, compressed artifacts, evidence references and deterministic model replay. It rejects outdated releases and release sequence downgrades against `last_accepted_sequence`.
+
+Important limitations: this authenticates **possession of a pinned signing key**, not legal identity, a GitHub Actions OIDC identity, a transparency-log inclusion proof, or a production-ready supply-chain attestation. No production trust key is created, committed, uploaded, or provisioned. The offline demonstration creates a temporary, in-memory key for *test-only* synthetic data. Do **not** treat the demo key as a persistent production identity.
+
+### Offline demonstration
+
+```bash
+python -m pip install -e '.[signing]'
+PYTHONPATH=src python examples/offline_signed_release_demo.py
+PYTHONPATH=src python -m unittest discover -s tests -v
+```
+
+### Owner-held trust state and rotation
+
+The consumer/operator must independently maintain: (1) the accepted publisher public key fingerprint and raw key, (2) approved repository+source commit+builder, (3) a monotonic `last_accepted_sequence` updated atomically after import, (4) separately authenticated key revocations and validity windows, and (5) a trusted time source. An attacker who can roll back the consumer's trusted state can replay old signed releases. Without that external state, **replay prevention cannot be claimed**.
+
+For key rotation, authenticate and distribute the new public key through an independent trusted mechanism; revoke the old fingerprint where necessary; ensure sequence continuity; do not rely on unsigned downloaded metadata. If the trusted time source, revocation record, or signing identity is unavailable, fail closed rather than silently falling back to unsigned import.
+
+### Remaining NO-GO conditions
+
+There is no independently established long-lived publisher identity or key custody system, no trusted key distribution or revocation feed, no Sigstore certificate/transparency validation, no consumer-side durable rollback database, and no real-world public-data approval. **A valid synthetic Ed25519 signature is not authorization to publish real IOC data, connect AEGIS or take automated security action.** The private AEGIS project remains unchanged.
+
+Research references: [PyCA Ed25519 interface](https://cryptography.io/en/latest/hazmat/primitives/asymmetric/ed25519/), [Sigstore verification trust model](https://docs.sigstore.dev/about/overview/).

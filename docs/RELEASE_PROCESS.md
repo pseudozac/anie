@@ -28,3 +28,7 @@ Once a public dataset pipeline is approved, keep source code, low-churn manifest
 ## Authenticated consumer design (Issue #6)
 
 See [independent release trust design](RELEASE_TRUST_DESIGN.md). The current offline verifier uses a separately pinned manifest digest, **not a publisher signature**. No release signing, deployment or public real-data distribution is enabled.
+
+## v0.3 offline Ed25519 verification
+
+A separate synthetic-only Ed25519 attestation can now be signed/verified with the optional `signing` extra. See [release trust design](RELEASE_TRUST_DESIGN.md). This authenticates a separately pinned test key, not a GitHub identity or Sigstore attestation; it does not authorize uploading releases. Production key custody, rotation, rollback state and full publisher identity proof remain a **NO-GO** gate.

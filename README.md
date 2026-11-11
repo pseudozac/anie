@@ -108,3 +108,7 @@ See [Temporal Benchmark methodology](docs/TEMPORAL_BENCHMARK.md). The committed 
 ## Offline release trust design
 
 Issue #6 adds a separate operator-pinned manifest integrity check and documented future signature/attestation gates. **This does not sign artifacts or publish any dataset.** See [release trust design](docs/RELEASE_TRUST_DESIGN.md).
+
+## v0.3 cryptographically signed synthetic release verification
+
+An optional `signing` extra (`cryptography`) supports Ed25519 signing and independently pinned-key verification of **offline synthetic demo** releases. The core ANIE runtime still has no third-party dependencies. Run `python -m pip install -e '.[signing]'` and `PYTHONPATH=src python examples/offline_signed_release_demo.py` to exercise an **ephemeral test key**. No signing credential or real dataset is committed, uploaded or deployed. [Threat model and limitations](docs/RELEASE_TRUST_DESIGN.md).
