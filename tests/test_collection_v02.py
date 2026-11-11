@@ -153,12 +153,14 @@ class TestDNSParsing(unittest.TestCase):
         self.assertEqual(event.observation.error_code, "invalid_response")
 
     def test_truncated_question_mismatch_and_wrong_rrtype(self):
+        wrong_record = dns(["192.0.2.3"])
+        wrong_record["answers"] = [{"type": "TXT", "value": "unexpected", "ttl": 30}]
         bad = [
             dns(["192.0.2.3"], truncated=True),
             dns(["192.0.2.3"], question="other.example.test"),
             dns(["192.0.2.3"], kind="AAAA"),
             dns(["192.0.2.3"], complete=False),
-            dns(["192.0.2.3"], answers=[{"type": "TXT", "value": "unexpected", "ttl": 30}]),
+            wrong_record,
         ]
         for fixture in bad:
             with self.subTest(fixture=fixture):
