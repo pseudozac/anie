@@ -48,7 +48,7 @@ def inspect_workflow(content: str) -> list[str]:
     ):
         if forbidden in content:
             errors.append("privileged/secret workflow token: " + forbidden)
-    uses = re.findall(r"(?m)^\s*-\s*uses:\s*([^\s#]+)", content)
+    uses = re.findall(r"(?m)^\s*(?:-\s*)?uses:\s*([^\s#]+)", content)
     if not uses:
         errors.append("no pinned actions found")
     for item in uses:
