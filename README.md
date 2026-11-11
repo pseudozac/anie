@@ -1,6 +1,6 @@
 # ANIE — AI-Native Internet Intelligence Engine
 
-**v0.1.0 research prototype • offline-first • synthetic data only • no API keys • no live internet collection**
+**v0.2.0 research prototype • offline-first • synthetic data only • no API keys • no live internet collection**
 
 ANIE is an independent, open-source-oriented research engine that transforms structured internet observations into **evidence-linked, time-aware intelligence records**. It is intended to supply a future consumer such as AEGIS without giving ANIE access to private cases, credentials, browser history or customer telemetry.
 
@@ -13,6 +13,7 @@ ANIE is an independent, open-source-oriented research engine that transforms str
 - Produce reproducible gzip JSONL intelligence and evidence artifacts with SHA-256 manifests.
 - Verify checksums, evidence references and independently recompute findings.
 - Synthetic-only data publication guard; network-free CPU demonstration and unit tests.
+- **v0.2 offline collector foundation:** explicit per-target request budgets, DNS A/AAAA/PTR fixture processing, RDAP network/autnum validation, outcome-preserving collection events, append-only collection ledger and pure public-destination/redirect checks (no network I/O).
 
 **Important:** ANIE does not currently gather real internet data. Its ML distance is not an attack verdict, confidence, maliciousness probability or production-grade model. This prototype does not publish to GitHub or provision any cloud resource.
 
@@ -46,6 +47,14 @@ with gzip.open("local-data/demo/publication/intelligence.jsonl.gz", "rt") as fil
         if finding["assessment"]["ai"]["status"] == "outlier":
             print(json.dumps(finding, indent=2))
 ```
+
+## Offline collector demonstration (v0.2)
+
+```bash
+PYTHONPATH=src python examples/offline_collection_demo.py
+```
+
+This tests a fixture-only DNS/RDAP collector with a separately validated collection-event schema. No sockets or external providers are contacted. See [v0.2 collection design and limitations](docs/COLLECTOR_V02.md).
 
 ## Reusable commands
 

@@ -39,3 +39,4 @@ jobs:
           python -m anie demo --out ./local-data/ci
           python -m anie verify --dir ./local-data/ci/publication
           python examples/aegis_readonly_consumer.py ./local-data/ci/publication
+          python examples/offline_collection_demo.py

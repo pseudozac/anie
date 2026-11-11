@@ -2,7 +2,7 @@
 
 This is an OFFLINE, SYNTHETIC-ONLY research prototype, not a live security scanner.
 
-- No collection network client, credential store, production deployment or data publishing automation exists in v0.1.
+- No collection network client, credential store, production deployment or data publishing automation exists in v0.2.
 - Reports cannot declare an IOC malicious; novelty scores are not calibrated probabilities.
 - Publish and verify only accept synthetic records. Do not introduce real datasets, private domains, customer logs, personal data or secrets into a public repository.
 - Dataset hashes check consistency, **not** publisher identity or authenticity. Signed releases and trusted signing keys are future work.

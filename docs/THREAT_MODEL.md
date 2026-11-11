@@ -1,4 +1,4 @@
-# ANIE threat model — v0.1 and future collector design
+# ANIE threat model — v0.2 offline collector design and future network gates
 
 ## Assets and trust boundaries
 
@@ -15,8 +15,8 @@ Boundary F: external PRs -> CI and repository configuration (supply-chain, workf
 
 | Threat | Baseline control | Future gate |
 | --- | --- | --- |
-| SSRF / DNS rebinding / redirect to private services | No live v0.1 network client | Target allowlist; IP/CIDR classification; redirect and DNS revalidation; egress sandbox |
-| Internet-service abuse or terms violation | No scanning/crawling in v0.1 | Ownership/authorization, robots/site terms, per-host budgets, stop switch, abuse contact |
+| SSRF / DNS rebinding / redirect to private services | No live v0.2 network client; pure simulated address/redirect validation and exact fixture-scope policy | Target allowlist; IP/CIDR classification; redirect and DNS revalidation; egress sandbox |
+| Internet-service abuse or terms violation | No scanning/crawling in v0.2 | Ownership/authorization, robots/site terms, per-host budgets, stop switch, abuse contact |
 | Malformed/oversized payloads and decompression bombs | Bounded JSON fields and artifact verification | Resource budget fuzzing, streaming parser limits, memory/time caps |
 | Poisoned evidence, stale data, or source collusion | Source IDs, timestamps, explicit error states, evidence-linked findings | Origin authentication, freshness/validity rules, source reliability studies |
 | Misleading ML confidence or false attribution | Novelty-only score, no malicious verdict, no fake probabilities | Time-split benchmark, provenance audit, calibration/abstention policy |
@@ -27,7 +27,7 @@ Boundary F: external PRs -> CI and repository configuration (supply-chain, workf
 
 ## Risk posture
 
-v0.1 is offline, synthetic only. Therefore real network collector security controls are **design requirements, not implemented mitigations**. Nothing here authorizes live scans or proves future public-data redistribution rights.
+v0.2 is offline, synthetic only. It adds strict synthetic fixture parser, explicit target and query budgets, an append-only collection-event ledger and modeled public-egress checks. **These checks are not an egress firewall or a real transport.** Therefore real network collector security controls are **design requirements, not implemented mitigations**. Nothing here authorizes live scans or proves future public-data redistribution rights.
 
 Before adding *any* live collection: document source and terms, target scope, geographies if relevant, host/path permissions, response rate, consent, identity, egress isolation, IP rebinding defenses, budget, retention, complaints/opt-out and test evidence. Any high-impact response or active probing requires a separate explicit authorization.
 

@@ -18,3 +18,7 @@ Research question: can temporal first-party internet observations and uncertaint
 4. Train time-split models and compare their value against the deterministic baseline.
 5. Add authenticated signed releases, public-data privacy review, and a read-only AEGIS adapter behind a feature flag.
 6. Plan SNOOP separately as an opt-in browser sensor; its private observations must never flow to ANIE's public corpus by default.
+
+## 2026-11-11 — offline collector foundation
+
+The v0.2 synthetic fixture-only parser and policy are implemented as a safety baseline. Real DNS/RDAP network clients, live service selection and publication are **not** implemented or approved. See [collector design](COLLECTOR_V02.md) and [threat model](THREAT_MODEL.md).
