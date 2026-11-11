@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add deterministic chronological synthetic infrastructure-novelty benchmark, two non-ML baselines, abstention/uncertainty regression tests, model predictions fingerprint and memory/timing reporting. No live data or production verdict changes.
+
+
 No live collectors, real-data publication, hosted services or external scanning approved.
 
 ## 0.2.0 — offline collection foundation (2026-11-11)

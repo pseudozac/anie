@@ -61,3 +61,7 @@ The demo output directory must be new/empty. Do not commit `local-data/`. CI may
 - `.agents/skills/dataset-release/SKILL.md`: public data licensing, versioning, checksums/signatures and consumer compatibility
 
 See `docs/RELEASE_PROCESS.md` before proposing tags/releases, and `SECURITY.md` for vulnerability reporting.
+
+## Model benchmark gate
+
+Before modifying `src/anie/ml.py`, `src/anie/temporal.py`, novelty labels, thresholds or user-facing model claims, read [Temporal Benchmark methodology](docs/TEMPORAL_BENCHMARK.md), run `PYTHONPATH=src python tools/benchmark_report.py --check benchmarks/expected_snapshot.json`, and compare against all non-ML baselines. Do not tune to the fixed synthetic holdout or silently replace the snapshot. Preserve independent prospective validation and abstention. The benchmark never provides evidence of real-world maliciousness.

@@ -40,3 +40,5 @@ jobs:
           python -m anie verify --dir ./local-data/ci/publication
           python examples/aegis_readonly_consumer.py ./local-data/ci/publication
           python examples/offline_collection_demo.py
+      - name: Synthetic temporal benchmark report (training past only)
+        run: python tools/benchmark_report.py --check benchmarks/expected_snapshot.json
