@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- PR 2: First-party DNS-over-HTTPS (DoH) collection engine (`DohCollector`) and policy governor (`DohRateGovernor`).
+- Strict target allowlist limited to `example.com` and `iana.org`, and query kinds `dns_a` and `dns_aaaa`.
+- Anti-rebinding resolver endpoint resolution requiring all returned IPs to be verified global addresses before socket allocation.
+- Persistent SQLite-backed rate governor with per-target cooldown, hourly quotas, resolver quotas, and daily limits.
+- Full RFC 8484 wire-format exchange with bounded response capture (<= 65,535 bytes) and SHA-256 evidence integrity.
+- Explicit response classification for ANSWER, NXDOMAIN, NODATA, SERVFAIL, and REFUSED.
+- Mandatory invariants: SERVFAIL recorded as error without inferring DNSSEC-bogus; analytical confidence kept strictly nullable (`None`).
 - PR 1: Introduce Phase 2 first-party intelligence data models (`RealObservation`, `RealCollectionEvent`, `FactualVerification`) and SQLite store (`RealObservationStore`).
 - Replace arbitrary confidence multipliers with distinct empirical factual verification attributes and explicitly nullable analytical confidence.
 - Enforce strict cross-pipeline isolation: real observations require `synthetic=False` and are rejected by synthetic publishers; synthetic fixtures are rejected by `RealObservationStore`.
