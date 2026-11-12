@@ -341,6 +341,8 @@ class BatchConfig:
     min_mem_mb: int = DEFAULT_MIN_MEMORY_MB
     min_disk_mb: int = DEFAULT_MIN_DISK_MB
     timeout_seconds: float = DEFAULT_BATCH_TIMEOUT_SECONDS
+    pilot_mode: bool = False
+    pilot_db_path: Path | None = None
 
     def __post_init__(self):
         if self.mode not in VALID_MODES:
@@ -424,7 +426,14 @@ class BatchOrchestrator:
 
     def determine_batch_queries(self) -> list[tuple[str, str]]:
         """Determine sequential queries satisfying the 30-minute per-domain cooldown."""
-        if self.config.explicit_queries is not None:
+        if self.config.pilot_mode:
+            from .pilot_governor import PilotGovernor
+            pilot_db = self.config.pilot_db_path or self.config.quota_db_path
+            gov = PilotGovernor(pilot_db)
+            run_id, day_num, raw_queries = gov.check_and_plan_pilot_batch()
+            self._pilot_run_id = run_id
+            self._pilot_day_number = day_num
+        elif self.config.explicit_queries is not None:
             raw_queries = self.config.explicit_queries
         elif self.config.query_mode in ("dns_a", "dns_aaaa"):
             raw_queries = [(d, self.config.query_mode) for d in self.config.domains]
@@ -492,6 +501,22 @@ class BatchOrchestrator:
 
         return canonical_queries
 
+    def _record_pilot_outcome(self, report: BatchReport) -> None:
+        """Persist pilot batch outcome into durable pilot schedule state if in pilot mode."""
+        if self.config.pilot_mode and hasattr(self, "_pilot_run_id") and self._pilot_run_id is not None:
+            try:
+                from .pilot_governor import PilotGovernor
+                pilot_db = self.config.pilot_db_path or self.config.quota_db_path
+                gov = PilotGovernor(pilot_db)
+                gov.record_pilot_outcome(
+                    run_id=self._pilot_run_id,
+                    outcome=report.outcome,
+                    batch_id=report.batch_id,
+                    error_reason=report.reason,
+                )
+            except Exception as exc:
+                sys.stderr.write(f"ANIE warning: failed to record pilot outcome in state db: {exc}\n")
+
     def execute_batch(self) -> BatchReport:
         """Execute one bounded batch run under host-health and policy governance."""
         t0 = time.monotonic()
@@ -550,6 +575,7 @@ class BatchOrchestrator:
                         reason=f"scope validation error: {exc}",
                         scope={"domains": self.config.domains, "queries_requested": self.config.query_mode},
                     )
+                    self._record_pilot_outcome(report)
                     emit_telemetry(report.to_dict(), self.config.log_file_path)
                     return report
 
@@ -582,6 +608,7 @@ class BatchOrchestrator:
                         queries_planned=len(batch_queries),
                         queries_skipped=len(batch_queries),
                     )
+                    self._record_pilot_outcome(report)
                     emit_telemetry(report.to_dict(), self.config.log_file_path)
                     return report
 
@@ -604,6 +631,7 @@ class BatchOrchestrator:
                         queries_skipped=0,
                         records_persisted={"observation_ids": [], "event_ids": []},
                     )
+                    self._record_pilot_outcome(report)
                     emit_telemetry(report.to_dict(), self.config.log_file_path)
                     return report
 
@@ -668,6 +696,7 @@ class BatchOrchestrator:
                     queries_failed=failed,
                     records_persisted={"observation_ids": persisted_obs, "event_ids": persisted_events},
                 )
+                self._record_pilot_outcome(report)
                 emit_telemetry(report.to_dict(), self.config.log_file_path)
                 return report
 
@@ -683,6 +712,7 @@ class BatchOrchestrator:
                 reason=f"concurrency lock contention: {exc}",
                 preflight={},
             )
+            self._record_pilot_outcome(report)
             emit_telemetry(report.to_dict(), self.config.log_file_path)
             return report
         except Exception as exc:
@@ -697,6 +727,7 @@ class BatchOrchestrator:
                 reason=f"unhandled batch error: {exc}",
                 preflight={},
             )
+            self._record_pilot_outcome(report)
             emit_telemetry(report.to_dict(), self.config.log_file_path)
             return report
 

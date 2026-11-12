@@ -234,6 +234,19 @@ class TestDohGovernorAdversarial(unittest.TestCase):
                 locking_conn.execute("ROLLBACK")
                 locking_conn.close()
 
+    def test_bootstrap_fallback_when_local_dns_denied(self):
+        """When local DNS resolution fails (e.g. 169.254.169.254 blocked), fallback to pinned bootstrap IPs."""
+        def failing_addrinfo(host, port, **kwargs):
+            raise socket.gaierror(-2, "Name or service not known")
+
+        pinned = resolve_and_pin_endpoint(
+            "cloudflare-dns.com",
+            port=443,
+            addrinfo_fn=failing_addrinfo,
+            timeout=2.0,
+        )
+        self.assertEqual(pinned, "104.16.248.249")
+
 
 if __name__ == "__main__":
     unittest.main()

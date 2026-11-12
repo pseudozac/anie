@@ -13,6 +13,10 @@ WorkingDirectory=/var/lib/anie
 # Optional environment configuration for authorization and flags
 EnvironmentFile=-/etc/default/anie-collector
 
+# Fail-Closed Security Preflight: ExecStartPre fails the unit (observable failed state)
+# if IMDS 169.254.169.254 is reachable, egress filtering is inactive, or preflight checks fail.
+ExecStartPre=/opt/anie/venv/bin/python -m anie preflight --imds-ip 169.254.169.254
+
 # Default execution is safe offline dry-run; live collection requires
 # explicit operator configuration in /etc/default/anie-collector
 # (ANIE_LIVE_COLLECTION_AUTHORIZED=1 and EXTRA_OPTS="--live")
@@ -47,6 +51,11 @@ RestrictNamespaces=yes
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 CapabilityBoundingSet=
 NoNewPrivileges=yes
+
+# Network egress boundary: IMDS 169.254.169.254 is completely removed.
+# Only pinned DoH bootstrap and authoritative anycast IPs are permitted.
+IPAddressDeny=any
+IPAddressAllow=104.16.248.249 104.16.249.249 2606:4700::6810:f8f9 2606:4700::6810:f9f9 1.1.1.1 1.0.0.1
 
 # Explicit read/write storage access
 ReadWritePaths=/var/lib/anie /var/log/anie

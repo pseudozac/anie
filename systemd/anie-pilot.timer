@@ -1,0 +1,16 @@
+[Unit]
+Description=ANIE 72-Hour Pilot Daily Collection Timer (Calendar Scheduled)
+Documentation=file:///opt/anie-phase2/docs/REAL_WORLD_PILOT.md
+ConditionPathExists=/etc/systemd/system/anie-pilot.service
+
+[Timer]
+# Conservative daily schedule (06:00 UTC) with 15-minute randomized jitter
+# to prevent burst synchronization across network infrastructure.
+# Persistent=false strictly prevents catch-up runs after host downtime or reboots.
+OnCalendar=*-*-* 06:00:00 UTC
+RandomizedDelaySec=900s
+Persistent=false
+Unit=anie-pilot.service
+
+[Install]
+WantedBy=timers.target

@@ -66,6 +66,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--min-mem-mb", type=int, default=200, help="minimum required host RAM in MiB")
     p.add_argument("--min-disk-mb", type=int, default=500, help="minimum required disk capacity in MiB")
     p.add_argument("--timeout", type=float, default=20.0, help="overall batch execution timeout")
+    p.add_argument("--pilot", action="store_true", help="enable strictly bounded 72-hour pilot governor and query alternation")
+    p = sub.add_parser("preflight", help="execute security preflight assertions")
+    p.add_argument("--require-firewall", action="store_true", help="require kernel firewall rule presence")
+    p.add_argument("--imds-ip", default="169.254.169.254", help="target IMDS IP to verify blocked")
     args = parser.parse_args(argv)
     try:
         if args.command == "demo":
@@ -201,6 +205,7 @@ def main(argv: list[str] | None = None) -> int:
                 min_mem_mb=args.min_mem_mb,
                 min_disk_mb=args.min_disk_mb,
                 timeout_seconds=args.timeout,
+                pilot_mode=args.pilot,
             )
             orchestrator = BatchOrchestrator(config)
             report = orchestrator.execute_batch()
@@ -209,6 +214,12 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             # Distinguish PARTIAL and FAILED outcomes with non-zero exit code
             return 1
+        elif args.command == "preflight":
+            from .preflight_hardening import main as preflight_main
+            sub_argv = ["--imds-ip", args.imds_ip]
+            if args.require_firewall:
+                sub_argv.append("--require-firewall")
+            return preflight_main(sub_argv)
         return 0
     except (ValueError, PermissionError, FileNotFoundError, FileExistsError, json.JSONDecodeError) as exc:
         print(f"ANIE error: {exc}", file=sys.stderr)
