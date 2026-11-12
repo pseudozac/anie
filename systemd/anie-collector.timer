@@ -1,0 +1,16 @@
+[Unit]
+Description=ANIE First-Party Intelligence Batch Collection Timer
+Documentation=file:///opt/anie/systemd/README.md
+ConditionPathExists=/etc/systemd/system/anie-collector.service
+
+[Timer]
+# Conservative daily schedule (06:00 UTC) with 5-minute randomized jitter
+# to prevent synchronized network bursts.
+# Disabled by default; requires explicit administrator activation.
+OnCalendar=*-*-* 06:00:00 UTC
+RandomizedDelaySec=300s
+Persistent=false
+Unit=anie-collector.service
+
+[Install]
+WantedBy=timers.target
