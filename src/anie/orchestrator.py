@@ -14,13 +14,17 @@ Key Architectural Invariants:
 3. Preflight Resource Safeguards:
    - Minimum available host RAM: 200 MiB (abstains if below threshold to safeguard host).
    - Minimum available storage: 500 MiB.
-   - Advisory process locking to prevent overlapping executions.
+   - Fail-closed host metrics: unknown memory metrics prevent live collection.
+   - Advisory process locking covering the complete execution critical section.
    - SQLite schema readiness and quick integrity checks.
-4. Dry-Run Default: Safe offline dry-run by default.
+4. Dry-Run Default & Telemetry Correctness: Safe offline dry-run by default.
+   Dry-run reports queries_attempted=0, queries_succeeded=0, queries_failed=0, records_persisted=0,
+   and reports queries_planned separately.
    Real network collection requires explicit operator authorization (--mode live AND ANIE_LIVE_COLLECTION_AUTHORIZED=1).
-5. Structured Telemetry: Emits single-line JSON records with bounded rotation (<= 5 MiB).
-6. Operational Boundaries: In-process timeouts are cooperative at I/O boundaries.
-   True supervisor-level cancellation requires systemd TimeoutStartSec.
+5. Monotonic Batch Deadline: A single monotonic deadline governs the entire batch execution.
+   Remaining budget is passed to sequential collection operations; queries abort if budget is exhausted.
+   Total budget bounded at <= 25.0s to allow systemd TimeoutStartSec (30s) cleanup headroom.
+6. Structured Telemetry: Emits single-line JSON records with bounded rotation (<= 5 MiB).
 """
 from __future__ import annotations
 
@@ -28,6 +32,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -58,12 +63,45 @@ from .real_store import RealObservationStore
 
 DEFAULT_MIN_MEMORY_MB = 200
 DEFAULT_MIN_DISK_MB = 500
+DEFAULT_BATCH_TIMEOUT_SECONDS = 20.0
+MAX_BATCH_TIMEOUT_SECONDS = 25.0  # Leaves >= 5s headroom before systemd 30s TimeoutStartSec
 MAX_QUERIES_PER_BATCH = 4
 MAX_LOG_SIZE_BYTES = 5 * 1024 * 1024  # 5 MiB
+VALID_MODES = frozenset({"dry_run", "live"})
 
 
-def get_available_memory_mb() -> int:
-    """Read available host memory in MiB without external dependencies."""
+def _validate_threshold(val: Any, name: str) -> int:
+    """Validate that a memory or disk threshold is a positive finite integer."""
+    if isinstance(val, bool) or not isinstance(val, (int, float)):
+        raise ValueError(f"{name} must be a positive integer: got {val!r}")
+    if math.isnan(val) or math.isinf(val) or val <= 0:
+        raise ValueError(f"{name} must be a positive finite number > 0: got {val}")
+    int_val = int(val)
+    if int_val != val:
+        raise ValueError(f"{name} must be an integer: got {val}")
+    return int_val
+
+
+def _validate_timeout(val: Any) -> float:
+    """Validate that timeout is positive, finite, and <= MAX_BATCH_TIMEOUT_SECONDS."""
+    if isinstance(val, bool) or not isinstance(val, (int, float)):
+        raise ValueError(f"timeout_seconds must be a positive float: got {val!r}")
+    if math.isnan(val) or math.isinf(val) or val <= 0.0:
+        raise ValueError(f"timeout_seconds must be a positive finite number > 0: got {val}")
+    f_val = float(val)
+    if f_val > MAX_BATCH_TIMEOUT_SECONDS:
+        raise ValueError(
+            f"timeout_seconds ({f_val:.2f}s) exceeds maximum allowed {MAX_BATCH_TIMEOUT_SECONDS:.1f}s "
+            "to guarantee systemd TimeoutStartSec (30s) cleanup headroom"
+        )
+    return f_val
+
+
+def get_available_memory_mb() -> int | None:
+    """Read available host memory in MiB without external dependencies.
+    
+    Returns None if memory metrics cannot be determined (fail-closed).
+    """
     # 1. Linux /proc/meminfo (Standard on Oracle Linux / Ubuntu)
     if os.path.exists("/proc/meminfo"):
         try:
@@ -99,8 +137,8 @@ def get_available_memory_mb() -> int:
         except Exception:
             pass
 
-    # Fallback assumption if OS metrics are unavailable
-    return 1024
+    # Fail-closed: do not invent an unverified fallback metric
+    return None
 
 
 def get_available_disk_mb(path: str | Path) -> int:
@@ -183,15 +221,17 @@ class PreflightReport:
     disk_available_mb: int
     checks: dict[str, str] = field(default_factory=dict)
     failure_reason: str | None = None
+    operational_error: bool = False
 
 
 def run_preflight_checks(
     quota_db_path: Path,
     store_db_path: Path,
     lock_path: Path | None = None,
+    log_path: Path | None = None,
     min_mem_mb: int = DEFAULT_MIN_MEMORY_MB,
     min_disk_mb: int = DEFAULT_MIN_DISK_MB,
-    mem_fn: Callable[[], int] | None = None,
+    mem_fn: Callable[[], int | None] | None = None,
     disk_fn: Callable[[Path], int] | None = None,
 ) -> PreflightReport:
     """Execute host and environment preflight safety checks."""
@@ -199,8 +239,23 @@ def run_preflight_checks(
     read_mem = mem_fn or get_available_memory_mb
     read_disk = disk_fn or get_available_disk_mb
 
-    # 1. Host Memory check
+    # Validate thresholds
+    min_mem_mb = _validate_threshold(min_mem_mb, "min_mem_mb")
+    min_disk_mb = _validate_threshold(min_disk_mb, "min_disk_mb")
+
+    # 1. Host Memory check (fail-closed if unknown)
     avail_mem = read_mem()
+    if avail_mem is None:
+        checks["memory_mb"] = "unknown"
+        return PreflightReport(
+            passed=False,
+            mem_available_mb=-1,
+            disk_available_mb=0,
+            checks=checks,
+            failure_reason="operational error: host memory availability cannot be determined",
+            operational_error=True,
+        )
+
     checks["memory_mb"] = f"{avail_mem} (min: {min_mem_mb})"
     if avail_mem < min_mem_mb:
         return PreflightReport(
@@ -209,6 +264,7 @@ def run_preflight_checks(
             disk_available_mb=0,
             checks=checks,
             failure_reason=f"insufficient available RAM: {avail_mem} MiB < {min_mem_mb} MiB threshold",
+            operational_error=False,
         )
 
     # 2. Host Storage checks
@@ -223,10 +279,17 @@ def run_preflight_checks(
             disk_available_mb=avail_disk,
             checks=checks,
             failure_reason=f"insufficient available disk: {avail_disk} MiB < {min_disk_mb} MiB threshold",
+            operational_error=False,
         )
 
     # 3. Directory writability checks
-    for p in (quota_db_path.parent, store_db_path.parent):
+    paths_to_verify = [quota_db_path.parent, store_db_path.parent]
+    if log_path is not None:
+        paths_to_verify.append(log_path.parent)
+    if lock_path is not None:
+        paths_to_verify.append(lock_path.parent)
+
+    for p in paths_to_verify:
         try:
             p.mkdir(parents=True, exist_ok=True)
             test_file = p / f".anie_test_write_{uuid.uuid4().hex}"
@@ -240,6 +303,7 @@ def run_preflight_checks(
                 disk_available_mb=avail_disk,
                 checks=checks,
                 failure_reason=f"storage path '{p}' is unwritable: {exc}",
+                operational_error=True,
             )
 
     # 4. Database integrity checks
@@ -253,6 +317,7 @@ def run_preflight_checks(
                 disk_available_mb=avail_disk,
                 checks=checks,
                 failure_reason=f"database integrity failure for {label}: {msg}",
+                operational_error=True,
             )
 
     return PreflightReport(
@@ -266,7 +331,7 @@ def run_preflight_checks(
 @dataclass
 class BatchConfig:
     domains: list[str] = field(default_factory=lambda: ["example.com", "iana.org"])
-    query_mode: str = "alternate"  # "alternate", "dns_a", "dns_aaaa", or explicit pairs
+    query_mode: str = "alternate"  # "alternate", "dns_a", "dns_aaaa"
     explicit_queries: list[tuple[str, str]] | None = None
     mode: str = "dry_run"  # "dry_run" (default) or "live"
     quota_db_path: Path = field(default_factory=lambda: Path("local-data/doh_quota.sqlite"))
@@ -275,7 +340,14 @@ class BatchConfig:
     lock_file_path: Path | None = None
     min_mem_mb: int = DEFAULT_MIN_MEMORY_MB
     min_disk_mb: int = DEFAULT_MIN_DISK_MB
-    timeout_seconds: float = DEFAULT_TOTAL_TIMEOUT_SECONDS
+    timeout_seconds: float = DEFAULT_BATCH_TIMEOUT_SECONDS
+
+    def __post_init__(self):
+        if self.mode not in VALID_MODES:
+            raise ValueError(f"invalid execution mode '{self.mode}': must be one of {sorted(VALID_MODES)}")
+        self.min_mem_mb = _validate_threshold(self.min_mem_mb, "min_mem_mb")
+        self.min_disk_mb = _validate_threshold(self.min_disk_mb, "min_disk_mb")
+        self.timeout_seconds = _validate_timeout(self.timeout_seconds)
 
 
 @dataclass
@@ -285,10 +357,11 @@ class BatchReport:
     completed_at: str
     duration_seconds: float
     mode: str
-    outcome: str  # "SUCCESS", "SKIPPED", "FAILED"
+    outcome: str  # "SUCCESS", "SKIPPED", "PARTIAL", "FAILED"
     reason: str | None = None
     scope: dict[str, Any] = field(default_factory=dict)
     preflight: dict[str, Any] = field(default_factory=dict)
+    queries_planned: int = 0
     queries_attempted: int = 0
     queries_succeeded: int = 0
     queries_failed: int = 0
@@ -308,10 +381,13 @@ def emit_telemetry(
     record: dict[str, Any],
     log_path: Path | None,
     max_bytes: int = MAX_LOG_SIZE_BYTES,
-) -> None:
-    """Emit single-line structured JSON execution record with size-bounded rotation."""
+) -> bool:
+    """Emit single-line structured JSON execution record with size-bounded rotation.
+    
+    Returns True if emitted successfully or if log_path is None, False on error.
+    """
     if log_path is None:
-        return
+        return True
 
     try:
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -324,8 +400,11 @@ def emit_telemetry(
         line = json.dumps(record, separators=(",", ":")) + "\n"
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(line)
+        return True
     except OSError as exc:
         sys.stderr.write(f"ANIE telemetry logging error: {exc}\n")
+        sys.stderr.flush()
+        return False
 
 
 class BatchOrchestrator:
@@ -335,7 +414,7 @@ class BatchOrchestrator:
         self,
         config: BatchConfig,
         collector_factory: Callable[..., Any] | None = None,
-        mem_fn: Callable[[], int] | None = None,
+        mem_fn: Callable[[], int | None] | None = None,
         disk_fn: Callable[[Path], int] | None = None,
     ):
         self.config = config
@@ -346,17 +425,21 @@ class BatchOrchestrator:
     def determine_batch_queries(self) -> list[tuple[str, str]]:
         """Determine sequential queries satisfying the 30-minute per-domain cooldown."""
         if self.config.explicit_queries is not None:
-            queries = self.config.explicit_queries
+            raw_queries = self.config.explicit_queries
         elif self.config.query_mode in ("dns_a", "dns_aaaa"):
-            queries = [(d, self.config.query_mode) for d in self.config.domains]
+            raw_queries = [(d, self.config.query_mode) for d in self.config.domains]
         else:
             # Query alternation mode: inspect last persisted record per domain
-            queries = []
+            raw_queries = []
             store = None
             if self.config.store_db_path.exists():
                 try:
                     store = RealObservationStore(self.config.store_db_path)
-                except Exception:
+                except Exception as exc:
+                    if self.config.mode == "live":
+                        raise RuntimeError(
+                            f"failed to initialize real observation store for query alternation: {exc}"
+                        ) from exc
                     store = None
 
             for d in self.config.domains:
@@ -370,32 +453,44 @@ class BatchOrchestrator:
                                 next_kind = "dns_aaaa"
                             else:
                                 next_kind = "dns_a"
-                    except Exception:
-                        pass
-                queries.append((d, next_kind))
+                    except Exception as exc:
+                        if self.config.mode == "live":
+                            raise RuntimeError(
+                                f"failed to read previous observations for '{d}' from real store: {exc}"
+                            ) from exc
+                raw_queries.append((d, next_kind))
 
-        # 1. Pilot batch envelope: <= 2 domains
-        domains = [q[0] for q in queries]
-        validate_batch_domains(domains)
+        # 1. Canonicalize domains and check uniqueness
+        canonical_queries: list[tuple[str, str]] = []
+        canonical_domains: list[str] = []
+        for domain, kind in raw_queries:
+            if not isinstance(domain, str):
+                raise ScopeDenied(f"domain must be a string: got {type(domain)}")
+            c_domain = domain.strip().lower().rstrip(".")
+            canonical_domains.append(c_domain)
+            canonical_queries.append((c_domain, kind))
 
-        # 2. Pilot cooldown invariant: at most 1 query per domain in the same batch
-        if len(domains) != len(set(domains)):
+        # 2. Pilot batch envelope: <= 2 domains
+        validate_batch_domains(canonical_domains)
+
+        # 3. Pilot cooldown invariant: duplicate domain within one batch is strictly forbidden
+        if len(canonical_domains) != len(set(canonical_domains)):
             raise ScopeDenied(
-                "pilot envelope prohibits multiple queries for the same domain within one batch "
+                "pilot envelope prohibits duplicate domains within one batch "
                 "to satisfy the 30-minute per-domain cooldown; use alternating batches"
             )
 
-        # 3. Overall ceiling: <= 4 total queries per batch
-        if len(queries) > MAX_QUERIES_PER_BATCH:
+        # 4. Overall ceiling: <= 4 total queries per batch
+        if len(canonical_queries) > MAX_QUERIES_PER_BATCH:
             raise ScopeDenied(
-                f"batch query count ({len(queries)}) exceeds maximum ceiling of {MAX_QUERIES_PER_BATCH}"
+                f"batch query count ({len(canonical_queries)}) exceeds maximum ceiling of {MAX_QUERIES_PER_BATCH}"
             )
 
-        # 4. Validate all kinds
-        for domain, kind in queries:
+        # 5. Validate all kinds and targets
+        for domain, kind in canonical_queries:
             validate_target(domain, kind)
 
-        return queries
+        return canonical_queries
 
     def execute_batch(self) -> BatchReport:
         """Execute one bounded batch run under host-health and policy governance."""
@@ -404,15 +499,31 @@ class BatchOrchestrator:
         now_utc = datetime.now(timezone.utc)
         start_iso = now_utc.isoformat(timespec="seconds").replace("+00:00", "Z")
 
-        # 1. Validate Mode & Authorization
+        # 1. Enforce exact allowlist of execution modes fail-closed
+        if self.config.mode not in VALID_MODES:
+            completed_iso = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+            report = BatchReport(
+                batch_id=batch_id,
+                started_at=start_iso,
+                completed_at=completed_iso,
+                duration_seconds=time.monotonic() - t0,
+                mode=str(self.config.mode),
+                outcome="FAILED",
+                reason=f"invalid execution mode '{self.config.mode}': must be one of {sorted(VALID_MODES)}",
+            )
+            emit_telemetry(report.to_dict(), self.config.log_file_path)
+            return report
+
+        # 2. Validate Live Mode Authorization Gate
         if self.config.mode == "live":
             auth_env = os.environ.get("ANIE_LIVE_COLLECTION_AUTHORIZED")
             if auth_env != "1":
+                completed_iso = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
                 report = BatchReport(
                     batch_id=batch_id,
                     started_at=start_iso,
-                    completed_at=start_iso,
-                    duration_seconds=0.0,
+                    completed_at=completed_iso,
+                    duration_seconds=time.monotonic() - t0,
                     mode=self.config.mode,
                     outcome="FAILED",
                     reason="live collection unauthorized: ANIE_LIVE_COLLECTION_AUTHORIZED=1 environment required",
@@ -420,57 +531,61 @@ class BatchOrchestrator:
                 emit_telemetry(report.to_dict(), self.config.log_file_path)
                 return report
 
-        # 2. Envelope and Scope Validation
-        try:
-            batch_queries = self.determine_batch_queries()
-        except (ScopeDenied, ValueError) as exc:
-            completed_iso = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-            report = BatchReport(
-                batch_id=batch_id,
-                started_at=start_iso,
-                completed_at=completed_iso,
-                duration_seconds=time.monotonic() - t0,
-                mode=self.config.mode,
-                outcome="FAILED",
-                reason=f"scope validation error: {exc}",
-                scope={"domains": self.config.domains, "queries_requested": self.config.query_mode},
-            )
-            emit_telemetry(report.to_dict(), self.config.log_file_path)
-            return report
-
-        # 3. Host Safeguard Preflight Checks
-        preflight = run_preflight_checks(
-            quota_db_path=self.config.quota_db_path,
-            store_db_path=self.config.store_db_path,
-            lock_path=self.config.lock_file_path,
-            min_mem_mb=self.config.min_mem_mb,
-            min_disk_mb=self.config.min_disk_mb,
-            mem_fn=self._mem_fn,
-            disk_fn=self._disk_fn,
-        )
-
-        if not preflight.passed:
-            completed_iso = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-            report = BatchReport(
-                batch_id=batch_id,
-                started_at=start_iso,
-                completed_at=completed_iso,
-                duration_seconds=time.monotonic() - t0,
-                mode=self.config.mode,
-                outcome="SKIPPED",
-                reason=preflight.failure_reason,
-                scope={"queries": batch_queries},
-                preflight=asdict(preflight),
-                queries_skipped=len(batch_queries),
-            )
-            emit_telemetry(report.to_dict(), self.config.log_file_path)
-            return report
-
-        # 4. Advisory Process Lock (Prevent overlapping collector runs)
+        # 3. Advisory Process Lock (protects complete execution critical section)
         lock_target = self.config.lock_file_path or (self.config.quota_db_path.parent / "collector.lock")
         try:
             with acquire_collector_lock(lock_target):
-                # 5. Execute Collection Batch (Dry-run or Live)
+                # 4. Scope and Query Envelope Determination
+                try:
+                    batch_queries = self.determine_batch_queries()
+                except (ScopeDenied, ValueError, RuntimeError) as exc:
+                    completed_iso = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+                    report = BatchReport(
+                        batch_id=batch_id,
+                        started_at=start_iso,
+                        completed_at=completed_iso,
+                        duration_seconds=time.monotonic() - t0,
+                        mode=self.config.mode,
+                        outcome="FAILED",
+                        reason=f"scope validation error: {exc}",
+                        scope={"domains": self.config.domains, "queries_requested": self.config.query_mode},
+                    )
+                    emit_telemetry(report.to_dict(), self.config.log_file_path)
+                    return report
+
+                # 5. Host Safeguard Preflight Checks
+                preflight = run_preflight_checks(
+                    quota_db_path=self.config.quota_db_path,
+                    store_db_path=self.config.store_db_path,
+                    lock_path=self.config.lock_file_path,
+                    log_path=self.config.log_file_path,
+                    min_mem_mb=self.config.min_mem_mb,
+                    min_disk_mb=self.config.min_disk_mb,
+                    mem_fn=self._mem_fn,
+                    disk_fn=self._disk_fn,
+                )
+
+                if not preflight.passed:
+                    completed_iso = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+                    # Distinguish genuine resource shortages (SKIPPED) from operational errors (FAILED)
+                    outcome = "FAILED" if preflight.operational_error else "SKIPPED"
+                    report = BatchReport(
+                        batch_id=batch_id,
+                        started_at=start_iso,
+                        completed_at=completed_iso,
+                        duration_seconds=time.monotonic() - t0,
+                        mode=self.config.mode,
+                        outcome=outcome,
+                        reason=preflight.failure_reason,
+                        scope={"queries": batch_queries},
+                        preflight=asdict(preflight),
+                        queries_planned=len(batch_queries),
+                        queries_skipped=len(batch_queries),
+                    )
+                    emit_telemetry(report.to_dict(), self.config.log_file_path)
+                    return report
+
+                # 6. Dry-Run Execution: purely planned, zero live operations reported
                 if self.config.mode == "dry_run":
                     completed_iso = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
                     report = BatchReport(
@@ -482,20 +597,29 @@ class BatchOrchestrator:
                         outcome="SUCCESS",
                         scope={"queries": batch_queries},
                         preflight=asdict(preflight),
-                        queries_attempted=len(batch_queries),
-                        queries_succeeded=len(batch_queries),
+                        queries_planned=len(batch_queries),
+                        queries_attempted=0,
+                        queries_succeeded=0,
+                        queries_failed=0,
+                        queries_skipped=0,
+                        records_persisted={"observation_ids": [], "event_ids": []},
                     )
                     emit_telemetry(report.to_dict(), self.config.log_file_path)
                     return report
 
-                # Live collection
+                # 7. Live Collection Execution under monotonic overall batch deadline
+                batch_deadline = t0 + self.config.timeout_seconds
                 governor = DohRateGovernor(self.config.quota_db_path)
                 store = RealObservationStore(self.config.store_db_path)
 
                 if self._collector_factory is not None:
-                    collector = self._collector_factory(rate_governor=governor, timeout_seconds=self.config.timeout_seconds)
+                    collector = self._collector_factory(
+                        rate_governor=governor, timeout_seconds=self.config.timeout_seconds
+                    )
                 else:
-                    collector = DohCollector(rate_governor=governor, timeout_seconds=self.config.timeout_seconds)
+                    collector = DohCollector(
+                        rate_governor=governor, timeout_seconds=self.config.timeout_seconds
+                    )
 
                 succeeded = 0
                 failed = 0
@@ -503,8 +627,22 @@ class BatchOrchestrator:
                 persisted_events: list[str] = []
 
                 for domain, kind in batch_queries:
+                    remaining_timeout = batch_deadline - time.monotonic()
+                    if remaining_timeout <= 0:
+                        failed += 1
+                        sys.stderr.write(
+                            f"ANIE query error for {domain} {kind}: overall batch deadline "
+                            f"({self.config.timeout_seconds:.2f}s) exhausted\n"
+                        )
+                        continue
+
                     try:
-                        event, obs = collector.collect(domain, kind)
+                        try:
+                            event, obs = collector.collect(
+                                domain, kind, timeout_seconds=remaining_timeout
+                            )
+                        except TypeError:
+                            event, obs = collector.collect(domain, kind)
                         store.insert_record(event, obs)
                         persisted_obs.append(obs.observation_id)
                         persisted_events.append(event.event_id)
@@ -524,6 +662,7 @@ class BatchOrchestrator:
                     outcome=outcome,
                     scope={"queries": batch_queries},
                     preflight=asdict(preflight),
+                    queries_planned=len(batch_queries),
                     queries_attempted=len(batch_queries),
                     queries_succeeded=succeeded,
                     queries_failed=failed,
@@ -542,9 +681,7 @@ class BatchOrchestrator:
                 mode=self.config.mode,
                 outcome="SKIPPED",
                 reason=f"concurrency lock contention: {exc}",
-                scope={"queries": batch_queries},
-                preflight=asdict(preflight),
-                queries_skipped=len(batch_queries),
+                preflight={},
             )
             emit_telemetry(report.to_dict(), self.config.log_file_path)
             return report
@@ -558,8 +695,7 @@ class BatchOrchestrator:
                 mode=self.config.mode,
                 outcome="FAILED",
                 reason=f"unhandled batch error: {exc}",
-                scope={"queries": batch_queries},
-                preflight=asdict(preflight),
+                preflight={},
             )
             emit_telemetry(report.to_dict(), self.config.log_file_path)
             return report

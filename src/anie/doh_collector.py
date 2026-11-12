@@ -302,15 +302,17 @@ class DohCollector:
         domain: str,
         kind: str,
         now_dt: datetime | None = None,
+        timeout_seconds: float | None = None,
     ) -> tuple[RealCollectionEvent, RealObservation]:
         """Collect and parse genuine DoH measurement under monotonic wall-clock deadline."""
         start_time = time.monotonic()
-        deadline = start_time + self.timeout_seconds
+        effective_timeout = float(timeout_seconds) if timeout_seconds is not None else self.timeout_seconds
+        deadline = start_time + effective_timeout
 
         def remaining_timeout() -> float:
             rem = deadline - time.monotonic()
             if rem <= 0:
-                raise TimeoutError(f"overall DoH deadline ({self.timeout_seconds:.2f}s) exceeded")
+                raise TimeoutError(f"overall DoH deadline ({effective_timeout:.2f}s) exceeded")
             return rem
 
         # 1. Scope & Allowlist enforcement

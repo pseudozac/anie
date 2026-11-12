@@ -36,7 +36,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--lock-file", default=None, help="path to advisory concurrency lock file")
     p.add_argument("--min-mem-mb", type=int, default=200, help="minimum required host RAM in MiB")
     p.add_argument("--min-disk-mb", type=int, default=500, help="minimum required disk capacity in MiB")
-    p.add_argument("--timeout", type=float, default=25.0, help="overall batch execution timeout")
+    p.add_argument("--timeout", type=float, default=20.0, help="overall batch execution timeout")
     args = parser.parse_args(argv)
     try:
         if args.command == "demo":
@@ -82,9 +82,10 @@ def main(argv: list[str] | None = None) -> int:
             orchestrator = BatchOrchestrator(config)
             report = orchestrator.execute_batch()
             print(report.to_json())
-            if report.outcome == "FAILED":
-                return 1
-            return 0
+            if report.outcome in ("SUCCESS", "SKIPPED"):
+                return 0
+            # Distinguish PARTIAL and FAILED outcomes with non-zero exit code
+            return 1
         return 0
     except (ValueError, PermissionError, FileNotFoundError, FileExistsError, json.JSONDecodeError) as exc:
         print(f"ANIE error: {exc}", file=sys.stderr)
