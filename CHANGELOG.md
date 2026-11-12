@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- PR 4: Authenticated first-party intelligence publication pipeline (`src/anie/real_publish.py`), detached Ed25519 signing, and multi-tier evidence verification.
+- Deterministic canonical publication engine (`export_canonical_dataset()`, `publish_real()`) producing reproducible gzip archives (`mtime=0`, `compresslevel=9`) sorted by observation and event timestamps/IDs, with strict pre-publication integrity checks and atomic artifact generation.
+- Air-gapped detached Ed25519 signing workflow (`sign_manifest_detached()`): primary signing keys never reside on the collector host (`anie-collector-01`), binding signatures strictly to an explicit key ID, manifest digest, release sequence, and validity window.
+- Independent consumer verification engine (`verify_real_release()`): validates partition SHA-256 digests, raw DNS evidence payload hashes, observation-to-event referential consistency, decompression bomb defenses ($\le 100\text{ MB}$ uncompressed ceiling), and operator-pinned public keys.
+- Monotonic release sequencing and persistent verifier high-water mark tracking (`ReleaseSequenceTracker`) providing genuine anti-replay and downgrade rollback protection, with opt-in historical auditing (`allow_rollback=True`).
+- Key rotation and operator revocation support in `RealReleaseTrust` via multi-key maps (`trusted_keys`), `revoked_key_ids`, and `revoked_fingerprints`.
+- Unconditional anti-contamination enforcement: rejects synthetic fixtures, synthetic methods, and synthetic source IDs within real publication artifacts.
+- CLI integration: subcommands `publish-real` and `verify-real` with support for offline candidate export, detached signature generation, and pinned public-key verification.
+- Comprehensive operational documentation in `docs/REAL_PUBLICATION_AND_SIGNING.md`.
 - PR 3: Bounded batch orchestrator (`BatchOrchestrator`, `src/anie/orchestrator.py`) and CLI subcommand `collect-batch` for resource-governed one-shot execution on Oracle Cloud micro instances (1 GiB RAM).
 - Strict execution envelope: maximum 2 domains (`example.com`, `iana.org`), alternating query kinds (`dns_a` $\leftrightarrow$ `dns_aaaa`) across batches based on last persisted observation, canonicalized domain uniqueness, at most 1 query per domain per batch to strictly satisfy the 30-minute per-domain cooldown, and an absolute ceiling of $\le 4$ queries per batch.
 - Fail-closed execution modes (`VALID_MODES = {"dry_run", "live"}`) preventing programmatic or CLI bypass; live collection strictly gated by `--live` and `ANIE_LIVE_COLLECTION_AUTHORIZED=1`.
