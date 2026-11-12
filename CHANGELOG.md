@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- PR 1: Introduce Phase 2 first-party intelligence data models (`RealObservation`, `RealCollectionEvent`, `FactualVerification`) and SQLite store (`RealObservationStore`).
+- Replace arbitrary confidence multipliers with distinct empirical factual verification attributes and explicitly nullable analytical confidence.
+- Enforce strict cross-pipeline isolation: real observations require `synthetic=False` and are rejected by synthetic publishers; synthetic fixtures are rejected by `RealObservationStore`.
+- Implement referential integrity with `FOREIGN KEY ... ON DELETE RESTRICT` and two-phase retention invariants preventing evidence deletion while dependent observations remain.
+- Replace unconstrained `INSERT OR IGNORE` with strict collision detection: accept identical duplicate records idempotently, reject conflicting identifiers with `IntegrityError`.
+- Cryptographically verify raw evidence hashes when loading and exporting collection events.
+- Document exact SQLite WAL durability and crash-recovery semantics under `NORMAL` and `FULL` synchronous modes without absolute durability claims.
+
 ## 0.4.1 — exact-scope manual DNS pilot preflight (2026-11-12)
 
 - Fix compatibility with official IANA-style RDAP bootstrap records containing matched HTTPS/HTTP alternatives; never select HTTP.
