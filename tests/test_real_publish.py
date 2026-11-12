@@ -2,19 +2,26 @@
 
 Verifies:
 - Deterministic canonical serialization and byte-for-byte reproducibility.
+- Manifest determinism with fixed publication timestamp.
 - Air-gapped detached Ed25519 signing and verification.
+- Complete metadata binding enforcement across manifest, payload, attestation, and trust policy.
+- Separate integrity vs authentication result contracts.
 - Manifest and archive tampering detection.
 - Raw DNS evidence hash verification.
 - Referential integrity between observations and events.
+- Strict model reconstruction validation (ordering, duplicate IDs, content-addressed IDs).
 - Anti-contamination guards against synthetic records.
 - Decompression bomb and size limit defenses.
-- Monotonic sequence verification and rollback protection.
+- Fail-closed persistent sequence tracking and anti-rollback protection.
+- Concurrency-safe atomic state tracker sequence advancement.
 - Key rotation and key revocation compatibility.
-- CLI subcommands: publish-real and verify-real.
+- Genuine offline detached signing CLI workflow.
+- Strict key file loading without truncation fallbacks.
 """
 from __future__ import annotations
 
 import base64
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import gzip
 from hashlib import sha256
@@ -24,6 +31,8 @@ import os
 from pathlib import Path
 import shutil
 from tempfile import TemporaryDirectory
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -43,9 +52,13 @@ from anie.real_publish import (
     REAL_MANIFEST_SCHEMA,
     RealReleaseTrust,
     ReleaseSequenceTracker,
+    TrackerStateError,
+    TrackerStateLostError,
     TrustedKey,
     export_canonical_dataset,
     key_fingerprint,
+    load_private_key_file,
+    load_public_key_file,
     publish_real,
     sign_manifest_detached,
     verify_real_release,
@@ -54,6 +67,8 @@ from anie.real_store import RealObservationStore
 from test_real_models import sample_event, sample_observation, sample_request
 
 HAVE_CRYPTO = importlib.util.find_spec("cryptography") is not None
+if os.environ.get("GITHUB_ACTIONS") == "true" and not HAVE_CRYPTO:
+    raise RuntimeError("cryptography is required in GitHub CI and must not be skipped")
 
 
 def make_test_pair(subject: str = "example.com", kind: str = "dns_a", observed_at: str = "2026-11-12T10:00:00Z"):
@@ -76,8 +91,9 @@ class TestDeterministicPublication(unittest.TestCase):
             dir_a = Path(tmp) / "pub_a"
             dir_b = Path(tmp) / "pub_b"
 
-            man_a = publish_real(data, dir_a, as_of="2026-11-12T10:00:00Z", release_sequence=1)
-            man_b = publish_real(data, dir_b, as_of="2026-11-12T10:00:00Z", release_sequence=1)
+            # Use fixed published_at to achieve 100% manifest determinism
+            man_a = publish_real(data, dir_a, as_of="2026-11-12T10:00:00Z", release_sequence=1, published_at="2026-11-12T10:01:00Z")
+            man_b = publish_real(data, dir_b, as_of="2026-11-12T10:00:00Z", release_sequence=1, published_at="2026-11-12T10:01:00Z")
 
             # Assert identical partition SHA-256 hashes
             for fa, fb in zip(man_a["files"], man_b["files"]):
@@ -88,6 +104,12 @@ class TestDeterministicPublication(unittest.TestCase):
                 file_bytes_a = (dir_a / fa["file"]).read_bytes()
                 file_bytes_b = (dir_b / fb["file"]).read_bytes()
                 self.assertEqual(file_bytes_a, file_bytes_b)
+
+            # Assert identical manifest contents and SHA-256
+            manifest_a_bytes = (dir_a / "manifest.json").read_bytes()
+            manifest_b_bytes = (dir_b / "manifest.json").read_bytes()
+            self.assertEqual(manifest_a_bytes, manifest_b_bytes)
+            self.assertEqual(sha256(manifest_a_bytes).hexdigest(), sha256(manifest_b_bytes).hexdigest())
 
     def test_export_canonical_dataset_ordering_and_referential_integrity(self):
         with TemporaryDirectory() as tmp:
@@ -108,6 +130,22 @@ class TestDeterministicPublication(unittest.TestCase):
             self.assertEqual(ev_list[0].event_id, ev1.event_id)
             self.assertEqual(ev_list[1].event_id, ev2.event_id)
 
+    def test_single_snapshot_export_prevents_silent_truncation(self):
+        """Export must reject datasets exceeding limit rather than silently truncating."""
+        with TemporaryDirectory() as tmp:
+            store_db = Path(tmp) / "real.sqlite"
+            store = RealObservationStore(store_db)
+
+            ev1, obs1 = make_test_pair("example.com", "dns_a", "2026-11-12T08:00:00Z")
+            ev2, obs2 = make_test_pair("iana.org", "dns_aaaa", "2026-11-12T08:05:00Z")
+
+            store.insert_record(ev1, obs1)
+            store.insert_record(ev2, obs2)
+
+            # Request export with limit=1 when 2 records exist
+            with self.assertRaisesRegex(ValueError, "dataset exceeds maximum partition limit"):
+                export_canonical_dataset(store, as_of="2026-11-12T10:00:00Z", limit=1)
+
     def test_cannot_overwrite_existing_release_directory(self):
         ev, obs = make_test_pair()
         with TemporaryDirectory() as tmp:
@@ -120,7 +158,7 @@ class TestDeterministicPublication(unittest.TestCase):
         ev, obs = make_test_pair()
         with TemporaryDirectory() as tmp:
             out_dir = Path(tmp) / "release"
-            # Intentionally corrupt verify_real_release to simulate failure before atomic rename
+            # Simulate verify failure before atomic rename
             with patch("anie.real_publish.verify_real_release", side_effect=RuntimeError("simulated verify crash")):
                 with self.assertRaises(RuntimeError):
                     publish_real(([obs], [ev]), out_dir, as_of="2026-11-12T10:00:00Z")
@@ -177,17 +215,30 @@ class TestAntiContamination(unittest.TestCase):
 
 
 class TestIntegrityAndEvidenceVerification(unittest.TestCase):
-    def test_unsigned_release_verification_succeeds(self):
+    def test_unsigned_candidate_verification_contract(self):
+        """Unsigned candidate release verification distinguishes candidate integrity from authentication."""
         ev, obs = make_test_pair()
         with TemporaryDirectory() as tmp:
             out_dir = Path(tmp) / "release"
             publish_real(([obs], [ev]), out_dir, as_of="2026-11-12T10:00:00Z")
-            res = verify_real_release(out_dir, trust=None)
-            self.assertTrue(res["verified"])
+
+            # 1. Unsigned verification requires integrity_only=True
+            with self.assertRaisesRegex(ValueError, "authenticated release verification requires a RealReleaseTrust"):
+                verify_real_release(out_dir, trust=None, integrity_only=False)
+
+            # 2. Candidate inspection with integrity_only=True succeeds and reports unauthenticated
+            res = verify_real_release(out_dir, integrity_only=True)
+            self.assertEqual(res["status"], "CANDIDATE_INTEGRITY_VERIFIED")
+            self.assertFalse(res["authenticated"])
+            self.assertTrue(res["integrity_only"])
+            self.assertTrue(res["structural_valid"])
+            self.assertTrue(res["evidence_integrity_valid"])
+            self.assertFalse(res["publisher_authenticated"])
+            self.assertFalse(res["anti_rollback_verified"])
             self.assertEqual(res["dataset_type"], DATASET_TYPE_REAL)
             self.assertEqual(res["total_observations"], 1)
             self.assertEqual(res["total_events"], 1)
-            self.assertFalse(res["publisher_signature_verified"])
+            self.assertIsNone(res["key_id"])
 
     def test_manifest_tampering_detected(self):
         ev, obs = make_test_pair()
@@ -200,7 +251,7 @@ class TestIntegrityAndEvidenceVerification(unittest.TestCase):
             man_file.write_text(canonical_json(man_data) + "\n", encoding="utf-8")
 
             with self.assertRaisesRegex(ValueError, "total_observations|record count mismatch|integrity mismatch"):
-                verify_real_release(out_dir, trust=None)
+                verify_real_release(out_dir, integrity_only=True)
 
     def test_partition_file_tampering_detected(self):
         ev, obs = make_test_pair()
@@ -213,7 +264,7 @@ class TestIntegrityAndEvidenceVerification(unittest.TestCase):
                 f.write(b"\x00")
 
             with self.assertRaisesRegex(ValueError, "SHA-256 integrity mismatch|size mismatch"):
-                verify_real_release(out_dir, trust=None)
+                verify_real_release(out_dir, integrity_only=True)
 
     def test_corrupted_raw_dns_evidence_detected(self):
         ev, obs = make_test_pair()
@@ -240,8 +291,8 @@ class TestIntegrityAndEvidenceVerification(unittest.TestCase):
             man_data["files"][1]["bytes"] = ev_file.stat().st_size
             man_file.write_text(canonical_json(man_data) + "\n", encoding="utf-8")
 
-            with self.assertRaisesRegex(ValueError, "raw DNS evidence hash mismatch"):
-                verify_real_release(out_dir, trust=None)
+            with self.assertRaisesRegex(ValueError, "raw_sha256 mismatch|raw evidence verification failed"):
+                verify_real_release(out_dir, integrity_only=True)
 
     def test_missing_referenced_collection_event_detected(self):
         ev, obs = make_test_pair()
@@ -264,7 +315,7 @@ class TestIntegrityAndEvidenceVerification(unittest.TestCase):
             man_file.write_text(canonical_json(man_data) + "\n", encoding="utf-8")
 
             with self.assertRaisesRegex(ValueError, "broken referential integrity"):
-                verify_real_release(out_dir, trust=None)
+                verify_real_release(out_dir, integrity_only=True)
 
     def test_duplicate_observation_id_rejected(self):
         ev, obs = make_test_pair()
@@ -289,13 +340,36 @@ class TestIntegrityAndEvidenceVerification(unittest.TestCase):
             man_file.write_text(canonical_json(man_data) + "\n", encoding="utf-8")
 
             with self.assertRaisesRegex(ValueError, "duplicate observation_id"):
-                verify_real_release(out_dir, trust=None)
+                verify_real_release(out_dir, integrity_only=True)
+
+    def test_out_of_order_records_rejected(self):
+        """Partitions not in strict deterministic order must fail closed."""
+        ev1, obs1 = make_test_pair("example.com", "dns_a", "2026-11-12T08:00:00Z")
+        ev2, obs2 = make_test_pair("iana.org", "dns_aaaa", "2026-11-12T08:05:00Z")
+
+        with TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "release"
+            publish_real(([obs1, obs2], [ev1, ev2]), out_dir, as_of="2026-11-12T10:00:00Z")
+
+            # Invert order of observations in archive
+            obs_file = out_dir / "real_observations.jsonl.gz"
+            inverted_payload = (canonical_json(obs2.to_dict()) + "\n" + canonical_json(obs1.to_dict()) + "\n").encode("utf-8")
+            with obs_file.open("wb") as raw:
+                with gzip.GzipFile(fileobj=raw, mode="wb", filename="", mtime=0, compresslevel=9) as gz:
+                    gz.write(inverted_payload)
+
+            man_file = out_dir / "manifest.json"
+            man_data = json.loads(man_file.read_text(encoding="utf-8"))
+            man_data["files"][0]["sha256"] = sha256(obs_file.read_bytes()).hexdigest()
+            man_data["files"][0]["bytes"] = obs_file.stat().st_size
+            man_file.write_text(canonical_json(man_data) + "\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "out of deterministic order"):
+                verify_real_release(out_dir, integrity_only=True)
 
 
 class TestDetachedEd25519SigningAndVerification(unittest.TestCase):
     def setUp(self):
-        if not HAVE_CRYPTO:
-            self.skipTest("cryptography[signing] extra not installed")
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
         from cryptography.hazmat.primitives import serialization
 
@@ -335,10 +409,81 @@ class TestDetachedEd25519SigningAndVerification(unittest.TestCase):
                 trust=self.trust,
                 now="2026-11-12T11:00:00Z",
             )
-            self.assertTrue(res["verified"])
-            self.assertTrue(res["publisher_signature_verified"])
+            self.assertEqual(res["status"], "AUTHENTICATED")
+            self.assertTrue(res["authenticated"])
+            self.assertTrue(res["structural_valid"])
+            self.assertTrue(res["evidence_integrity_valid"])
+            self.assertTrue(res["publisher_authenticated"])
             self.assertEqual(res["key_id"], self.key_id)
             self.assertEqual(res["key_fingerprint"], key_fingerprint(self.pub_bytes))
+
+    def test_metadata_binding_enforced_in_signing(self):
+        """Signing must fail closed when requested metadata conflicts with manifest."""
+        ev, obs = make_test_pair()
+        with TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "release"
+            publish_real(([obs], [ev]), out_dir, as_of="2026-11-12T10:00:00Z", release_sequence=1, publisher_identity="anie-first-party")
+
+            # 1. Publisher mismatch
+            with self.assertRaisesRegex(ValueError, "publisher mismatch"):
+                sign_manifest_detached(
+                    out_dir,
+                    self.priv_key,
+                    key_id=self.key_id,
+                    release_sequence=1,
+                    publisher_identity="unauthorized-channel",
+                    issued_at="2026-11-12T10:05:00Z",
+                    expires_at="2026-12-12T10:05:00Z",
+                )
+
+            # 2. Sequence mismatch
+            with self.assertRaisesRegex(ValueError, "release sequence mismatch"):
+                sign_manifest_detached(
+                    out_dir,
+                    self.priv_key,
+                    key_id=self.key_id,
+                    release_sequence=2,  # Manifest says 1
+                    issued_at="2026-11-12T10:05:00Z",
+                    expires_at="2026-12-12T10:05:00Z",
+                )
+
+            # 3. Commit mismatch
+            with self.assertRaisesRegex(ValueError, "source_commit mismatch"):
+                sign_manifest_detached(
+                    out_dir,
+                    self.priv_key,
+                    key_id=self.key_id,
+                    release_sequence=1,
+                    source_commit="1" * 40,  # Manifest has 0*40
+                    issued_at="2026-11-12T10:05:00Z",
+                    expires_at="2026-12-12T10:05:00Z",
+                )
+
+    def test_metadata_binding_enforced_in_verification(self):
+        """Verification must reject inconsistent metadata even if cryptographic signature is valid."""
+        ev, obs = make_test_pair()
+        with TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "release"
+            publish_real(([obs], [ev]), out_dir, as_of="2026-11-12T10:00:00Z", release_sequence=1)
+            sign_manifest_detached(
+                out_dir,
+                self.priv_key,
+                key_id=self.key_id,
+                release_sequence=1,
+                issued_at="2026-11-12T10:05:00Z",
+                expires_at="2026-12-12T10:05:00Z",
+            )
+
+            att_file = out_dir / ATTESTATION_NAME
+            att = json.loads(att_file.read_text(encoding="utf-8"))
+
+            # Tamper outer key_id
+            tampered_att = dict(att)
+            tampered_att["key_id"] = "different-key-id"
+            att_file.write_text(canonical_json(tampered_att) + "\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "outer attestation key_id '.*' does not match"):
+                verify_real_release(out_dir, trust=self.trust, now="2026-11-12T11:00:00Z")
 
     def test_forged_signature_rejected(self):
         ev, obs = make_test_pair()
@@ -478,7 +623,7 @@ class TestDetachedEd25519SigningAndVerification(unittest.TestCase):
                 expires_at="2026-04-01T10:05:00Z",
             )
             res1 = verify_real_release(dir1, trust=trust, now="2026-03-15T12:00:00Z")
-            self.assertTrue(res1["verified"])
+            self.assertTrue(res1["authenticated"])
             self.assertEqual(res1["key_id"], "operator-k1")
 
             # Release 2 signed by Key 2 in August
@@ -493,14 +638,12 @@ class TestDetachedEd25519SigningAndVerification(unittest.TestCase):
                 expires_at="2026-09-01T10:05:00Z",
             )
             res2 = verify_real_release(dir2, trust=trust, now="2026-08-15T12:00:00Z")
-            self.assertTrue(res2["verified"])
+            self.assertTrue(res2["authenticated"])
             self.assertEqual(res2["key_id"], "operator-k2")
 
 
 class TestReplayAndRollbackProtection(unittest.TestCase):
     def setUp(self):
-        if not HAVE_CRYPTO:
-            self.skipTest("cryptography[signing] extra not installed")
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
         from cryptography.hazmat.primitives import serialization
 
@@ -521,7 +664,7 @@ class TestReplayAndRollbackProtection(unittest.TestCase):
         ev, obs = make_test_pair()
         with TemporaryDirectory() as tmp:
             state_file = Path(tmp) / "verifier_state.json"
-            tracker = ReleaseSequenceTracker(state_file)
+            tracker = ReleaseSequenceTracker(state_file, auto_init=True)
 
             # Step 1: Verify Sequence 5
             dir5 = Path(tmp) / "rel_5"
@@ -535,7 +678,7 @@ class TestReplayAndRollbackProtection(unittest.TestCase):
                 expires_at="2026-12-12T10:05:00Z",
             )
             res5 = verify_real_release(dir5, trust=self.trust, now="2026-11-12T11:00:00Z", sequence_tracker=tracker)
-            self.assertTrue(res5["verified"])
+            self.assertTrue(res5["authenticated"])
             self.assertEqual(tracker.get_last_accepted_sequence("anie-first-party"), 5)
 
             # Step 2: Attempting Sequence 4 (Downgrade/Replay attack)
@@ -562,9 +705,81 @@ class TestReplayAndRollbackProtection(unittest.TestCase):
                 sequence_tracker=tracker,
                 allow_rollback=True,
             )
-            self.assertTrue(res_hist["verified"])
+            self.assertTrue(res_hist["authenticated"])
             # High-water mark remains at 5
             self.assertEqual(tracker.get_last_accepted_sequence("anie-first-party"), 5)
+
+    def test_tracker_corruption_fails_closed(self):
+        """Malformed or unreadable state file must raise TrackerStateError and never reset to zero."""
+        with TemporaryDirectory() as tmp:
+            state_file = Path(tmp) / "state.json"
+            tracker = ReleaseSequenceTracker(state_file)
+            tracker.initialize()
+            tracker.update_accepted_sequence("anie-first-party", 10)
+
+            # Corrupt the state file
+            state_file.write_text("{malformed json corrupt state")
+
+            # Must fail closed with TrackerStateError, never return 0 or reset
+            with self.assertRaises(TrackerStateError):
+                tracker.get_last_accepted_sequence("anie-first-party")
+
+            with self.assertRaises(TrackerStateError):
+                tracker.update_accepted_sequence("anie-first-party", 11)
+
+    def test_tracker_missing_state_after_init(self):
+        """Deleting state file after initialization must be detected as TrackerStateLostError."""
+        with TemporaryDirectory() as tmp:
+            state_file = Path(tmp) / "state.json"
+            tracker = ReleaseSequenceTracker(state_file)
+            tracker.initialize()
+            self.assertTrue(tracker.is_initialized())
+            self.assertEqual(tracker.get_last_accepted_sequence("anie-first-party"), 0)
+
+            # Unexpected deletion
+            state_file.unlink()
+            self.assertFalse(tracker.is_initialized())
+
+            with self.assertRaises(TrackerStateLostError):
+                tracker.get_last_accepted_sequence("anie-first-party")
+
+    def test_tracker_concurrent_updates_prevent_downgrade(self):
+        """Concurrent verifiers cannot cause a lower sequence to overwrite a higher accepted sequence."""
+        with TemporaryDirectory() as tmp:
+            state_file = Path(tmp) / "concurrent_state.json"
+            tracker = ReleaseSequenceTracker(state_file, auto_init=True)
+
+            def worker(seq: int):
+                try:
+                    tracker.update_accepted_sequence("anie-first-party", seq)
+                    return True
+                except ValueError:
+                    # Expected if racing behind a higher sequence
+                    return False
+
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                # Dispatch random order sequences
+                futures = [ex.submit(worker, s) for s in [5, 12, 8, 20, 15, 22, 10, 25]]
+                results = [f.result() for f in futures]
+
+            final_seq = tracker.get_last_accepted_sequence("anie-first-party")
+            # Highest sequence submitted was 25
+            self.assertEqual(final_seq, 25)
+
+    def test_tracker_write_failure_clean_rollback(self):
+        """Write or replace failure leaves original state file uncorrupted."""
+        with TemporaryDirectory() as tmp:
+            state_file = Path(tmp) / "atomic_state.json"
+            tracker = ReleaseSequenceTracker(state_file, auto_init=True)
+            tracker.update_accepted_sequence("anie-first-party", 10)
+
+            # Simulate failure during replace
+            with patch.object(Path, "replace", side_effect=OSError("simulated disk full")):
+                with self.assertRaises(OSError):
+                    tracker.update_accepted_sequence("anie-first-party", 20)
+
+            # Original state remains intact at 10
+            self.assertEqual(tracker.get_last_accepted_sequence("anie-first-party"), 10)
 
 
 class TestResourceLimitsAndSafety(unittest.TestCase):
@@ -574,12 +789,22 @@ class TestResourceLimitsAndSafety(unittest.TestCase):
             out_dir = Path(tmp) / "release"
             publish_real(([obs], [ev]), out_dir, as_of="2026-11-12T10:00:00Z")
 
-            # Replace observations.jsonl.gz with a gzip payload exceeding MAX_PARTITION_DECOMPRESSED_BYTES
+            # Test that decompressing a partition exceeding the configured limit is rejected fail-closed
+            with patch("anie.real_publish.MAX_PARTITION_DECOMPRESSED_BYTES", 200):
+                with self.assertRaisesRegex(ValueError, "exceeded decompression limit"):
+                    verify_real_release(out_dir, integrity_only=True)
+
+    def test_single_record_byte_limit_rejected(self):
+        ev, obs = make_test_pair()
+        with TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "release"
+            publish_real(([obs], [ev]), out_dir, as_of="2026-11-12T10:00:00Z")
+
             obs_file = out_dir / "real_observations.jsonl.gz"
-            huge_data = b"X" * (MAX_PARTITION_DECOMPRESSED_BYTES + 1024)
+            huge_line = b"X" * 600000 + b"\n"  # Exceeds 500,000 byte limit
             with obs_file.open("wb") as raw:
                 with gzip.GzipFile(fileobj=raw, mode="wb", filename="", mtime=0) as gz:
-                    gz.write(huge_data)
+                    gz.write(huge_line)
 
             man_file = out_dir / "manifest.json"
             man_data = json.loads(man_file.read_text(encoding="utf-8"))
@@ -587,8 +812,8 @@ class TestResourceLimitsAndSafety(unittest.TestCase):
             man_data["files"][0]["bytes"] = obs_file.stat().st_size
             man_file.write_text(canonical_json(man_data) + "\n", encoding="utf-8")
 
-            with self.assertRaisesRegex(ValueError, "exceeded decompression limit"):
-                verify_real_release(out_dir, trust=None)
+            with self.assertRaisesRegex(ValueError, "exceeds byte limit"):
+                verify_real_release(out_dir, integrity_only=True)
 
     def test_truncated_archive_rejected(self):
         ev, obs = make_test_pair()
@@ -602,39 +827,53 @@ class TestResourceLimitsAndSafety(unittest.TestCase):
             obs_file.write_bytes(raw_bytes[: len(raw_bytes) // 2])
 
             with self.assertRaises(ValueError):
-                verify_real_release(out_dir, trust=None)
+                verify_real_release(out_dir, integrity_only=True)
+
+
+class TestKeyLoadingAndOfflineWorkflow(unittest.TestCase):
+    def test_strict_key_loading_pem_and_raw(self):
+        """Strict loaders accept valid PEM and 32 raw bytes; reject truncated/corrupted keys."""
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        from cryptography.hazmat.primitives import serialization
+
+        priv = Ed25519PrivateKey.generate()
+        pem_bytes = priv.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        pub_raw = priv.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+
+        with TemporaryDirectory() as tmp:
+            pem_path = Path(tmp) / "priv.pem"
+            pem_path.write_bytes(pem_bytes)
+
+            raw_path = Path(tmp) / "pub.raw"
+            raw_path.write_bytes(pub_raw)
+
+            # Valid loads
+            loaded_priv = load_private_key_file(pem_path)
+            self.assertIsInstance(loaded_priv, Ed25519PrivateKey)
+
+            loaded_pub = load_public_key_file(raw_path)
+            self.assertEqual(loaded_pub, pub_raw)
+
+            # Truncated raw key must fail closed without fallback
+            bad_raw = Path(tmp) / "bad.raw"
+            bad_raw.write_bytes(b"\x00" * 16)  # 16 bytes instead of 32
+            with self.assertRaisesRegex(ValueError, "unsupported private key format|permissive truncation"):
+                load_private_key_file(bad_raw)
+
+            with self.assertRaisesRegex(ValueError, "unsupported public key format|permissive truncation"):
+                load_public_key_file(bad_raw)
 
 
 class TestCliRealPublication(unittest.TestCase):
-    def test_cli_publish_real_and_verify_real(self):
-        ev, obs = make_test_pair()
-        with TemporaryDirectory() as tmp:
-            db_path = Path(tmp) / "real.sqlite"
-            store = RealObservationStore(db_path)
-            store.insert_record(ev, obs)
-
-            out_dir = Path(tmp) / "release_cli"
-
-            # 1. Unsigned export via CLI
-            exit_pub = cli_main([
-                "publish-real",
-                "--db", str(db_path),
-                "--out", str(out_dir),
-                "--as-of", "2026-11-12T10:00:00Z",
-                "--sequence", "1",
-            ])
-            self.assertEqual(exit_pub, 0)
-            self.assertTrue((out_dir / "manifest.json").exists())
-
-            # 2. Unsigned verification via CLI
-            exit_ver = cli_main([
-                "verify-real",
-                "--dir", str(out_dir),
-            ])
-            self.assertEqual(exit_ver, 0)
-
-    @unittest.skipUnless(HAVE_CRYPTO, "cryptography required for detached signing test")
-    def test_cli_detached_sign_and_signed_verify(self):
+    def test_cli_detached_offline_signing_workflow(self):
+        """Full genuine offline signing and verification CLI workflow."""
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
         from cryptography.hazmat.primitives import serialization
 
@@ -659,30 +898,80 @@ class TestCliRealPublication(unittest.TestCase):
             key_file.write_bytes(priv_pem)
             pub_file = Path(tmp) / "operator.pub"
             pub_file.write_bytes(pub_raw)
+            state_file = Path(tmp) / "verifier_state.json"
 
-            out_dir = Path(tmp) / "signed_release_cli"
+            out_dir = Path(tmp) / "release_cli"
 
-            # 1. Export and detached sign via CLI
+            # 1. Collector VM exports unsigned candidate release
             exit_pub = cli_main([
                 "publish-real",
                 "--db", str(db_path),
                 "--out", str(out_dir),
                 "--as-of", "2026-11-12T10:00:00Z",
                 "--sequence", "1",
-                "--sign-key", str(key_file),
-                "--key-id", "operator-cli-key",
             ])
             self.assertEqual(exit_pub, 0)
+            self.assertTrue((out_dir / "manifest.json").exists())
+            self.assertFalse((out_dir / ATTESTATION_NAME).exists())
+
+            # 2. Inspect unsigned candidate using --integrity-only
+            exit_cand = cli_main([
+                "verify-real",
+                "--dir", str(out_dir),
+                "--integrity-only",
+            ])
+            self.assertEqual(exit_cand, 0)
+
+            # 3. Unsigned verification without --integrity-only and without --key-file fails
+            exit_fail = cli_main([
+                "verify-real",
+                "--dir", str(out_dir),
+            ])
+            self.assertEqual(exit_fail, 2)
+
+            # 4. Operator machine executes detached offline signing
+            exit_sign = cli_main([
+                "sign-real",
+                "--dir", str(out_dir),
+                "--key-file", str(key_file),
+                "--key-id", "operator-2026-key",
+                "--sequence", "1",
+                "--publisher", "anie-first-party",
+            ])
+            self.assertEqual(exit_sign, 0)
             self.assertTrue((out_dir / ATTESTATION_NAME).exists())
 
-            # 2. Signed verify via CLI
+            # 5. Independent consumer verifies signed release with state tracker
             exit_ver = cli_main([
                 "verify-real",
                 "--dir", str(out_dir),
                 "--key-file", str(pub_file),
-                "--key-id", "operator-cli-key",
+                "--key-id", "operator-2026-key",
+                "--state-file", str(state_file),
+                "--init-state",
             ])
             self.assertEqual(exit_ver, 0)
+
+            # 6. Re-verifying same release sequence fails due to anti-replay
+            exit_replay = cli_main([
+                "verify-real",
+                "--dir", str(out_dir),
+                "--key-file", str(pub_file),
+                "--key-id", "operator-2026-key",
+                "--state-file", str(state_file),
+            ])
+            self.assertEqual(exit_replay, 2)  # ValueError caught by CLI
+
+            # 7. Auditing with --allow-rollback succeeds
+            exit_audit = cli_main([
+                "verify-real",
+                "--dir", str(out_dir),
+                "--key-file", str(pub_file),
+                "--key-id", "operator-2026-key",
+                "--state-file", str(state_file),
+                "--allow-rollback",
+            ])
+            self.assertEqual(exit_audit, 0)
 
 
 if __name__ == "__main__":

@@ -32,15 +32,28 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--publisher", default="anie-first-party", help="publisher identity")
     p.add_argument("--sequence", type=int, default=1, help="monotonically increasing release sequence")
     p.add_argument("--commit", default=None, help="source repository commit hash")
-    p.add_argument("--sign-key", default=None, help="optional path to Ed25519 private key for detached signing")
-    p.add_argument("--key-id", default=None, help="key ID for detached signature (required if --sign-key is given)")
+    p.add_argument("--published-at", default=None, help="optional fixed publication timestamp for reproducible manifest")
+    p = sub.add_parser("sign-real", help="detached offline Ed25519 signing of candidate release")
+    p.add_argument("--dir", required=True, help="path to unsigned candidate release directory")
+    p.add_argument("--key-file", required=True, help="path to operator Ed25519 private key (PEM or 32 raw bytes)")
+    p.add_argument("--key-id", required=True, help="operator key identifier")
+    p.add_argument("--sequence", type=int, required=True, help="expected release sequence (must match manifest)")
+    p.add_argument("--publisher", default="anie-first-party", help="expected publisher (must match manifest)")
+    p.add_argument("--commit", default=None, help="expected source commit (must match manifest if given)")
+    p.add_argument("--issued-at", default=None, help="optional ISO-8601 signature issuance timestamp (defaults to now)")
+    p.add_argument("--expires-at", default=None, help="optional ISO-8601 signature expiration timestamp (defaults to issued_at + 30 days)")
+    p.add_argument("--valid-days", type=int, default=30, help="validity window in days if expires-at is not set")
     p = sub.add_parser("verify-real", help="verify integrity, evidence, and Ed25519 signature of real dataset")
     p.add_argument("--dir", required=True, help="path to publication directory")
-    p.add_argument("--key-file", default=None, help="optional path to operator-pinned Ed25519 public key file")
+    p.add_argument("--key-file", default=None, help="path to operator-pinned Ed25519 public key file (required for authenticated verification)")
     p.add_argument("--key-id", default=None, help="expected key ID (default: key-1)")
     p.add_argument("--state-file", default=None, help="path to sequence tracking state file for rollback protection")
+    p.add_argument("--init-state", action="store_true", help="explicitly initialize state file if missing")
     p.add_argument("--allow-rollback", action="store_true", help="allow historical verification without rollback error")
+    p.add_argument("--integrity-only", action="store_true", help="inspect candidate release integrity without cryptographic authentication")
     p.add_argument("--now", default=None, help="optional frozen timestamp for verification")
+    p.add_argument("--expected-publisher", default="anie-first-party", help="expected publisher identity")
+    p.add_argument("--expected-commit", default=None, help="expected source repository commit hash")
     p = sub.add_parser("collect-batch", help="execute bounded one-shot batch collection")
     p.add_argument("--domains", nargs="+", default=["example.com", "iana.org"], help="target domains (max 2)")
     p.add_argument("--kind", choices=["alternate", "dns_a", "dns_aaaa"], default="alternate", help="query record kind")
@@ -81,8 +94,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "verify":
             print(json.dumps(verify_release(args.dir), indent=2))
         elif args.command == "publish-real":
-            from datetime import datetime, timedelta, timezone
-            from .real_publish import publish_real, sign_manifest_detached
+            from .real_publish import publish_real
             from .real_store import RealObservationStore
             store = RealObservationStore(args.db)
             manifest = publish_real(
@@ -92,67 +104,88 @@ def main(argv: list[str] | None = None) -> int:
                 publisher_identity=args.publisher,
                 release_sequence=args.sequence,
                 source_commit=args.commit,
+                published_at=args.published_at,
             )
-            attestation = None
-            if args.sign_key:
-                if not args.key_id:
-                    raise ValueError("--key-id is required when --sign-key is provided")
-                from cryptography.hazmat.primitives import serialization
-                key_path = Path(args.sign_key)
-                key_bytes = key_path.read_bytes()
-                try:
-                    priv_key = serialization.load_pem_private_key(key_bytes, password=None)
-                except Exception:
-                    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-                    priv_key = Ed25519PrivateKey.from_private_bytes(key_bytes[:32])
-                now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-                expires_iso = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat(timespec="seconds").replace("+00:00", "Z")
-                attestation = sign_manifest_detached(
-                    args.out,
-                    priv_key,
-                    key_id=args.key_id,
-                    release_sequence=args.sequence,
-                    issued_at=now_iso,
-                    expires_at=expires_iso,
-                    publisher_identity=args.publisher,
-                    source_commit=args.commit,
-                )
-            result = {"published": True, "manifest": manifest}
-            if attestation:
-                result["attestation"] = attestation
-            print(json.dumps(result, indent=2))
+            print(json.dumps({"published": True, "manifest": manifest}, indent=2))
+            return 0
+        elif args.command == "sign-real":
+            from datetime import datetime, timedelta, timezone
+            from .real_publish import (
+                load_private_key_file,
+                sign_manifest_detached,
+                verify_real_release,
+            )
+            # 1. Validate candidate release integrity before signing
+            verify_real_release(args.dir, integrity_only=True)
+            # 2. Strict key loading
+            priv_key = load_private_key_file(args.key_file)
+            now_dt = datetime.now(timezone.utc)
+            issued_iso = args.issued_at or now_dt.isoformat(timespec="seconds").replace("+00:00", "Z")
+            if args.expires_at:
+                expires_iso = args.expires_at
+            else:
+                issued_parsed = datetime.fromisoformat(issued_iso.replace("Z", "+00:00"))
+                expires_iso = (issued_parsed + timedelta(days=args.valid_days)).isoformat(timespec="seconds").replace("+00:00", "Z")
+            attestation = sign_manifest_detached(
+                args.dir,
+                priv_key,
+                key_id=args.key_id,
+                release_sequence=args.sequence,
+                issued_at=issued_iso,
+                expires_at=expires_iso,
+                publisher_identity=args.publisher,
+                source_commit=args.commit,
+            )
+            print(json.dumps({"signed": True, "attestation": attestation}, indent=2))
             return 0
         elif args.command == "verify-real":
-            from .real_publish import RealReleaseTrust, ReleaseSequenceTracker, verify_real_release
+            from .real_publish import (
+                RealReleaseTrust,
+                ReleaseSequenceTracker,
+                TrackerStateError,
+                TrackerStateLostError,
+                load_public_key_file,
+                verify_real_release,
+            )
+            if not args.integrity_only and not args.key_file:
+                print(
+                    "ANIE error: --key-file is required for authenticated verification; "
+                    "pass --integrity-only to inspect unsigned candidate release",
+                    file=sys.stderr,
+                )
+                return 2
+
             trust = None
             if args.key_file:
-                key_path = Path(args.key_file)
-                key_bytes = key_path.read_bytes()
-                if len(key_bytes) == 32:
-                    pub_bytes = key_bytes
-                else:
-                    from cryptography.hazmat.primitives import serialization
-                    pub = serialization.load_pem_public_key(key_bytes)
-                    pub_bytes = pub.public_bytes(
-                        encoding=serialization.Encoding.Raw,
-                        format=serialization.PublicFormat.Raw,
-                    )
+                pub_bytes = load_public_key_file(args.key_file)
                 key_id = args.key_id or "key-1"
                 trust = RealReleaseTrust.from_single_key(
                     key_id=key_id,
                     public_key_raw=pub_bytes,
                     valid_from="2026-01-01T00:00:00Z",
-                    valid_until="2027-01-01T00:00:00Z",
+                    valid_until="2030-01-01T00:00:00Z",
+                    expected_publisher=args.expected_publisher,
+                    expected_source_commit=args.expected_commit,
                 )
-            tracker = ReleaseSequenceTracker(args.state_file) if args.state_file else None
+
+            tracker = None
+            if args.state_file:
+                tracker = ReleaseSequenceTracker(args.state_file, auto_init=args.init_state)
+
             res = verify_real_release(
                 args.dir,
                 trust=trust,
+                integrity_only=args.integrity_only,
                 now=args.now,
                 allow_rollback=args.allow_rollback,
                 sequence_tracker=tracker,
+                allow_uninitialized_state=args.init_state,
             )
             print(json.dumps(res, indent=2))
+            if not args.integrity_only and not res.get("authenticated"):
+                return 1
+            if args.integrity_only and not res.get("evidence_integrity_valid"):
+                return 1
             return 0
         elif args.command == "collect-batch":
             from .orchestrator import BatchConfig, BatchOrchestrator
