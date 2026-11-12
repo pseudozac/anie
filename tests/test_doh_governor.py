@@ -6,7 +6,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import socket
 import sqlite3
+import sys
 from tempfile import TemporaryDirectory
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -170,17 +172,51 @@ class TestDohGovernorAdversarial(unittest.TestCase):
                     gov.check_and_reserve("example.com", "cloudflare_doh")
 
     def test_dns_resolution_delay_exhausts_deadline(self):
-        def stalled_addrinfo(host, port, type=socket.SOCK_STREAM):
-            time.sleep(1.0)
-            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("104.16.132.229", 443))]
-
-        # If resolution deadline is 0.1s, it must raise TimeoutError without waiting forever
+        # A resolver operation that sleeps 60s in an isolated child process
+        hanging_cmd = [sys.executable, "-c", "import time; time.sleep(60)"]
+        t0 = time.monotonic()
         with self.assertRaises(TimeoutError):
             resolve_and_pin_endpoint(
                 "cloudflare-dns.com",
-                getaddrinfo_fn=stalled_addrinfo,
-                timeout=0.1,
+                timeout=0.15,
+                subproc_cmd=hanging_cmd,
             )
+        elapsed = time.monotonic() - t0
+        # Main execution path must return promptly within ~0.2-0.5s, NOT block for 60s
+        self.assertLess(elapsed, 0.8)
+
+    def test_repeated_dns_timeouts_do_not_leak_resources(self):
+        hanging_cmd = [sys.executable, "-c", "import time; time.sleep(60)"]
+        initial_threads = threading.active_count()
+        for _ in range(5):
+            with self.assertRaises(TimeoutError):
+                resolve_and_pin_endpoint(
+                    "cloudflare-dns.com",
+                    timeout=0.08,
+                    subproc_cmd=hanging_cmd,
+                )
+        # Verify zero background threads leaked
+        self.assertEqual(threading.active_count(), initial_threads)
+
+    def test_sqlite_lock_contention_bounded_deadline(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "locked_rate.sqlite"
+            # Configured default busy timeout is 5000ms
+            gov = DohRateGovernor(db_path, target_cooldown_seconds=1800.0, busy_timeout_ms=5000)
+
+            locking_conn = sqlite3.connect(db_path)
+            locking_conn.execute("BEGIN EXCLUSIVE")
+
+            t0 = time.monotonic()
+            try:
+                # With deadline timeout=0.12s, lock acquisition must fail closed within ~0.3s, not wait 5.0s
+                with self.assertRaises((ScopeDenied, TimeoutError)):
+                    gov.check_and_reserve("example.com", "cloudflare_doh", timeout=0.12)
+                elapsed = time.monotonic() - t0
+                self.assertLess(elapsed, 0.6)
+            finally:
+                locking_conn.execute("ROLLBACK")
+                locking_conn.close()
 
 
 if __name__ == "__main__":

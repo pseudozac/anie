@@ -4,10 +4,10 @@
 
 - PR 2: First-party DNS-over-HTTPS (DoH) collection engine (`DohCollector`) and policy governor (`DohRateGovernor`).
 - Strict target allowlist limited to `example.com` and `iana.org`, query kinds `dns_a` and `dns_aaaa`, and batch domain size limit ($\le 2$ domains per invocation).
-- Anti-rebinding resolver endpoint resolution requiring all returned IPs to be verified global addresses before socket allocation, with bounded resolution execution via thread pool.
-- Persistent SQLite-backed rate governor with atomic `BEGIN IMMEDIATE` multi-process locking, per-target 30-minute cooldown, conservative hourly quotas, and fail-closed error handling. Ephemeral in-memory storage restricted strictly to explicit test mode.
+- Anti-rebinding resolver endpoint resolution requiring all returned IPs to be verified global addresses before socket allocation, with isolated subprocess-based execution guaranteeing hard cancellation without blocking context managers or leaking threads/processes.
+- Persistent SQLite-backed rate governor with atomic `BEGIN IMMEDIATE` multi-process locking, deadline-bounded lock acquisition, per-target 30-minute cooldown, conservative hourly quotas, and fail-closed error handling. Ephemeral in-memory storage restricted strictly to explicit test mode.
 - Full RFC 8484 wire-format exchange with bounded response capture ($\le 65,535$ bytes) and SHA-256 evidence integrity.
-- Monotonic wall-clock deadline enforcement encompassing endpoint resolution, connection, TLS handshake, chunked body reading, and retries without deadline reset.
+- Comprehensive monotonic wall-clock deadline enforcement encompassing SQLite lock acquisition, endpoint resolution, TCP connect, TLS handshake, HTTP request transmission, response headers, chunked body streaming, and bounded retries without deadline reset.
 - Explicit DNS response classification for ANSWER, NXDOMAIN, NODATA, SERVFAIL, and REFUSED.
 - Resolver AD flag recorded strictly as an untrusted third-party claim (`resolver_ad_claim=True`) while `dnssec_status` remains `'indeterminate'` without independent cryptographic proof.
 - Mandatory invariants: SERVFAIL recorded as error without inferring DNSSEC-bogus; analytical confidence kept strictly nullable (`None`).

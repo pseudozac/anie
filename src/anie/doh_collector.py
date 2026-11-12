@@ -63,17 +63,32 @@ class _PinnedHttpsConnection(http.client.HTTPSConnection):
         ip: str,
         host: str,
         timeout: float = DEFAULT_TOTAL_TIMEOUT_SECONDS,
+        deadline: float | None = None,
     ):
         self._pinned_ip_address = ensure_global_ip(ip)
+        self._deadline = deadline
         context = ssl.create_default_context()
         context.minimum_version = ssl.TLSVersion.TLSv1_2
         super().__init__(host, port=443, timeout=timeout, context=context)
 
+    def _get_remaining(self) -> float:
+        if self._deadline is not None:
+            rem = self._deadline - time.monotonic()
+            if rem <= 0:
+                raise TimeoutError("monotonic execution deadline exhausted before socket operation")
+            return rem
+        return self.timeout
+
     def connect(self):
+        # 1. TCP connection using fresh remaining deadline
+        rem_tcp = self._get_remaining()
         sock = socket.create_connection(
-            (self._pinned_ip_address, 443), timeout=self.timeout
+            (self._pinned_ip_address, 443), timeout=rem_tcp
         )
         try:
+            # 2. TLS handshake using fresh remaining deadline
+            rem_tls = self._get_remaining()
+            sock.settimeout(rem_tls)
             self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
         except BaseException:
             sock.close()
@@ -89,8 +104,9 @@ class DohCollector:
         quota_db_path: str | Path | None = None,
         resolver_url: str = "https://cloudflare-dns.com/dns-query",
         timeout_seconds: float = DEFAULT_TOTAL_TIMEOUT_SECONDS,
-        connection_factory: Callable[[str, str, float], Any] | None = None,
-        addrinfo_fn: Callable[..., list[Any]] = socket.getaddrinfo,
+        connection_factory: Callable[..., Any] | None = None,
+        addrinfo_fn: Callable[..., list[Any]] | None = None,
+        subproc_cmd: list[str] | None = None,
     ):
         self.resolver_host, self.resolver_path = validate_resolver_endpoint(resolver_url)
         self.resolver_url = resolver_url
@@ -109,6 +125,7 @@ class DohCollector:
         self.timeout_seconds = float(timeout_seconds)
         self._connection_factory = connection_factory or _PinnedHttpsConnection
         self._addrinfo_fn = addrinfo_fn
+        self._subproc_cmd = subproc_cmd
 
     def _execute_http_get(
         self,
@@ -133,9 +150,33 @@ class DohCollector:
             if rem_timeout <= 0:
                 raise TimeoutError(f"overall DoH deadline ({self.timeout_seconds:.2f}s) exceeded")
 
-            conn = self._connection_factory(pinned_ip, self.resolver_host, rem_timeout)
             try:
+                conn = self._connection_factory(pinned_ip, self.resolver_host, rem_timeout, deadline=deadline)
+            except TypeError:
+                conn = self._connection_factory(pinned_ip, self.resolver_host, rem_timeout)
+
+            try:
+                # Ensure connection is established before request
+                if not hasattr(conn, "sock") or conn.sock is None:
+                    if hasattr(conn, "connect"):
+                        conn.connect()
+
+                # HTTP request transmission under actual remaining deadline
+                rem_req = deadline - time.monotonic()
+                if rem_req <= 0:
+                    raise TimeoutError(f"overall DoH deadline ({self.timeout_seconds:.2f}s) exceeded before request")
+                if hasattr(conn, "sock") and conn.sock is not None:
+                    conn.sock.settimeout(rem_req)
+
                 conn.request("GET", request_path, headers=headers)
+
+                # HTTP response headers under actual remaining deadline
+                rem_resp = deadline - time.monotonic()
+                if rem_resp <= 0:
+                    raise TimeoutError(f"overall DoH deadline ({self.timeout_seconds:.2f}s) exceeded waiting for response headers")
+                if hasattr(conn, "sock") and conn.sock is not None:
+                    conn.sock.settimeout(rem_resp)
+
                 response = conn.getresponse()
 
                 # Treat redirects (HTTP 3xx) as a scope violation
@@ -205,18 +246,19 @@ class DohCollector:
         # 1. Scope & Allowlist enforcement
         norm_domain, norm_kind = validate_target(domain, kind)
 
-        # 2. Rate governor budget check and reservation
+        # 2. Rate governor budget check and reservation with monotonic deadline
         observed_at_iso = self.rate_governor.check_and_reserve(
-            norm_domain, RESOLVER_IDENTITY, now_dt=now_dt
+            norm_domain, RESOLVER_IDENTITY, now_dt=now_dt, timeout=remaining_timeout()
         )
 
-        # 3. Bounded endpoint resolution & Anti-rebinding IP pinning
+        # 3. Bounded endpoint resolution under monotonic deadline
         res_timeout = min(remaining_timeout(), DEFAULT_RESOLVER_DNS_TIMEOUT)
         pinned_ip = resolve_and_pin_endpoint(
             self.resolver_host,
             port=443,
-            getaddrinfo_fn=self._addrinfo_fn,
+            addrinfo_fn=self._addrinfo_fn,
             timeout=res_timeout,
+            subproc_cmd=self._subproc_cmd,
         )
 
         # 4. Generate RFC 1035 wire query

@@ -15,12 +15,14 @@ Enforces fail-closed security invariants before any network socket can be alloca
 """
 from __future__ import annotations
 
-import concurrent.futures
 from contextlib import contextmanager
 from datetime import datetime, timezone
+import json
 from pathlib import Path
 import socket
 import sqlite3
+import subprocess
+import sys
 import time
 from typing import Any, Callable
 from urllib.parse import urlsplit
@@ -98,39 +100,130 @@ def validate_resolver_endpoint(url: str) -> tuple[str, str]:
     return parsed.hostname, parsed.path or "/dns-query"
 
 
+_SUBPROCESS_RESOLVER_SCRIPT = """
+import json
+import socket
+import sys
+
+def main():
+    if len(sys.argv) < 3:
+        sys.exit(2)
+    host = sys.argv[1]
+    port = int(sys.argv[2])
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        addresses = list({info[4][0] for info in infos})
+        json.dump({"status": "ok", "addresses": addresses}, sys.stdout)
+    except socket.gaierror as exc:
+        json.dump({"status": "gaierror", "error": str(exc)}, sys.stdout)
+    except Exception as exc:
+        json.dump({"status": "error", "error": str(exc)}, sys.stdout)
+
+if __name__ == "__main__":
+    main()
+"""
+
+
+def resolve_host_in_subprocess(
+    host: str,
+    port: int = 443,
+    timeout: float = DEFAULT_RESOLVER_DNS_TIMEOUT,
+    subproc_cmd: list[str] | None = None,
+) -> list[str]:
+    """Execute resolver hostname resolution in an isolated subprocess with explicit cancellation.
+    
+    If libc getaddrinfo or OS network resolution blocks indefinitely, the child process
+    is forcefully killed via proc.kill() (SIGKILL on POSIX, TerminateProcess on Windows)
+    and reaped via proc.wait(), guaranteeing zero leaked threads, zero orphan processes,
+    and returning control immediately to the caller within the configured deadline.
+    """
+    cmd = subproc_cmd if subproc_cmd is not None else [
+        sys.executable, "-c", _SUBPROCESS_RESOLVER_SCRIPT, host, str(port)
+    ]
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        proc.kill()
+        try:
+            proc.wait(timeout=1.0)
+        except Exception:
+            pass
+        raise TimeoutError(
+            f"resolver host '{host}' resolution exceeded deadline of {timeout:.2f}s"
+        ) from exc
+    except BaseException:
+        proc.kill()
+        try:
+            proc.wait(timeout=1.0)
+        except Exception:
+            pass
+        raise
+
+    if proc.returncode != 0 and not stdout:
+        raise ScopeDenied(
+            f"resolver subprocess exited with code {proc.returncode}: {stderr.strip()}"
+        )
+
+    try:
+        data = json.loads(stdout)
+    except Exception as exc:
+        raise ScopeDenied(f"invalid JSON response from resolver subprocess: {exc}") from exc
+
+    status = data.get("status")
+    if status == "ok":
+        return data.get("addresses", [])
+    elif status == "gaierror":
+        raise ScopeDenied(f"failed to resolve DoH resolver endpoint '{host}': {data.get('error')}")
+    else:
+        raise ScopeDenied(f"resolver subprocess error: {data.get('error')}")
+
+
 def resolve_and_pin_endpoint(
     host: str,
     port: int = 443,
-    getaddrinfo_fn: Callable[..., list[Any]] = socket.getaddrinfo,
+    addrinfo_fn: Callable[..., list[Any]] | None = None,
     timeout: float = DEFAULT_RESOLVER_DNS_TIMEOUT,
+    subproc_cmd: list[str] | None = None,
 ) -> str:
     """Resolve fixed resolver host within bounded deadline, enforcing global IP routing (Anti-Rebinding).
     
-    Uses concurrent execution to ensure blocking C-level getaddrinfo cannot exceed timeout.
+    Subprocess isolation is used by default to ensure blocking C-level getaddrinfo calls
+    cannot keep the main execution path blocked or leak worker threads.
     If ANY resolved IP is private, reserved, loopback, or documentation, fails closed.
     Returns the first approved deterministic global IP.
     """
     if host not in ALLOWED_RESOLVER_HOSTS:
         raise ScopeDenied(f"resolver host '{host}' not authorized for address resolution")
 
-    # Bounded resolver execution to prevent un-timeoutable DNS hangs
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(getaddrinfo_fn, host, port, type=socket.SOCK_STREAM)
+    if timeout <= 0:
+        raise TimeoutError(
+            f"resolver host '{host}' resolution deadline exhausted (remaining: {timeout:.2f}s)"
+        )
+
+    # Use subprocess isolation when no in-memory mock addrinfo_fn is provided or subproc_cmd is set
+    if subproc_cmd is not None or addrinfo_fn is None or addrinfo_fn is socket.getaddrinfo:
+        raw_addresses = resolve_host_in_subprocess(
+            host, port, timeout=timeout, subproc_cmd=subproc_cmd
+        )
+    else:
+        # Fast direct execution for mocked unit test fixtures
         try:
-            infos = future.result(timeout=timeout)
-        except concurrent.futures.TimeoutError as exc:
-            raise TimeoutError(
-                f"resolver host '{host}' resolution exceeded deadline of {timeout:.2f}s"
-            ) from exc
+            infos = addrinfo_fn(host, port, type=socket.SOCK_STREAM)
+            raw_addresses = [info[4][0] for info in infos]
         except socket.gaierror as exc:
             raise ScopeDenied(f"failed to resolve DoH resolver endpoint '{host}'") from exc
 
-    if not infos or len(infos) > 32:
+    if not raw_addresses or len(raw_addresses) > 32:
         raise ScopeDenied("DoH resolver address set empty or exceeds allowable limit")
 
-    addresses = {info[4][0] for info in infos}
     approved_addresses = []
-    for addr in addresses:
+    for addr in set(raw_addresses):
         try:
             global_addr = ensure_global_ip(addr)
             approved_addresses.append(global_addr)
@@ -224,8 +317,9 @@ class DohRateGovernor:
             self._mem_conn = None
 
     @contextmanager
-    def _connect(self):
+    def _connect(self, busy_timeout_ms: int | None = None):
         """Acquire database connection with fail-closed error handling."""
+        ms = busy_timeout_ms if busy_timeout_ms is not None else self.busy_timeout_ms
         if self._is_memory:
             if self._mem_conn is None:
                 raise ScopeDenied("quota database unavailable (connection closed)")
@@ -237,11 +331,11 @@ class DohRateGovernor:
                 raise
         else:
             try:
-                conn = sqlite3.connect(self.db_path, timeout=self.busy_timeout_ms / 1000.0, isolation_level=None)
+                conn = sqlite3.connect(self.db_path, timeout=ms / 1000.0, isolation_level=None)
             except (sqlite3.Error, OSError) as exc:
                 raise ScopeDenied(f"quota database unavailable: {exc}") from exc
             try:
-                conn.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms}")
+                conn.execute(f"PRAGMA busy_timeout = {ms}")
                 conn.execute("PRAGMA journal_mode = WAL")
                 yield conn
             except (sqlite3.Error, OSError) as exc:
@@ -279,22 +373,36 @@ class DohRateGovernor:
         domain: str,
         resolver: str,
         now_dt: datetime | None = None,
+        timeout: float | None = None,
     ) -> str:
         """Atomically check quotas and reserve a slot using BEGIN IMMEDIATE locking.
         
         Ensures race-free reservations across concurrent processes. Fails closed.
+        Bounded by remaining monotonic deadline timeout if specified.
         """
+        t_start = time.monotonic()
         now = now_dt or datetime.now(timezone.utc)
         if now.tzinfo is None:
             now = now.replace(tzinfo=timezone.utc)
         epoch = now.timestamp()
         iso_str = now.isoformat(timespec="seconds").replace("+00:00", "Z")
 
-        with self._connect() as conn:
+        effective_busy_ms = self.busy_timeout_ms
+        if timeout is not None:
+            if timeout <= 0:
+                raise TimeoutError("quota reservation deadline exhausted before lock acquisition")
+            effective_busy_ms = max(1, int(min(timeout, self.busy_timeout_ms / 1000.0) * 1000))
+
+        with self._connect(busy_timeout_ms=effective_busy_ms) as conn:
             # 1. Acquire IMMEDIATE write lock to block concurrent racers
             try:
                 conn.execute("BEGIN IMMEDIATE")
             except sqlite3.OperationalError as exc:
+                if timeout is not None and (time.monotonic() - t_start) >= timeout:
+                    raise TimeoutError(
+                        f"quota database lock acquisition exceeded deadline of {timeout:.2f}s: {exc}"
+                    ) from exc
+                raise ScopeDenied(f"quota database lock contention: {exc}") from exc
                 raise ScopeDenied(f"quota database lock contention: {exc}") from exc
 
             try:

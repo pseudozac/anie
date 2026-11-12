@@ -6,6 +6,7 @@ from io import BytesIO
 from pathlib import Path
 import socket
 import struct
+import sys
 from tempfile import TemporaryDirectory
 import time
 import unittest
@@ -57,12 +58,14 @@ class MockHttpResponse:
         payload: bytes = b"",
         headers: dict[str, str] | None = None,
         read_delay: float = 0.0,
+        chunk_size: int | None = None,
     ):
         self.status = status
         self.payload = payload
         self.headers = headers or {"Content-Type": "application/dns-message"}
         self._stream = BytesIO(payload)
         self.read_delay = read_delay
+        self.chunk_size = chunk_size
 
     def getheader(self, name: str, default: str | None = None) -> str | None:
         for k, v in self.headers.items():
@@ -73,7 +76,18 @@ class MockHttpResponse:
     def read(self, amt: int | None = None) -> bytes:
         if self.read_delay > 0:
             time.sleep(self.read_delay)
-        return self._stream.read(amt)
+        max_read = amt or 4096
+        if self.chunk_size is not None:
+            max_read = min(max_read, self.chunk_size)
+        return self._stream.read(max_read)
+
+
+class MockSocket:
+    def __init__(self, timeout: float = 1.0):
+        self.timeout = timeout
+
+    def settimeout(self, t: float):
+        self.timeout = t
 
 
 class MockHttpsConnection:
@@ -81,12 +95,20 @@ class MockHttpsConnection:
         self,
         response: MockHttpResponse | Exception,
         connect_delay: float = 0.0,
+        header_delay: float = 0.0,
+        deadline: float | None = None,
     ):
         self.response = response
         self.connect_delay = connect_delay
+        self.header_delay = header_delay
+        self.deadline = deadline
         self.closed = False
         self.requests: list[dict] = []
-        self.sock = None
+        self.sock = MockSocket()
+
+    def connect(self):
+        if self.connect_delay > 0:
+            time.sleep(self.connect_delay)
 
     def request(self, method: str, path: str, headers: dict | None = None):
         if self.connect_delay > 0:
@@ -96,6 +118,8 @@ class MockHttpsConnection:
             raise self.response
 
     def getresponse(self) -> MockHttpResponse:
+        if self.header_delay > 0:
+            time.sleep(self.header_delay)
         if isinstance(self.response, Exception):
             raise self.response
         return self.response
@@ -147,18 +171,84 @@ class TestDohCollectorAdversarial(unittest.TestCase):
         self.assertFalse(obs.factual_verification.resolver_ad_claim)
 
     def test_endpoint_resolution_delay_exhausts_deadline(self):
-        def stalled_addrinfo(host, port, type=socket.SOCK_STREAM):
-            time.sleep(0.5)
-            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("104.16.132.229", 443))]
+        # Resolver operation that never returns (sleeps 60s in isolated subprocess)
+        hanging_cmd = [sys.executable, "-c", "import time; time.sleep(60)"]
+        collector = DohCollector(
+            rate_governor=self.rate_gov,
+            timeout_seconds=0.15,  # Strict short deadline
+            subproc_cmd=hanging_cmd,
+        )
+
+        t0 = time.monotonic()
+        with self.assertRaises(TimeoutError):
+            collector.collect("example.com", "dns_a")
+        elapsed = time.monotonic() - t0
+        # Main execution path must return promptly within ~0.2-0.5s, NOT block for 60s
+        self.assertLess(elapsed, 0.8)
+
+    def test_slow_http_headers_exhaust_deadline(self):
+        wire_data = make_raw_dns_response("example.com", "dns_a")
+        # Connection simulates header read delay exceeding total timeout
+        slow_conn = MockHttpsConnection(
+            MockHttpResponse(status=200, payload=wire_data),
+            header_delay=0.35,
+        )
+        collector = DohCollector(
+            rate_governor=self.rate_gov,
+            timeout_seconds=0.12,
+            connection_factory=lambda ip, host, timeout, **kw: slow_conn,
+            addrinfo_fn=self.mock_addrinfo,
+        )
+        t0 = time.monotonic()
+        with self.assertRaises(TimeoutError):
+            collector.collect("example.com", "dns_a")
+        elapsed = time.monotonic() - t0
+        self.assertLess(elapsed, 0.6)
+
+    def test_slow_response_body_chunks_cannot_reset_deadline(self):
+        wire_data = make_raw_dns_response("example.com", "dns_a")
+        # 10-byte chunks with 0.05s delay per chunk across ~44-byte response
+        # Total reading time would be ~0.25s.
+        # With timeout_seconds=0.10s, deadline must be exceeded after ~2 chunks.
+        slow_resp = MockHttpResponse(status=200, payload=wire_data, read_delay=0.05, chunk_size=10)
+        mock_conn = MockHttpsConnection(slow_resp)
 
         collector = DohCollector(
             rate_governor=self.rate_gov,
-            timeout_seconds=0.1,  # Strict short deadline
-            addrinfo_fn=stalled_addrinfo,
+            timeout_seconds=0.10,
+            connection_factory=lambda ip, host, timeout, **kw: mock_conn,
+            addrinfo_fn=self.mock_addrinfo,
         )
 
+        t0 = time.monotonic()
         with self.assertRaises(TimeoutError):
             collector.collect("example.com", "dns_a")
+        elapsed = time.monotonic() - t0
+        # Must fail when cumulative read time exhausts deadline, not reset per chunk
+        self.assertLess(elapsed, 0.4)
+
+    def test_synthetic_and_real_pipeline_isolation(self):
+        wire_data = make_raw_dns_response("example.com", "dns_a")
+        mock_conn = MockHttpsConnection(MockHttpResponse(status=200, payload=wire_data))
+        collector = DohCollector(
+            rate_governor=self.rate_gov,
+            connection_factory=lambda ip, host, timeout, **kw: mock_conn,
+            addrinfo_fn=self.mock_addrinfo,
+        )
+        event, real_obs = collector.collect("example.com", "dns_a")
+
+        # 1. Real observation must explicitly have synthetic=False
+        self.assertFalse(real_obs.synthetic)
+
+        # 2. Synthetic publisher must strictly reject real observations
+        with self.assertRaises((PermissionError, ValueError, ScopeDenied, AttributeError)):
+            publish_synthetic([real_obs], Path("tmp_pub"), as_of="2026-11-12T00:00:00Z")
+
+        # 3. RealObservation constructor must reject synthetic=True records
+        bad_dict = real_obs.to_dict()
+        bad_dict["synthetic"] = True
+        with self.assertRaises(ValueError):
+            RealObservation.from_dict(bad_dict)
 
     def test_tls_connection_stall_exhausts_deadline(self):
         # Connection factory stalls during connect
