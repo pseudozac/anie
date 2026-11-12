@@ -71,9 +71,12 @@ RandomizedDelaySec=300s
 
 The service unit enforces defense-in-depth isolation suitable for a shared or minimal VM:
 - **Resource Caps**: `MemoryMax=128M`, `MemoryHigh=96M`, `CPUQuota=20%`, `Nice=19`.
+  - **`MemoryHigh=96M` vs `MemoryMax=128M`**: `MemoryHigh` is an asynchronous memory throttling and page-cache reclaim threshold enforced by the kernel. Exceeding 96 MiB throttles allocation and reclaims cached disk pages; it does **not** kill processes. `MemoryMax=128M` is the absolute hard ceiling where the kernel OOM killer terminates processes with `SIGKILL`.
+  - **Process RSS (`VmHWM`) vs Cgroup Accounting**: Process `VmHWM` tracks only resident user-space pages mapped into the process. Cgroup accounting (`memory.current`, `memory.peak`) aggregates process RSS, child processes, kernel memory (page tables, slab allocations), and kernel page cache for SQLite database I/O. Therefore, active cgroup peak memory is expected to exceed single-process `VmHWM`. Active cgroup limits must be verified against `/sys/fs/cgroup/...` attributes on live systemd hosts.
 - **Filesystem Isolation**: `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`. Only `/var/lib/anie` (databases) and `/var/log/anie` (telemetry) are writable. The application code `/opt/anie` is strictly read-only (`ReadOnlyPaths=/opt/anie`).
 - **Kernel & Capability Stripping**: `CapabilityBoundingSet=` (drops all Linux root capabilities), `NoNewPrivileges=yes`, `ProtectKernelTunables=yes`, `ProtectKernelModules=yes`, `ProtectControlGroups=yes`, `RestrictRealtime=yes`.
 - **Network Family Filter**: `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX` (prevents raw sockets or packet sniffing).
+- **Runbook Reference**: For comprehensive deployment instructions, see [docs/ORACLE_DRY_RUN_RUNBOOK.md](../docs/ORACLE_DRY_RUN_RUNBOOK.md).
 
 ---
 
@@ -101,8 +104,17 @@ sudo systemctl daemon-reload
 
 ### Dry-Run Validation (Offline Mode)
 By default, the service executes in safe offline dry-run mode without making network calls.
+
 ```bash
-# Execute a single one-shot batch under systemd
+# Option A: Standalone manual one-shot dry run (outside systemd)
+/opt/anie/venv/bin/python -m anie collect-batch \
+  --mode dry_run \
+  --quota-db /var/lib/anie/doh_quota.sqlite \
+  --store-db /var/lib/anie/real_intelligence.sqlite \
+  --log-file /var/log/anie/collector.jsonl \
+  --lock-file /var/lib/anie/collector.lock
+
+# Option B: Execute a single one-shot batch under systemd
 sudo systemctl start anie-collector.service
 
 # Check execution status and journal output
