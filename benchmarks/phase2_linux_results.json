@@ -1,0 +1,69 @@
+{
+  "timestamp": "2026-11-12T15:45:30.142233+00:00",
+  "platform": "linux",
+  "python_version": "3.12.3 (main, Jan 17 2025, 18:03:48) [GCC 13.3.0]",
+  "acceptance": {
+    "batch_execution": {
+      "outcome": "SUCCESS",
+      "queries_succeeded": 2,
+      "duration_seconds": 0.0835
+    },
+    "sqlite_persistence": "verified",
+    "evidence_integrity": "verified",
+    "canonical_export": {
+      "total_observations": 2,
+      "total_events": 2,
+      "manifest_sha256": "f0e2127d608973a8727cc850ee1bff310333e99975f8294a2a2f47879527d232"
+    },
+    "candidate_integrity": "verified",
+    "detached_signing": {
+      "key_id": "test-operator-key-2026",
+      "fingerprint": "cf2bc9fa833e3c87fcfc592955986a28e00c07de5e8648478bba46bfb766b607"
+    },
+    "consumer_verification": "authenticated",
+    "anti_rollback": "verified_monotonic_and_replay_rejected",
+    "adversarial_defenses": "all_passed_fail_closed",
+    "process_restart_persistence": "verified"
+  },
+  "benchmark": [
+    {
+      "records": 200,
+      "db_size_kb": 600.0,
+      "obs_gz_kb": 18.14,
+      "ev_gz_kb": 10.0,
+      "insert_duration_s": 1.748,
+      "publish_duration_s": 0.337,
+      "verify_duration_s": 0.124,
+      "publish_peak_heap_kb": 970.9,
+      "verify_peak_heap_kb": 191.3,
+      "process_peak_rss_mb": 35.17,
+      "memory_method": "linux_proc_status"
+    },
+    {
+      "records": 3000,
+      "db_size_kb": 8600.0,
+      "obs_gz_kb": 265.13,
+      "ev_gz_kb": 141.27,
+      "insert_duration_s": 25.845,
+      "publish_duration_s": 5.304,
+      "verify_duration_s": 1.935,
+      "publish_peak_heap_kb": 14170.5,
+      "verify_peak_heap_kb": 784.9,
+      "process_peak_rss_mb": 65.28,
+      "memory_method": "linux_proc_status"
+    },
+    {
+      "records": 5000,
+      "db_size_kb": 14328.0,
+      "obs_gz_kb": 441.56,
+      "ev_gz_kb": 234.97,
+      "insert_duration_s": 44.372,
+      "publish_duration_s": 8.608,
+      "verify_duration_s": 3.118,
+      "publish_peak_heap_kb": 24094.9,
+      "verify_peak_heap_kb": 1386.9,
+      "process_peak_rss_mb": 91.1,
+      "memory_method": "linux_proc_status"
+    }
+  ]
+}

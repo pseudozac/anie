@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add reproducible Phase 2 offline acceptance test runner (`tools/phase2_acceptance_runner.py`), integration test suite (`tests/test_phase2_acceptance.py`), and offline schedule cadence simulator (`tools/schedule_simulator.py`) with committed reference benchmarks in `benchmarks/`.
 - PR 4: Authenticated first-party intelligence publication pipeline (`src/anie/real_publish.py`), detached Ed25519 signing, and multi-tier evidence verification.
 - Deterministic canonical publication engine (`export_canonical_dataset()`, `publish_real()`) producing reproducible gzip archives (`mtime=0`, `compresslevel=9`) sorted by observation and event timestamps/IDs, single consistent SQLite read snapshot transactions (`BEGIN DEFERRED`), fail-closed over-limit dataset protection (no silent truncation), and atomic artifact generation.
 - Manifest byte-for-byte reproducibility via explicit publication timestamps (`--published-at`).

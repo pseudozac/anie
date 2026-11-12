@@ -1,0 +1,28 @@
+{
+  "timestamp": "2026-11-12T15:49:27.718253+00:00",
+  "platform": "win32",
+  "python_version": "3.9.7 (tags/v3.9.7:1016ef3, Aug 30 2021, 20:19:38) [MSC v.1929 64 bit (AMD64)]",
+  "acceptance": {
+    "batch_execution": {
+      "outcome": "SUCCESS",
+      "queries_succeeded": 2,
+      "duration_seconds": 0.046
+    },
+    "sqlite_persistence": "verified",
+    "evidence_integrity": "verified",
+    "canonical_export": {
+      "total_observations": 2,
+      "total_events": 2,
+      "manifest_sha256": "09be19da10869a9eb478e9ea3b85ab44759448d70eab93d55da2f0bed90be1ba"
+    },
+    "candidate_integrity": "verified",
+    "detached_signing": {
+      "key_id": "test-operator-key-2026",
+      "fingerprint": "81ecf0070ca2c26a4227dbe37078a5afcec7048cfa5a06e6519d504c37500398"
+    },
+    "consumer_verification": "authenticated",
+    "anti_rollback": "verified_monotonic_and_replay_rejected",
+    "adversarial_defenses": "all_passed_fail_closed",
+    "process_restart_persistence": "verified"
+  }
+}

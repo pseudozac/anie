@@ -45,5 +45,9 @@ jobs:
           python examples/offline_signed_release_demo.py
           python tools/offline_acquisition_report.py
           python tools/live_dns_pilot.py
+      - name: Phase 2 offline acceptance and schedule simulation
+        run: |
+          python tools/phase2_acceptance_runner.py --check
+          python tools/schedule_simulator.py --days 30 --json benchmarks/schedule_simulation.json
       - name: Synthetic temporal benchmark report (training past only)
         run: python tools/benchmark_report.py --check benchmarks/expected_snapshot.json
