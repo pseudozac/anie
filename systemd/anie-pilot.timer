@@ -2,6 +2,8 @@
 Description=ANIE 72-Hour Pilot Daily Collection Timer (Calendar Scheduled)
 Documentation=file:///opt/anie-phase2/docs/REAL_WORLD_PILOT.md
 ConditionPathExists=/etc/systemd/system/anie-pilot.service
+# Stop recurring timer execution permanently once 72-hour pilot is completed
+ConditionPathExists=!/var/lib/anie/pilot_completed.sentinel
 
 [Timer]
 # Conservative daily schedule (06:00 UTC) with 15-minute randomized jitter

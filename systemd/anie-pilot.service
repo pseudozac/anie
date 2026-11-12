@@ -3,6 +3,9 @@ Description=ANIE 72-Hour Pilot First-Party Intelligence Bounded Batch Collector
 Documentation=file:///opt/anie-phase2/docs/REAL_WORLD_PILOT.md
 After=network-online.target
 Wants=network-online.target
+# Fail-Closed Completion Barrier: If the 72-hour pilot completed sentinel exists,
+# systemd condition evaluation evaluates to false and skips service startup cleanly.
+ConditionPathExists=!/var/lib/anie/pilot_completed.sentinel
 
 [Service]
 Type=oneshot

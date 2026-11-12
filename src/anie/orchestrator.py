@@ -343,6 +343,7 @@ class BatchConfig:
     timeout_seconds: float = DEFAULT_BATCH_TIMEOUT_SECONDS
     pilot_mode: bool = False
     pilot_db_path: Path | None = None
+    pilot_sentinel_path: Path | None = None
 
     def __post_init__(self):
         if self.mode not in VALID_MODES:
@@ -429,7 +430,7 @@ class BatchOrchestrator:
         if self.config.pilot_mode:
             from .pilot_governor import PilotGovernor
             pilot_db = self.config.pilot_db_path or self.config.quota_db_path
-            gov = PilotGovernor(pilot_db)
+            gov = PilotGovernor(pilot_db, sentinel_path=self.config.pilot_sentinel_path)
             run_id, day_num, raw_queries = gov.check_and_plan_pilot_batch()
             self._pilot_run_id = run_id
             self._pilot_day_number = day_num
@@ -507,7 +508,7 @@ class BatchOrchestrator:
             try:
                 from .pilot_governor import PilotGovernor
                 pilot_db = self.config.pilot_db_path or self.config.quota_db_path
-                gov = PilotGovernor(pilot_db)
+                gov = PilotGovernor(pilot_db, sentinel_path=self.config.pilot_sentinel_path)
                 gov.record_pilot_outcome(
                     run_id=self._pilot_run_id,
                     outcome=report.outcome,

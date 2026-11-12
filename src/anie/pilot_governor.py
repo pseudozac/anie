@@ -8,20 +8,25 @@ Enforces strict policy invariants for the 72-hour unattended pilot:
    - Day 1: example.com (dns_a),    iana.org (dns_aaaa)
    - Day 2: example.com (dns_aaaa), iana.org (dns_a)
    - Day 3: example.com (dns_a),    iana.org (dns_aaaa)
-5. Fail-closed: Ceases execution immediately on ceiling exhaustion or security block.
+5. Fail-closed: Ceases execution immediately on ceiling exhaustion, crash, or security block.
 6. Durable persistence: State is committed to SQLite with ACID transaction safety.
+7. Observable completion sentinel: Writes an unprivileged completion sentinel file upon
+   finishing the 72-hour authorization to permanently halt systemd timer triggers.
 """
 from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import sqlite3
+from typing import Any
 
 from .collection_policy import ScopeDenied
 
 MAX_AUTHORIZED_PILOT_RUNS = 3
+DEFAULT_SENTINEL_NAME = "pilot_completed.sentinel"
 
 # Canonical deterministic query schedule for the 72-hour pilot
 PILOT_DAY_QUERIES: dict[int, list[tuple[str, str]]] = {
@@ -38,11 +43,13 @@ class PilotGovernor:
         self,
         db_path: str | Path,
         max_runs: int = MAX_AUTHORIZED_PILOT_RUNS,
+        sentinel_path: str | Path | None = None,
     ):
         self.db_path = Path(db_path)
         self.max_runs = int(max_runs)
         if self.max_runs <= 0:
             raise ValueError(f"max_runs must be positive: {self.max_runs}")
+        self.sentinel_path = Path(sentinel_path) if sentinel_path else self.db_path.parent / DEFAULT_SENTINEL_NAME
         self._init_db()
 
     @contextmanager
@@ -99,6 +106,56 @@ class PilotGovernor:
             ).fetchone()
             return int(row[0]) if row else 0
 
+    def is_pilot_completed(self) -> bool:
+        """Check if 72-hour pilot authorization is fully exhausted or sentinel exists."""
+        if self.sentinel_path.exists():
+            return True
+        return self.get_completed_runs_count() >= self.max_runs
+
+    def write_completion_sentinel(self, now_iso: str | None = None) -> Path:
+        """Write an observable, unprivileged sentinel file to halt future recurring triggers."""
+        now_str = now_iso or datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+        self.sentinel_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with self._connect() as conn:
+            cur = conn.cursor()
+            runs = cur.execute(
+                "SELECT run_id, day_number, execution_date_utc, started_at, completed_at, batch_id, status "
+                "FROM pilot_schedule_state ORDER BY run_id ASC"
+            ).fetchall()
+
+        run_records = [
+            {
+                "run_id": r[0],
+                "day_number": r[1],
+                "execution_date_utc": r[2],
+                "started_at": r[3],
+                "completed_at": r[4],
+                "batch_id": r[5],
+                "status": r[6],
+            }
+            for r in runs
+        ]
+
+        manifest = {
+            "schema": "anie.pilot-completed-sentinel.v1",
+            "status": "72_HOUR_PILOT_COMPLETED",
+            "completed_at": now_str,
+            "total_runs_completed": self.get_completed_runs_count(),
+            "max_authorized_runs": self.max_runs,
+            "runs": run_records,
+            "notice": (
+                "The 72-hour unattended pilot has completed all authorized daily batches. "
+                "Further recurring collection attempts are permanently denied by this sentinel "
+                "and systemd condition evaluation. Renewed operator authorization is required."
+            ),
+        }
+
+        tmp_path = self.sentinel_path.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        tmp_path.replace(self.sentinel_path)
+        return self.sentinel_path
+
     def check_and_plan_pilot_batch(
         self,
         now_dt: datetime | None = None,
@@ -115,6 +172,13 @@ class PilotGovernor:
         today_utc = now.strftime("%Y-%m-%d")
         now_iso = now.isoformat(timespec="seconds").replace("+00:00", "Z")
 
+        # 0. Fast sentinel file check
+        if self.sentinel_path.exists():
+            raise ScopeDenied(
+                f"72-hour pilot authorization is already completed (sentinel file '{self.sentinel_path.name}' present). "
+                "Further collection attempts are permanently blocked."
+            )
+
         with self._connect() as conn:
             cur = conn.cursor()
             cur.execute("BEGIN IMMEDIATE")
@@ -129,30 +193,57 @@ class PilotGovernor:
                         "operator inspection and reset required"
                     )
 
-                # 2. Count completed runs
+                # 2. Reconcile any stale/crashed PLANNED reservations
+                stale_planned = cur.execute(
+                    "SELECT run_id, execution_date_utc, started_at FROM pilot_schedule_state WHERE status = 'PLANNED'"
+                ).fetchall()
+                crashed_today = False
+                for s_id, s_date, s_started in stale_planned:
+                    cur.execute(
+                        """
+                        UPDATE pilot_schedule_state 
+                        SET status = 'FAILED', completed_at = ?, error_reason = ? 
+                        WHERE run_id = ?
+                        """,
+                        (now_iso, f"interrupted: process crashed or terminated before completion (started {s_started})", s_id),
+                    )
+                    if s_date == today_utc:
+                        crashed_today = True
+
+                # 3. Count completed runs
                 completed_row = cur.execute(
                     "SELECT COUNT(*) FROM pilot_schedule_state WHERE status = 'COMPLETED'"
                 ).fetchone()
                 completed_count = int(completed_row[0]) if completed_row else 0
 
                 if completed_count >= self.max_runs:
+                    # Write completion sentinel if missing
+                    self.write_completion_sentinel(now_iso)
                     raise ScopeDenied(
                         f"72-hour pilot authorization ceiling reached: {completed_count}/{self.max_runs} "
                         "daily batches completed. Renewed operator authorization required."
                     )
 
-                # 3. Check anti-duplication & anti-catchup on calendar date
+                # 4. Enforce crash fail-closed on same calendar day
+                if crashed_today:
+                    raise ScopeDenied(
+                        f"pilot batch on {today_utc} was interrupted before completion; "
+                        "automatic restart on the same calendar day is prohibited to prevent duplicate network queries. "
+                        "Operator inspection required."
+                    )
+
+                # 5. Check anti-duplication & anti-catchup on calendar date
                 existing_today = cur.execute(
-                    "SELECT run_id, status FROM pilot_schedule_state WHERE execution_date_utc = ? AND status IN ('COMPLETED', 'PLANNED')",
+                    "SELECT run_id, status FROM pilot_schedule_state WHERE execution_date_utc = ? AND status IN ('COMPLETED', 'FAILED')",
                     (today_utc,),
                 ).fetchone()
                 if existing_today:
                     raise ScopeDenied(
-                        f"pilot batch already executed or active for date {today_utc} (run_id: {existing_today[0]}, status: {existing_today[1]}); "
-                        "duplicate or catch-up execution blocked"
+                        f"pilot batch already executed or attempted for date {today_utc} (run_id: {existing_today[0]}, status: {existing_today[1]}); "
+                        "duplicate, retry, or catch-up execution blocked on same calendar day"
                     )
 
-                # 4. Determine next day number and query plan
+                # 6. Determine next day number and query plan
                 day_number = completed_count + 1
                 if day_number not in PILOT_DAY_QUERIES:
                     raise ScopeDenied(f"no query alternation schedule defined for day {day_number}")
@@ -160,7 +251,7 @@ class PilotGovernor:
                 query_plan = PILOT_DAY_QUERIES[day_number]
                 plan_json = json.dumps(query_plan)
 
-                # 5. Atomically insert planned run record
+                # 7. Atomically insert planned run record
                 cur.execute(
                     """
                     INSERT INTO pilot_schedule_state (
@@ -208,3 +299,37 @@ class PilotGovernor:
                 """,
                 (db_status, completed_iso, batch_id, error_reason, run_id),
             )
+
+        # If this completion exhausts max authorized runs, write completion sentinel
+        if db_status == "COMPLETED" and self.get_completed_runs_count() >= self.max_runs:
+            self.write_completion_sentinel(completed_iso)
+
+    def get_pilot_summary(self) -> dict[str, Any]:
+        """Return human-readable summary of pilot progression and history."""
+        with self._connect() as conn:
+            cur = conn.cursor()
+            runs = cur.execute(
+                "SELECT run_id, day_number, execution_date_utc, status, started_at, completed_at, batch_id, error_reason "
+                "FROM pilot_schedule_state ORDER BY run_id ASC"
+            ).fetchall()
+
+        completed = sum(1 for r in runs if r[3] == "COMPLETED")
+        return {
+            "completed_runs": completed,
+            "max_runs": self.max_runs,
+            "is_completed": self.is_pilot_completed(),
+            "sentinel_exists": self.sentinel_path.exists(),
+            "runs": [
+                {
+                    "run_id": r[0],
+                    "day_number": r[1],
+                    "date": r[2],
+                    "status": r[3],
+                    "started_at": r[4],
+                    "completed_at": r[5],
+                    "batch_id": r[6],
+                    "error_reason": r[7],
+                }
+                for r in runs
+            ],
+        }
