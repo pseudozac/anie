@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- PR 4: Authenticated first-party intelligence publication pipeline (`src/anie/real_publish.py`), detached Ed25519 signing, and multi-tier evidence verification.
+- Deterministic canonical publication engine (`export_canonical_dataset()`, `publish_real()`) producing reproducible gzip archives (`mtime=0`, `compresslevel=9`) sorted by observation and event timestamps/IDs, single consistent SQLite read snapshot transactions (`BEGIN DEFERRED`), fail-closed over-limit dataset protection (no silent truncation), and atomic artifact generation.
+- Manifest byte-for-byte reproducibility via explicit publication timestamps (`--published-at`).
+- Complete metadata binding across manifest publisher, signed payload publisher, release sequence, git commit hashes, attestation key IDs, key fingerprints, and operator trust policies, preventing signature transposition even when mathematically valid.
+- Air-gapped detached Ed25519 signing workflow (`sign_manifest_detached()` and CLI `anie sign-real`): primary signing keys never reside on the collector host (`anie-collector-01`), with strict key parsing (PEM and exactly 32 raw bytes, rejecting permissive truncation fallbacks).
+- Independent four-tier consumer verification engine (`verify_real_release()` and CLI `anie verify-real`): distinguishes structural validation, evidence-integrity validation, publisher-signature authentication, and stateful anti-rollback verification, with an explicit `--integrity-only` mode for candidate inspection.
+- Complete evidence model reconstruction: validates content-addressed IDs, raw DNS wire payload hashes (`raw_sha256`), record schema versions, strict deterministic ordering, duplicate ID rejection, and referential consistency.
+- Memory-bounded streaming serialization, hashing, and decompression: guarantees execution within Oracle Cloud micro instance memory limits (1 GiB RAM) with bounded gzip record reading enforcing the $\le 500\text{ KB}$ record ceiling during streaming read (`stream.readline(limit + 1)`), rejecting unterminated records, and decompression bomb protection ($\le 100\text{ MB}$ uncompressed ceiling, $\le 100{,}000$ records per partition).
+- Hardened persistent verifier state tracking (`ReleaseSequenceTracker`): fail-closed error handling (`TrackerStateError`, `TrackerStateLostError`), concurrency-safe atomic multi-process file locking, prevention of lower-sequence overwrites, accurate `anti_rollback_verified=False` reporting for historical audits (`--allow-rollback`), and documented local filesystem rollback boundaries.
+- Key rotation and operator revocation support in `RealReleaseTrust` via multi-key maps (`trusted_keys`), `revoked_key_ids`, and `revoked_fingerprints`.
+- Unconditional anti-contamination enforcement: rejects synthetic fixtures, synthetic methods, and synthetic source IDs within real publication artifacts.
+- Comprehensive operational documentation and verified runbooks in `docs/REAL_PUBLICATION_AND_SIGNING.md`.
 - PR 3: Bounded batch orchestrator (`BatchOrchestrator`, `src/anie/orchestrator.py`) and CLI subcommand `collect-batch` for resource-governed one-shot execution on Oracle Cloud micro instances (1 GiB RAM).
 - Strict execution envelope: maximum 2 domains (`example.com`, `iana.org`), alternating query kinds (`dns_a` $\leftrightarrow$ `dns_aaaa`) across batches based on last persisted observation, canonicalized domain uniqueness, at most 1 query per domain per batch to strictly satisfy the 30-minute per-domain cooldown, and an absolute ceiling of $\le 4$ queries per batch.
 - Fail-closed execution modes (`VALID_MODES = {"dry_run", "live"}`) preventing programmatic or CLI bypass; live collection strictly gated by `--live` and `ANIE_LIVE_COLLECTION_AUTHORIZED=1`.
