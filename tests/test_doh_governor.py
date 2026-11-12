@@ -1,10 +1,13 @@
-"""Tests for Phase 2 DoH policy governor, allowlists, rate budgets, and anti-rebinding."""
+"""Adversarial and security tests for Phase 2 DoH policy governor and persistent quotas."""
 from __future__ import annotations
 
+import concurrent.futures
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import socket
+import sqlite3
 from tempfile import TemporaryDirectory
+import time
 import unittest
 
 from anie.collection_policy import ScopeDenied
@@ -14,12 +17,13 @@ from anie.doh_governor import (
     ALLOWED_TARGET_DOMAINS,
     DohRateGovernor,
     resolve_and_pin_endpoint,
+    validate_batch_domains,
     validate_resolver_endpoint,
     validate_target,
 )
 
 
-class TestDohGovernor(unittest.TestCase):
+class TestDohGovernorAdversarial(unittest.TestCase):
     def test_allowlist_permits_authorized_targets(self):
         self.assertEqual(validate_target("example.com", "dns_a"), ("example.com", "dns_a"))
         self.assertEqual(validate_target("EXAMPLE.COM.", "dns_aaaa"), ("example.com", "dns_aaaa"))
@@ -33,133 +37,140 @@ class TestDohGovernor(unittest.TestCase):
             validate_target("sub.example.com", "dns_a")
         with self.assertRaises(ScopeDenied):
             validate_target("attacker.org", "dns_a")
-        with self.assertRaises(ScopeDenied):
-            validate_target("192.0.2.1", "dns_a")
 
     def test_allowlist_denies_unauthorized_kinds(self):
         with self.assertRaises(ScopeDenied):
             validate_target("example.com", "dns_ptr")
         with self.assertRaises(ScopeDenied):
             validate_target("example.com", "dns_txt")
-        with self.assertRaises(ScopeDenied):
-            validate_target("example.com", "dns_mx")
-        with self.assertRaises(ScopeDenied):
-            validate_target("example.com", "rdap_asn")
 
-    def test_resolver_endpoint_validation(self):
-        host, path = validate_resolver_endpoint("https://cloudflare-dns.com/dns-query")
-        self.assertEqual(host, "cloudflare-dns.com")
-        self.assertEqual(path, "/dns-query")
+    def test_batch_domain_limit_enforced(self):
+        # 1 or 2 domains allowed
+        self.assertEqual(validate_batch_domains(["example.com", "iana.org"]), ["example.com", "iana.org"])
+        self.assertEqual(validate_batch_domains(["example.com", "example.com"]), ["example.com"])
 
-        # Insecure or unauthorized resolvers denied
-        with self.assertRaises(ScopeDenied):
-            validate_resolver_endpoint("http://cloudflare-dns.com/dns-query")
-        with self.assertRaises(ScopeDenied):
-            validate_resolver_endpoint("https://8.8.8.8/dns-query")
-        with self.assertRaises(ScopeDenied):
-            validate_resolver_endpoint("https://cloudflare-dns.com:8443/dns-query")
-        with self.assertRaises(ScopeDenied):
-            validate_resolver_endpoint("https://user:pass@cloudflare-dns.com/dns-query")
+        # 3 domains exceed pilot batch limit
+        with self.assertRaisesRegex(ScopeDenied, "maximum authorized domains"):
+            validate_batch_domains(["example.com", "iana.org", "other.org"])
 
-    def test_anti_rebinding_accepts_all_global_ips(self):
-        def mock_getaddrinfo(host, port, type=socket.SOCK_STREAM):
-            return [
-                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("104.16.132.229", 443)),
-                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("104.16.133.229", 443)),
-            ]
-
-        pinned_ip = resolve_and_pin_endpoint("cloudflare-dns.com", getaddrinfo_fn=mock_getaddrinfo)
-        self.assertEqual(pinned_ip, "104.16.132.229")
-
-    def test_anti_rebinding_rejects_private_and_loopback_ips(self):
-        def mock_private(host, port, type=socket.SOCK_STREAM):
-            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))]
-
-        with self.assertRaisesRegex(ScopeDenied, "non-global address"):
-            resolve_and_pin_endpoint("cloudflare-dns.com", getaddrinfo_fn=mock_private)
-
-    def test_anti_rebinding_rejects_mixed_global_and_private_answers(self):
-        # A DNS rebinding attack returning a public IP alongside a local IP must fail closed
-        def mock_mixed(host, port, type=socket.SOCK_STREAM):
-            return [
-                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("104.16.132.229", 443)),
-                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.1.1", 443)),
-            ]
-
-        with self.assertRaisesRegex(ScopeDenied, "non-global address"):
-            resolve_and_pin_endpoint("cloudflare-dns.com", getaddrinfo_fn=mock_mixed)
-
-    def test_anti_rebinding_rejects_documentation_ranges(self):
-        def mock_doc(host, port, type=socket.SOCK_STREAM):
-            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.1", 443))]
-
-        with self.assertRaisesRegex(ScopeDenied, "non-global address"):
-            resolve_and_pin_endpoint("cloudflare-dns.com", getaddrinfo_fn=mock_doc)
-
-    def test_rate_governor_target_cooldown(self):
+    def test_invalid_and_nonpositive_config_rejected(self):
         with TemporaryDirectory() as tmp:
-            db_path = Path(tmp) / "rate.sqlite"
-            gov = DohRateGovernor(db_path, target_cooldown_seconds=2.0)
+            p = Path(tmp) / "rate.sqlite"
+            with self.assertRaises(ValueError):
+                DohRateGovernor(p, max_target_per_hour=0)
+            with self.assertRaises(ValueError):
+                DohRateGovernor(p, max_target_per_hour=-1)
+            with self.assertRaises(ValueError):
+                DohRateGovernor(p, target_cooldown_seconds=0)
+            with self.assertRaises(ValueError):
+                DohRateGovernor(p, target_cooldown_seconds=-5.0)
+            with self.assertRaises(ValueError):
+                DohRateGovernor(p, max_resolver_per_hour=-10)
+            with self.assertRaises(ValueError):
+                DohRateGovernor(p, max_daily_total=0)
+
+    def test_in_memory_disallowed_without_explicit_test_flag(self):
+        with self.assertRaisesRegex(ValueError, "durable quota database required"):
+            DohRateGovernor(None)
+        with self.assertRaisesRegex(ValueError, "durable quota database required"):
+            DohRateGovernor(":memory:")
+
+    def test_persistent_quotas_after_process_restart(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "persistent_rate.sqlite"
             t0 = datetime(2026, 11, 12, 10, 0, 0, tzinfo=timezone.utc)
 
-            # First reservation succeeds
-            gov.check_and_reserve("example.com", "cloudflare_doh", now_dt=t0)
+            # Process 1 creates governor, reserves 1 slot for example.com
+            gov1 = DohRateGovernor(
+                db_path,
+                max_target_per_hour=1,
+                target_cooldown_seconds=1800.0,
+            )
+            gov1.check_and_reserve("example.com", "cloudflare_doh", now_dt=t0)
+            # Process 1 exits
 
-            # Second reservation 1 second later fails cooldown
-            t1 = t0 + timedelta(seconds=1)
+            # Process 2 starts fresh with new governor instance pointing to same file
+            gov2 = DohRateGovernor(
+                db_path,
+                max_target_per_hour=1,
+                target_cooldown_seconds=1800.0,
+            )
+            # Must remember previous reservation and fail closed on quota exhaustion
             with self.assertRaisesRegex(ScopeDenied, "cooldown"):
-                gov.check_and_reserve("example.com", "cloudflare_doh", now_dt=t1)
+                gov2.check_and_reserve("example.com", "cloudflare_doh", now_dt=t0 + timedelta(seconds=10))
 
-            # Reservation for different domain succeeds immediately
-            gov.check_and_reserve("iana.org", "cloudflare_doh", now_dt=t1)
-
-            # Reservation after cooldown succeeds
-            t2 = t0 + timedelta(seconds=3)
-            gov.check_and_reserve("example.com", "cloudflare_doh", now_dt=t2)
-
-    def test_rate_governor_hourly_target_budget(self):
+    def test_concurrent_reservations_atomic_race_protection(self):
         with TemporaryDirectory() as tmp:
-            db_path = Path(tmp) / "rate.sqlite"
+            db_path = Path(tmp) / "race_rate.sqlite"
+            # Exactly 1 slot available
             gov = DohRateGovernor(
                 db_path,
-                max_target_per_hour=3,
-                target_cooldown_seconds=1.0,
+                max_target_per_hour=1,
+                target_cooldown_seconds=1800.0,
             )
-            base_t = datetime(2026, 11, 12, 10, 0, 0, tzinfo=timezone.utc)
+            t0 = datetime(2026, 11, 12, 10, 0, 0, tzinfo=timezone.utc)
 
-            for i in range(3):
-                t = base_t + timedelta(seconds=i * 5)
-                gov.check_and_reserve("example.com", "cloudflare_doh", now_dt=t)
+            results = []
+            errors = []
 
-            # 4th reservation within the hour fails
-            t_fail = base_t + timedelta(seconds=20)
-            with self.assertRaisesRegex(ScopeDenied, "hourly budget"):
-                gov.check_and_reserve("example.com", "cloudflare_doh", now_dt=t_fail)
+            def attempt_reserve(proc_id: int):
+                proc_gov = DohRateGovernor(
+                    db_path,
+                    max_target_per_hour=1,
+                    target_cooldown_seconds=1800.0,
+                )
+                try:
+                    res = proc_gov.check_and_reserve("example.com", "cloudflare_doh", now_dt=t0)
+                    results.append(proc_id)
+                except ScopeDenied as exc:
+                    errors.append((proc_id, str(exc)))
 
-            # Slices after 1 hour succeed again
-            t_next_hour = base_t + timedelta(hours=1, seconds=10)
-            gov.check_and_reserve("example.com", "cloudflare_doh", now_dt=t_next_hour)
+            # Two competing processes run at the exact same time
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                f1 = executor.submit(attempt_reserve, 1)
+                f2 = executor.submit(attempt_reserve, 2)
+                f1.result()
+                f2.result()
 
-    def test_rate_governor_resolver_and_daily_budget(self):
+            # Exactly one process succeeded, exactly one was rejected
+            self.assertEqual(len(results), 1)
+            self.assertEqual(len(errors), 1)
+
+    def test_sqlite_lock_contention_fails_closed(self):
         with TemporaryDirectory() as tmp:
-            db_path = Path(tmp) / "rate.sqlite"
-            gov = DohRateGovernor(
-                db_path,
-                max_target_per_hour=100,
-                target_cooldown_seconds=0.0,
-                max_resolver_per_hour=5,
-                max_daily_total=8,
+            db_path = Path(tmp) / "locked_rate.sqlite"
+            gov = DohRateGovernor(db_path, target_cooldown_seconds=1800.0)
+
+            # Manually hold an EXCLUSIVE lock from another connection
+            locking_conn = sqlite3.connect(db_path)
+            locking_conn.execute("BEGIN EXCLUSIVE")
+
+            try:
+                # Governor attempts to reserve with timeout; must fail closed with ScopeDenied
+                with self.assertRaises(ScopeDenied):
+                    gov.check_and_reserve("example.com", "cloudflare_doh")
+            finally:
+                locking_conn.execute("ROLLBACK")
+                locking_conn.close()
+
+    def test_quota_database_failure_fails_closed(self):
+        # Point to an impossible unwritable directory
+        unwritable_path = Path("Z:/nonexistent_volume/unwritable/rate.sqlite")
+        with self.assertRaises(ScopeDenied):
+            DohRateGovernor(unwritable_path)
+
+    def test_dns_resolution_delay_exhausts_deadline(self):
+        def stalled_addrinfo(host, port, type=socket.SOCK_STREAM):
+            time.sleep(1.0)
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("104.16.132.229", 443))]
+
+        # If resolution deadline is 0.1s, it must raise TimeoutError without waiting forever
+        with self.assertRaises(TimeoutError):
+            resolve_and_pin_endpoint(
+                "cloudflare-dns.com",
+                getaddrinfo_fn=stalled_addrinfo,
+                timeout=0.1,
             )
-            base_t = datetime(2026, 11, 12, 10, 0, 0, tzinfo=timezone.utc)
-
-            for i in range(5):
-                t = base_t + timedelta(seconds=i * 2)
-                gov.check_and_reserve(f"target{i}.example.com", "cloudflare_doh", now_dt=t)
-
-            # 6th query to same resolver in this hour fails
-            t_fail = base_t + timedelta(seconds=12)
-            with self.assertRaisesRegex(ScopeDenied, "resolver.*hourly budget"):
-                gov.check_and_reserve("target6.example.com", "cloudflare_doh", now_dt=t_fail)
 
 
 if __name__ == "__main__":

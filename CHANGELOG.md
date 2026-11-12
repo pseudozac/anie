@@ -3,11 +3,13 @@
 ## Unreleased
 
 - PR 2: First-party DNS-over-HTTPS (DoH) collection engine (`DohCollector`) and policy governor (`DohRateGovernor`).
-- Strict target allowlist limited to `example.com` and `iana.org`, and query kinds `dns_a` and `dns_aaaa`.
-- Anti-rebinding resolver endpoint resolution requiring all returned IPs to be verified global addresses before socket allocation.
-- Persistent SQLite-backed rate governor with per-target cooldown, hourly quotas, resolver quotas, and daily limits.
-- Full RFC 8484 wire-format exchange with bounded response capture (<= 65,535 bytes) and SHA-256 evidence integrity.
-- Explicit response classification for ANSWER, NXDOMAIN, NODATA, SERVFAIL, and REFUSED.
+- Strict target allowlist limited to `example.com` and `iana.org`, query kinds `dns_a` and `dns_aaaa`, and batch domain size limit ($\le 2$ domains per invocation).
+- Anti-rebinding resolver endpoint resolution requiring all returned IPs to be verified global addresses before socket allocation, with bounded resolution execution via thread pool.
+- Persistent SQLite-backed rate governor with atomic `BEGIN IMMEDIATE` multi-process locking, per-target 30-minute cooldown, conservative hourly quotas, and fail-closed error handling. Ephemeral in-memory storage restricted strictly to explicit test mode.
+- Full RFC 8484 wire-format exchange with bounded response capture ($\le 65,535$ bytes) and SHA-256 evidence integrity.
+- Monotonic wall-clock deadline enforcement encompassing endpoint resolution, connection, TLS handshake, chunked body reading, and retries without deadline reset.
+- Explicit DNS response classification for ANSWER, NXDOMAIN, NODATA, SERVFAIL, and REFUSED.
+- Resolver AD flag recorded strictly as an untrusted third-party claim (`resolver_ad_claim=True`) while `dnssec_status` remains `'indeterminate'` without independent cryptographic proof.
 - Mandatory invariants: SERVFAIL recorded as error without inferring DNSSEC-bogus; analytical confidence kept strictly nullable (`None`).
 - PR 1: Introduce Phase 2 first-party intelligence data models (`RealObservation`, `RealCollectionEvent`, `FactualVerification`) and SQLite store (`RealObservationStore`).
 - Replace arbitrary confidence multipliers with distinct empirical factual verification attributes and explicitly nullable analytical confidence.

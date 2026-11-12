@@ -253,8 +253,12 @@ class TestLedgerAndCompatibility(unittest.TestCase):
             path = Path(tmp) / "collection.sqlite"
             ledger = CollectionLedger(path)
             ledger.add(event)
-            with sqlite3.connect(path) as db:
-                db.execute("UPDATE collection_events SET event_id='event_tampered'")
+            db = sqlite3.connect(path)
+            try:
+                with db:
+                    db.execute("UPDATE collection_events SET event_id='event_tampered'")
+            finally:
+                db.close()
             with self.assertRaisesRegex(ValueError, "integrity mismatch"):
                 ledger.by_subject(DOMAIN)
 

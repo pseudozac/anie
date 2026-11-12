@@ -55,6 +55,7 @@ class FactualVerification:
     resolver_identity: str
     wire_rcode: str
     raw_evidence_status: str
+    resolver_ad_claim: bool = False
 
     def __post_init__(self):
         if self.dnssec_status not in DNSSEC_STATUSES:
@@ -69,16 +70,21 @@ class FactualVerification:
             raise ValueError("wire_rcode must be a non-empty string")
         if self.raw_evidence_status not in RAW_EVIDENCE_STATUSES:
             raise ValueError(f"invalid raw_evidence_status: {self.raw_evidence_status}")
+        if not isinstance(self.resolver_ad_claim, bool):
+            raise ValueError("resolver_ad_claim must be a boolean")
 
-    def to_dict(self) -> dict[str, str]:
-        return {
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
             "dnssec_status": self.dnssec_status,
+            "raw_evidence_status": self.raw_evidence_status,
+            "resolver_identity": self.resolver_identity,
             "response_authenticity": self.response_authenticity,
             "transport_security": self.transport_security,
-            "resolver_identity": self.resolver_identity,
             "wire_rcode": self.wire_rcode,
-            "raw_evidence_status": self.raw_evidence_status,
         }
+        if self.resolver_ad_claim:
+            d["resolver_ad_claim"] = True
+        return d
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "FactualVerification":
@@ -91,9 +97,10 @@ class FactualVerification:
             "resolver_identity",
             "wire_rcode",
             "raw_evidence_status",
+            "resolver_ad_claim",
         }
-        if set(raw) != allowed:
-            raise ValueError(f"unexpected factual_verification fields: {set(raw) ^ allowed}")
+        if set(raw) - allowed:
+            raise ValueError(f"unexpected factual_verification fields: {set(raw) - allowed}")
         return cls(
             dnssec_status=raw["dnssec_status"],
             response_authenticity=raw["response_authenticity"],
@@ -101,6 +108,7 @@ class FactualVerification:
             resolver_identity=raw["resolver_identity"],
             wire_rcode=raw["wire_rcode"],
             raw_evidence_status=raw["raw_evidence_status"],
+            resolver_ad_claim=bool(raw.get("resolver_ad_claim", False)),
         )
 
 
