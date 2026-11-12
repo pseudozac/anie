@@ -208,8 +208,26 @@ class RealCollectionEvent:
             if computed_sha != self.raw_sha256:
                 raise ValueError(f"raw_sha256 mismatch: expected {self.raw_sha256}, got {computed_sha}")
         elif self.raw_evidence_status in {"unavailable", "redacted", "oversized"}:
-            if self.raw_payload is not None and len(self.raw_payload) > MAX_RAW_PAYLOAD_BYTES and self.raw_evidence_status != "oversized":
-                raise ValueError("payload exceeding bounds must have status 'oversized'")
+            if self.raw_payload is not None:
+                if len(self.raw_payload) > MAX_RAW_PAYLOAD_BYTES and self.raw_evidence_status != "oversized":
+                    raise ValueError("payload exceeding bounds must have status 'oversized'")
+                computed_sha = sha256(self.raw_payload).hexdigest()
+                if computed_sha != self.raw_sha256:
+                    raise ValueError(f"raw_sha256 mismatch: expected {self.raw_sha256}, got {computed_sha}")
+
+    def verify_raw_evidence(self) -> bool:
+        """Explicitly re-verify raw evidence payload against raw_sha256 and status constraints."""
+        if self.raw_evidence_status == "captured":
+            if self.raw_payload is None or not isinstance(self.raw_payload, (bytes, bytearray)):
+                return False
+            if len(self.raw_payload) > MAX_RAW_PAYLOAD_BYTES:
+                return False
+            return sha256(self.raw_payload).hexdigest() == self.raw_sha256
+        elif self.raw_evidence_status in RAW_EVIDENCE_STATUSES:
+            if self.raw_payload is not None:
+                return sha256(self.raw_payload).hexdigest() == self.raw_sha256
+            return bool(_HEX_64.fullmatch(self.raw_sha256))
+        return False
 
     @property
     def event_id(self) -> str:
@@ -258,6 +276,8 @@ class RealCollectionEvent:
             observed_at=utc_iso(raw["observed_at"]),
             raw_payload=raw_payload,
         )
+        if not event.verify_raw_evidence():
+            raise ValueError(f"raw evidence verification failed for event {event.event_id}")
         if "event_id" in raw and raw["event_id"] != event.event_id:
             raise ValueError("event_id integrity mismatch")
         return event

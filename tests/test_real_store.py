@@ -236,6 +236,120 @@ class TestRealObservationStore(unittest.TestCase):
             new_ver = conn.execute("PRAGMA user_version").fetchone()[0]
             self.assertEqual(new_ver, 2)
 
+    def test_event_id_collision_conflicting_payload_rejected(self):
+        from unittest.mock import patch, PropertyMock
+        event = sample_event()
+        obs = sample_observation(event=event)
+        self.assertTrue(self.store.insert_record(event, obs))
+
+        # Attempt to insert a conflicting event through API with matching event_id but altered payload
+        conflicting_event = sample_event(raw_payload=b"different_payload")
+        target_eid = event.event_id
+        with patch.object(RealCollectionEvent, "event_id", new_callable=PropertyMock) as mock_eid:
+            mock_eid.side_effect = lambda: target_eid
+            with self.assertRaises(sqlite3.IntegrityError):
+                self.store.insert_record(conflicting_event, obs)
+
+    def test_observation_id_collision_conflicting_payload_rejected(self):
+        from unittest.mock import patch, PropertyMock
+        event = sample_event()
+        obs = sample_observation(event=event)
+        self.assertTrue(self.store.insert_record(event, obs))
+
+        # Attempt to insert a conflicting observation through API with matching observation_id but altered confidence
+        conflicting_obs = sample_observation(event=event, confidence=0.99)
+        target_oid = obs.observation_id
+        with patch.object(RealObservation, "observation_id", new_callable=PropertyMock) as mock_oid:
+            mock_oid.side_effect = lambda: target_oid
+            with self.assertRaises(sqlite3.IntegrityError):
+                self.store.insert_record(event, conflicting_obs)
+
+    def test_batch_atomic_rollback_on_conflict(self):
+        # Prepare 3 records; the 3rd one has a conflicting/invalid foreign key
+        ev1 = sample_event(request=sample_request(subject="batch1.example.com"), raw_payload=b"wire1")
+        ob1 = sample_observation(subject="batch1.example.com", event=ev1)
+
+        ev2 = sample_event(request=sample_request(subject="batch2.example.com"), raw_payload=b"wire2")
+        ob2 = sample_observation(subject="batch2.example.com", event=ev2)
+
+        # ev3 is valid, but ob3 deliberately references a non-existent evidence_id
+        ev3 = sample_event(request=sample_request(subject="batch3.example.com"), raw_payload=b"wire3")
+        ob3 = sample_observation(
+            subject="batch3.example.com",
+            evidence_id="event_0000000000000000000000000000000000000000000000000000000000000000",
+        )
+
+        with self.assertRaises(ValueError):
+            # Fails referential match check before commit, rolling back entire batch
+            self.store.insert_batch([(ev1, ob1), (ev2, ob2), (ev3, ob3)])
+
+        # Assert atomic rollback: NONE of the batch records were committed
+        self.assertEqual(len(self.store.all_observations()), 0)
+        self.assertIsNone(self.store.get_event(ev1.event_id))
+
+    def test_batch_atomic_rollback_on_database_conflict(self):
+        from unittest.mock import patch, PropertyMock
+        ev1 = sample_event(request=sample_request(subject="batch1.example.com"), raw_payload=b"wire1")
+        ob1 = sample_observation(subject="batch1.example.com", event=ev1)
+        self.store.insert_record(ev1, ob1)
+
+        ev2 = sample_event(request=sample_request(subject="batch2.example.com"), raw_payload=b"wire2")
+        ob2 = sample_observation(subject="batch2.example.com", event=ev2)
+
+        # Create a conflicting observation with identical ID but altered confidence
+        ob1_conflicting = sample_observation(
+            subject="batch1.example.com",
+            event=ev1,
+            confidence=0.5,
+        )
+        target_id = ob1.observation_id
+        with patch.object(RealObservation, "observation_id", new_callable=PropertyMock) as mock_id:
+            mock_id.side_effect = lambda: target_id
+            with self.assertRaises(sqlite3.IntegrityError):
+                self.store.insert_batch([(ev1, ob1_conflicting), (ev2, ob2)])
+
+        # Verify ev2 was NOT committed due to rollback
+        self.assertIsNone(self.store.get_event(ev2.event_id))
+        self.assertIsNone(self.store.get_observation(ob2.observation_id))
+
+    def test_raw_evidence_hash_verified_on_load_and_export(self):
+        event = sample_event(raw_payload=b"verified_wire_packet")
+        obs = sample_observation(event=event)
+        self.store.insert_record(event, obs)
+
+        # Normal load and export succeed
+        loaded_ev = self.store.get_event(event.event_id)
+        self.assertIsNotNone(loaded_ev)
+        self.assertEqual(loaded_ev.raw_payload, b"verified_wire_packet")
+
+        exported_events = self.store.export_events()
+        self.assertEqual(len(exported_events), 1)
+        self.assertEqual(exported_events[0].event_id, event.event_id)
+
+        exported_records = self.store.export_records()
+        self.assertEqual(len(exported_records), 1)
+        self.assertEqual(exported_records[0][0].event_id, event.event_id)
+
+        # Directly tamper with raw_payload BLOB in the database
+        with self.store._connect() as conn:
+            conn.execute(
+                "UPDATE real_events SET raw_payload = ? WHERE event_id = ?",
+                (b"corrupted_bytes", event.event_id),
+            )
+
+        # Loading or exporting tampered event must fail closed with ValueError
+        with self.assertRaisesRegex(ValueError, "hash mismatch"):
+            self.store.get_event(event.event_id)
+
+        with self.assertRaisesRegex(ValueError, "hash mismatch"):
+            self.store.get_event_for_observation(obs.observation_id)
+
+        with self.assertRaisesRegex(ValueError, "hash mismatch"):
+            self.store.export_events()
+
+        with self.assertRaisesRegex(ValueError, "hash mismatch"):
+            self.store.export_records()
+
 
 if __name__ == "__main__":
     unittest.main()
