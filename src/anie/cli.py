@@ -67,6 +67,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--min-disk-mb", type=int, default=500, help="minimum required disk capacity in MiB")
     p.add_argument("--timeout", type=float, default=20.0, help="overall batch execution timeout")
     p.add_argument("--pilot", action="store_true", help="enable strictly bounded 72-hour pilot governor and query alternation")
+    p.add_argument("--pilot-start-date", default=None, help="explicit starting UTC date (YYYY-MM-DD) for 72-hour pilot window")
     p.add_argument("--sentinel-file", default=None, help="path to pilot completed sentinel file")
     p = sub.add_parser("preflight", help="execute security preflight assertions")
     p.add_argument("--require-firewall", action="store_true", help="require kernel firewall rule presence")
@@ -74,6 +75,7 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("pilot-status", help="display current 72-hour pilot progression and state")
     p.add_argument("--quota-db", default="/var/lib/anie/doh_quota.sqlite", help="path to doh_quota.sqlite database")
     p.add_argument("--sentinel-file", default=None, help="path to pilot completed sentinel file")
+    p.add_argument("--pilot-start-date", default=None, help="explicit starting UTC date (YYYY-MM-DD) for 72-hour pilot window")
     args = parser.parse_args(argv)
     try:
         if args.command == "demo":
@@ -211,6 +213,7 @@ def main(argv: list[str] | None = None) -> int:
                 timeout_seconds=args.timeout,
                 pilot_mode=args.pilot,
                 pilot_sentinel_path=Path(args.sentinel_file) if args.sentinel_file else None,
+                pilot_start_date=args.pilot_start_date,
             )
             orchestrator = BatchOrchestrator(config)
             report = orchestrator.execute_batch()
@@ -227,7 +230,7 @@ def main(argv: list[str] | None = None) -> int:
             return preflight_main(sub_argv)
         elif args.command == "pilot-status":
             from .pilot_governor import PilotGovernor
-            gov = PilotGovernor(args.quota_db, sentinel_path=args.sentinel_file)
+            gov = PilotGovernor(args.quota_db, sentinel_path=args.sentinel_file, pilot_start_date=args.pilot_start_date)
             print(json.dumps(gov.get_pilot_summary(), indent=2))
             return 0
         return 0
