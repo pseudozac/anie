@@ -46,7 +46,7 @@ flowchart TD
 - `structural_valid`: Directory, manifest schema, file presence, and compressed file size limits.
 - `evidence_integrity_valid`: Record schema conformance, content-addressed IDs, raw evidence wire hashes, deterministic ordering, and referential consistency.
 - `publisher_authenticated`: Detached Ed25519 cryptographic signature verified against pinned operator trust policy.
-- `anti_rollback_verified`: Monotonic release sequence verified against persistent state tracker.
+- `anti_rollback_verified`: Monotonic release sequence verified against persistent state tracker. Explicitly `false` when `--allow-rollback` is used for historical audits or when no tracker is configured.
 
 ### Result Contract
 When verifying an unsigned candidate with `--integrity-only`:
@@ -73,6 +73,18 @@ When verifying an authenticated release with a trusted key:
   "anti_rollback_verified": true
 }
 ```
+When verifying a historical release with `--allow-rollback` (forensic audit):
+```json
+{
+  "status": "AUTHENTICATED",
+  "authenticated": true,
+  "integrity_only": false,
+  "structural_valid": true,
+  "evidence_integrity_valid": true,
+  "publisher_authenticated": true,
+  "anti_rollback_verified": false
+}
+```
 Unsigned candidate inspection is **never represented as authenticated publication**. Verification without `--key-file` or `--integrity-only` fails closed with exit code 2.
 
 ---
@@ -96,7 +108,13 @@ ANIE implements defense-in-depth rollback protection:
    - Corrupted or unreadable state files raise `TrackerStateError` and never reset accepted sequences to zero.
    - Deleted or missing state files after initialization raise `TrackerStateLostError`.
    - Multi-process advisory locking (`msvcrt` on Windows, `fcntl` on POSIX) prevents race conditions and ensures a lower sequence cannot overwrite a higher sequence.
-4. **Controlled Historical Auditing (`--allow-rollback`):** When historical forensic auditing is deliberately required, consumers can pass `--allow-rollback`, which permits historical verification without mutating the persistent high-water mark.
+4. **Controlled Historical Auditing (`--allow-rollback`):** When historical forensic auditing is deliberately required, consumers can pass `--allow-rollback`, which permits historical verification without mutating the persistent high-water mark. When `--allow-rollback` is passed or no sequence tracker is provided, `anti_rollback_verified` is explicitly set to `false`, ensuring audits do not falsely claim active replay protection.
+
+### Bounded Streaming Decompression
+During verification of `real_events.jsonl.gz` and `real_observations.jsonl.gz`, ANIE streams decompressed data using `_iter_bounded_gzip_records()`:
+- **Per-record limit during reading:** Reads records with `stream.readline(MAX_SINGLE_RECORD_BYTES + 1)`. If a record exceeds 500 KiB before encountering a newline, it is immediately rejected during streaming read without accumulating unbounded memory.
+- **Strict record boundaries:** Every record must be terminated by a newline (`\n`); unterminated records are rejected fail-closed.
+- **Decompression limits:** Total decompressed partition size is bounded at 100 MiB (`MAX_PARTITION_DECOMPRESSED_BYTES`) and total record count at 100,000 (`MAX_RECORDS_PER_PARTITION`), defeating decompression bombs with negligible memory overhead.
 
 ### Local State Boundary Notice
 > [!WARNING]

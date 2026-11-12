@@ -823,6 +823,57 @@ class ReleaseSequenceTracker:
             self._write_state_atomic(data)
 
 
+def _iter_bounded_gzip_records(
+    stream: Any,
+    *,
+    max_record_bytes: int = MAX_SINGLE_RECORD_BYTES,
+    max_total_bytes: int = MAX_PARTITION_DECOMPRESSED_BYTES,
+    max_records: int = MAX_RECORDS_PER_PARTITION,
+    partition_name: str = "partition",
+) -> Iterator[tuple[int, bytes]]:
+    """Yield (line_number, record_bytes) from a gzip stream using bounded line reading.
+    
+    Enforces per-record byte limits during reading so an arbitrarily large record
+    cannot be accumulated into memory before rejection.
+    Enforces total decompression byte budgets and record-count ceilings.
+    Rejects records lacking required newline boundaries.
+    """
+    total_decompressed = 0
+    record_num = 0
+
+    while True:
+        # Read at most max_record_bytes + 1 bytes for the current record line.
+        # This bounds memory allocation to at most max_record_bytes + 1 bytes during reading.
+        chunk = stream.readline(max_record_bytes + 1)
+        if not chunk:
+            break
+
+        record_num += 1
+        if record_num > max_records:
+            raise ValueError(
+                f"partition '{partition_name}' exceeded maximum record limit of {max_records}"
+            )
+
+        if len(chunk) > max_record_bytes:
+            raise ValueError(
+                f"record #{record_num} in '{partition_name}' exceeds byte limit of {max_record_bytes} "
+                f"during streaming read"
+            )
+
+        if not chunk.endswith(b"\n"):
+            raise ValueError(
+                f"record #{record_num} in '{partition_name}' lacks required newline boundary"
+            )
+
+        total_decompressed += len(chunk)
+        if total_decompressed > max_total_bytes:
+            raise ValueError(
+                f"partition '{partition_name}' exceeded decompression limit of {max_total_bytes} bytes"
+            )
+
+        yield record_num, chunk[:-1]
+
+
 def verify_real_release(
     directory: str | Path,
     trust: RealReleaseTrust | None = None,
@@ -841,6 +892,7 @@ def verify_real_release(
       and referential integrity are fully verified via model reconstruction.
     - publisher_authenticated: Cryptographic Ed25519 signature verified against operator trust policy.
     - anti_rollback_verified: Release sequence verified monotonically against persistent state.
+      Explicitly False whenever allow_rollback=True bypasses enforcement or sequence_tracker is None.
     
     When integrity_only=True, candidate integrity is verified without requiring a trust policy;
     candidate verification is explicitly marked unauthenticated.
@@ -881,24 +933,23 @@ def verify_real_release(
         if h.hexdigest() != expected_meta.get("sha256"):
             raise ValueError(f"SHA-256 integrity mismatch for partition '{fname}'")
 
-    # 2. Streaming Decompression & Strict Model Reconstruction for Events
+    # 2. Bounded Streaming Decompression & Strict Model Reconstruction for Events
     events_path = dir_path / "real_events.jsonl.gz"
     event_meta = files_map["real_events.jsonl.gz"]
     event_ids: set[str] = set()
     prev_event_order: tuple[str, str] | None = None
     event_count = 0
-    total_decompressed_events = 0
 
     with gzip.open(events_path, "rb") as gz:
-        for line_num, line in enumerate(gz, 1):
-            if len(line) > MAX_SINGLE_RECORD_BYTES:
-                raise ValueError(f"event record #{line_num} exceeds byte limit of {MAX_SINGLE_RECORD_BYTES}")
-            total_decompressed_events += len(line)
-            if total_decompressed_events > MAX_PARTITION_DECOMPRESSED_BYTES:
-                raise ValueError(f"events partition exceeded decompression limit of {MAX_PARTITION_DECOMPRESSED_BYTES} bytes")
-
+        for line_num, line_bytes in _iter_bounded_gzip_records(
+            gz,
+            max_record_bytes=MAX_SINGLE_RECORD_BYTES,
+            max_total_bytes=MAX_PARTITION_DECOMPRESSED_BYTES,
+            max_records=MAX_RECORDS_PER_PARTITION,
+            partition_name="real_events.jsonl.gz",
+        ):
             try:
-                raw_dict = json.loads(line.decode("utf-8"))
+                raw_dict = json.loads(line_bytes.decode("utf-8"))
             except (ValueError, UnicodeDecodeError) as exc:
                 raise ValueError(f"malformed JSON in real_events line #{line_num}: {exc}") from exc
 
@@ -925,23 +976,22 @@ def verify_real_release(
     if manifest.get("total_events") != event_count:
         raise ValueError(f"manifest total_events ({manifest.get('total_events')}) does not match actual count ({event_count})")
 
-    # 3. Streaming Decompression & Strict Model Reconstruction for Observations
+    # 3. Bounded Streaming Decompression & Strict Model Reconstruction for Observations
     obs_path = dir_path / "real_observations.jsonl.gz"
     obs_meta = files_map["real_observations.jsonl.gz"]
     prev_obs_order: tuple[str, str] | None = None
     obs_count = 0
-    total_decompressed_obs = 0
 
     with gzip.open(obs_path, "rb") as gz:
-        for line_num, line in enumerate(gz, 1):
-            if len(line) > MAX_SINGLE_RECORD_BYTES:
-                raise ValueError(f"observation record #{line_num} exceeds byte limit of {MAX_SINGLE_RECORD_BYTES}")
-            total_decompressed_obs += len(line)
-            if total_decompressed_obs > MAX_PARTITION_DECOMPRESSED_BYTES:
-                raise ValueError(f"observations partition exceeded decompression limit of {MAX_PARTITION_DECOMPRESSED_BYTES} bytes")
-
+        for line_num, line_bytes in _iter_bounded_gzip_records(
+            gz,
+            max_record_bytes=MAX_SINGLE_RECORD_BYTES,
+            max_total_bytes=MAX_PARTITION_DECOMPRESSED_BYTES,
+            max_records=MAX_RECORDS_PER_PARTITION,
+            partition_name="real_observations.jsonl.gz",
+        ):
             try:
-                raw_dict = json.loads(line.decode("utf-8"))
+                raw_dict = json.loads(line_bytes.decode("utf-8"))
             except (ValueError, UnicodeDecodeError) as exc:
                 raise ValueError(f"malformed JSON in real_observations line #{line_num}: {exc}") from exc
 
@@ -1126,7 +1176,9 @@ def verify_real_release(
                 seq,
                 allow_uninitialized=allow_uninitialized_state,
             )
-        anti_rollback_verified = True
+            anti_rollback_verified = True
+        else:
+            anti_rollback_verified = False
 
     return {
         "status": "AUTHENTICATED",

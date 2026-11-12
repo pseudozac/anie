@@ -679,6 +679,7 @@ class TestReplayAndRollbackProtection(unittest.TestCase):
             )
             res5 = verify_real_release(dir5, trust=self.trust, now="2026-11-12T11:00:00Z", sequence_tracker=tracker)
             self.assertTrue(res5["authenticated"])
+            self.assertTrue(res5["anti_rollback_verified"])
             self.assertEqual(tracker.get_last_accepted_sequence("anie-first-party"), 5)
 
             # Step 2: Attempting Sequence 4 (Downgrade/Replay attack)
@@ -698,6 +699,7 @@ class TestReplayAndRollbackProtection(unittest.TestCase):
                 verify_real_release(dir4, trust=self.trust, now="2026-11-12T11:00:00Z", sequence_tracker=tracker)
 
             # Step 3: Historical audit with allow_rollback=True succeeds without modifying high-water mark
+            # anti_rollback_verified must be explicitly False during historical audits
             res_hist = verify_real_release(
                 dir4,
                 trust=self.trust,
@@ -706,8 +708,53 @@ class TestReplayAndRollbackProtection(unittest.TestCase):
                 allow_rollback=True,
             )
             self.assertTrue(res_hist["authenticated"])
+            self.assertTrue(res_hist["publisher_authenticated"])
+            self.assertTrue(res_hist["evidence_integrity_valid"])
+            self.assertFalse(res_hist["anti_rollback_verified"])
             # High-water mark remains at 5
             self.assertEqual(tracker.get_last_accepted_sequence("anie-first-party"), 5)
+
+    def test_historical_audit_never_claims_active_rollback_protection(self):
+        """When allow_rollback=True bypasses sequence enforcement, anti_rollback_verified must be False."""
+        ev, obs = make_test_pair()
+        with TemporaryDirectory() as tmp:
+            state_file = Path(tmp) / "verifier_state.json"
+            tracker = ReleaseSequenceTracker(state_file, auto_init=True)
+
+            dir5 = Path(tmp) / "rel_5"
+            publish_real(([obs], [ev]), dir5, as_of="2026-11-12T10:00:00Z", release_sequence=5)
+            sign_manifest_detached(
+                dir5,
+                self.priv_key,
+                key_id=self.key_id,
+                release_sequence=5,
+                issued_at="2026-11-12T10:05:00Z",
+                expires_at="2026-12-12T10:05:00Z",
+            )
+
+            # 1. Normal forward verification has anti_rollback_verified=True
+            res_normal = verify_real_release(
+                dir5,
+                trust=self.trust,
+                now="2026-11-12T11:00:00Z",
+                sequence_tracker=tracker,
+            )
+            self.assertTrue(res_normal["authenticated"])
+            self.assertTrue(res_normal["publisher_authenticated"])
+            self.assertTrue(res_normal["anti_rollback_verified"])
+
+            # 2. Historical audit with allow_rollback=True has anti_rollback_verified=False
+            res_audit = verify_real_release(
+                dir5,
+                trust=self.trust,
+                now="2026-11-12T11:00:00Z",
+                sequence_tracker=tracker,
+                allow_rollback=True,
+            )
+            self.assertTrue(res_audit["authenticated"])
+            self.assertTrue(res_audit["publisher_authenticated"])
+            self.assertTrue(res_audit["evidence_integrity_valid"])
+            self.assertFalse(res_audit["anti_rollback_verified"])
 
     def test_tracker_corruption_fails_closed(self):
         """Malformed or unreadable state file must raise TrackerStateError and never reset to zero."""
@@ -812,7 +859,54 @@ class TestResourceLimitsAndSafety(unittest.TestCase):
             man_data["files"][0]["bytes"] = obs_file.stat().st_size
             man_file.write_text(canonical_json(man_data) + "\n", encoding="utf-8")
 
-            with self.assertRaisesRegex(ValueError, "exceeds byte limit"):
+            with self.assertRaisesRegex(ValueError, "exceeds byte limit of 500000 during streaming read"):
+                verify_real_release(out_dir, integrity_only=True)
+
+    def test_oversized_single_line_record_rejected_during_reading(self):
+        """Compressed partition containing a single record exceeding 500 KiB must be rejected during reading."""
+        ev, obs = make_test_pair()
+        with TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "release"
+            publish_real(([obs], [ev]), out_dir, as_of="2026-11-12T10:00:00Z")
+
+            # Create a compressed partition with a single 1 MiB line (exceeds 500 KiB limit)
+            # Compressed with gzip, it takes only ~1 KiB on disk
+            obs_file = out_dir / "real_observations.jsonl.gz"
+            oversized_record = (b"A" * 1_000_000) + b"\n"
+            with obs_file.open("wb") as raw:
+                with gzip.GzipFile(fileobj=raw, mode="wb", filename="", mtime=0, compresslevel=9) as gz:
+                    gz.write(oversized_record)
+
+            man_file = out_dir / "manifest.json"
+            man_data = json.loads(man_file.read_text(encoding="utf-8"))
+            man_data["files"][0]["sha256"] = sha256(obs_file.read_bytes()).hexdigest()
+            man_data["files"][0]["bytes"] = obs_file.stat().st_size
+            man_file.write_text(canonical_json(man_data) + "\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "exceeds byte limit of 500000 during streaming read"):
+                verify_real_release(out_dir, integrity_only=True)
+
+    def test_record_lacking_newline_boundary_rejected(self):
+        """Partition record lacking required newline delimiter must be rejected fail-closed."""
+        ev, obs = make_test_pair()
+        with TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "release"
+            publish_real(([obs], [ev]), out_dir, as_of="2026-11-12T10:00:00Z")
+
+            obs_file = out_dir / "real_observations.jsonl.gz"
+            # Valid JSON but lacking trailing newline
+            no_nl_record = canonical_json(obs.to_dict()).encode("utf-8")
+            with obs_file.open("wb") as raw:
+                with gzip.GzipFile(fileobj=raw, mode="wb", filename="", mtime=0, compresslevel=9) as gz:
+                    gz.write(no_nl_record)
+
+            man_file = out_dir / "manifest.json"
+            man_data = json.loads(man_file.read_text(encoding="utf-8"))
+            man_data["files"][0]["sha256"] = sha256(obs_file.read_bytes()).hexdigest()
+            man_data["files"][0]["bytes"] = obs_file.stat().st_size
+            man_file.write_text(canonical_json(man_data) + "\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "lacks required newline boundary"):
                 verify_real_release(out_dir, integrity_only=True)
 
     def test_truncated_archive_rejected(self):
