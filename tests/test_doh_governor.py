@@ -9,6 +9,7 @@ import sqlite3
 from tempfile import TemporaryDirectory
 import time
 import unittest
+from unittest.mock import patch
 
 from anie.collection_policy import ScopeDenied
 from anie.doh_governor import (
@@ -139,7 +140,8 @@ class TestDohGovernorAdversarial(unittest.TestCase):
     def test_sqlite_lock_contention_fails_closed(self):
         with TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "locked_rate.sqlite"
-            gov = DohRateGovernor(db_path, target_cooldown_seconds=1800.0)
+            # Fast fail-closed under lock contention via short busy_timeout_ms
+            gov = DohRateGovernor(db_path, target_cooldown_seconds=1800.0, busy_timeout_ms=50)
 
             # Manually hold an EXCLUSIVE lock from another connection
             locking_conn = sqlite3.connect(db_path)
@@ -154,10 +156,18 @@ class TestDohGovernorAdversarial(unittest.TestCase):
                 locking_conn.close()
 
     def test_quota_database_failure_fails_closed(self):
-        # Point to an impossible unwritable directory
-        unwritable_path = Path("Z:/nonexistent_volume/unwritable/rate.sqlite")
-        with self.assertRaises(ScopeDenied):
-            DohRateGovernor(unwritable_path)
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "rate.sqlite"
+            # 1. Initialization failure fails closed
+            with patch("sqlite3.connect", side_effect=sqlite3.OperationalError("disk I/O error")):
+                with self.assertRaises(ScopeDenied):
+                    DohRateGovernor(db_path)
+
+            # 2. Reservation-time failure fails closed
+            gov = DohRateGovernor(db_path)
+            with patch("sqlite3.connect", side_effect=sqlite3.OperationalError("disk I/O error")):
+                with self.assertRaises(ScopeDenied):
+                    gov.check_and_reserve("example.com", "cloudflare_doh")
 
     def test_dns_resolution_delay_exhausts_deadline(self):
         def stalled_addrinfo(host, port, type=socket.SOCK_STREAM):

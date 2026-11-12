@@ -157,6 +157,7 @@ class DohRateGovernor:
         max_resolver_per_hour: int = DEFAULT_MAX_RESOLVER_PER_HOUR,
         max_daily_total: int = DEFAULT_MAX_DAILY_TOTAL,
         allow_ephemeral_for_testing: bool = False,
+        busy_timeout_ms: int = 5000,
     ):
         # 1. Reject invalid or nonpositive configuration values
         if type(max_target_per_hour) is not int or max_target_per_hour <= 0:
@@ -167,6 +168,8 @@ class DohRateGovernor:
             raise ValueError(f"max_resolver_per_hour must be a positive integer; got {max_resolver_per_hour}")
         if type(max_daily_total) is not int or max_daily_total <= 0:
             raise ValueError(f"max_daily_total must be a positive integer; got {max_daily_total}")
+        if type(busy_timeout_ms) is not int or busy_timeout_ms <= 0:
+            raise ValueError(f"busy_timeout_ms must be a positive integer; got {busy_timeout_ms}")
 
         # 2. Enforce durable quota database for real collection
         if db_path is None or str(db_path) == ":memory:":
@@ -177,8 +180,8 @@ class DohRateGovernor:
                 )
             self._is_memory = True
             self.db_path = Path(":memory:")
-            self._mem_conn = sqlite3.connect(":memory:", timeout=5.0)
-            self._mem_conn.execute("PRAGMA busy_timeout = 5000")
+            self._mem_conn = sqlite3.connect(":memory:", timeout=busy_timeout_ms / 1000.0)
+            self._mem_conn.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
         else:
             self._is_memory = False
             self.db_path = Path(db_path)
@@ -192,6 +195,7 @@ class DohRateGovernor:
         self.target_cooldown_seconds = float(target_cooldown_seconds)
         self.max_resolver_per_hour = max_resolver_per_hour
         self.max_daily_total = max_daily_total
+        self.busy_timeout_ms = busy_timeout_ms
         self._init_db()
 
     @classmethod
@@ -233,37 +237,42 @@ class DohRateGovernor:
                 raise
         else:
             try:
-                conn = sqlite3.connect(self.db_path, timeout=5.0, isolation_level=None)
-            except sqlite3.Error as exc:
+                conn = sqlite3.connect(self.db_path, timeout=self.busy_timeout_ms / 1000.0, isolation_level=None)
+            except (sqlite3.Error, OSError) as exc:
                 raise ScopeDenied(f"quota database unavailable: {exc}") from exc
             try:
-                conn.execute("PRAGMA busy_timeout = 5000")
+                conn.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms}")
                 conn.execute("PRAGMA journal_mode = WAL")
                 yield conn
-            except sqlite3.Error as exc:
+            except (sqlite3.Error, OSError) as exc:
                 raise ScopeDenied(f"quota database operation failed: {exc}") from exc
             finally:
                 conn.close()
 
     def _init_db(self) -> None:
-        with self._connect() as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS doh_rate_log (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    domain TEXT NOT NULL,
-                    resolver TEXT NOT NULL,
-                    observed_at TEXT NOT NULL,
-                    timestamp_epoch REAL NOT NULL
-                )
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_doh_rate_domain_time 
-                ON doh_rate_log(domain, timestamp_epoch)
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_doh_rate_resolver_time 
-                ON doh_rate_log(resolver, timestamp_epoch)
-            """)
+        try:
+            with self._connect() as conn:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS doh_rate_log (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        domain TEXT NOT NULL,
+                        resolver TEXT NOT NULL,
+                        observed_at TEXT NOT NULL,
+                        timestamp_epoch REAL NOT NULL
+                    )
+                """)
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_doh_rate_domain_time 
+                    ON doh_rate_log(domain, timestamp_epoch)
+                """)
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_doh_rate_resolver_time 
+                    ON doh_rate_log(resolver, timestamp_epoch)
+                """)
+        except (sqlite3.Error, OSError, ScopeDenied) as exc:
+            if isinstance(exc, ScopeDenied):
+                raise
+            raise ScopeDenied(f"failed to initialize quota database: {exc}") from exc
 
     def check_and_reserve(
         self,
