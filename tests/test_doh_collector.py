@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import http.client
 from io import BytesIO
 from pathlib import Path
 import socket
 import struct
 import sys
 from tempfile import TemporaryDirectory
+import threading
 import time
 import unittest
 
@@ -249,6 +251,50 @@ class TestDohCollectorAdversarial(unittest.TestCase):
         bad_dict["synthetic"] = True
         with self.assertRaises(ValueError):
             RealObservation.from_dict(bad_dict)
+
+    def test_slow_trickle_headers_cannot_extend_deadline_loopback(self):
+        # Local loopback TCP server on ephemeral port (isolated fixture, no public network/DNS)
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        port = server.getsockname()[1]
+
+        def slow_trickle_server():
+            try:
+                conn, _ = server.accept()
+                with conn:
+                    conn.recv(1024)
+                    # Trickle response headers 1 byte at a time with 0.04s sleep per byte
+                    # Over 55 bytes, full transmission would take ~2.2 seconds
+                    header_bytes = b"HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\n\r\n"
+                    for b in header_bytes:
+                        conn.sendall(bytes([b]))
+                        time.sleep(0.04)
+            except Exception:
+                pass
+
+        server_thread = threading.Thread(target=slow_trickle_server, daemon=True)
+        server_thread.start()
+
+        try:
+            # Client has a short 0.15s deadline; server attempts to trickle for >2.0s
+            collector = DohCollector(
+                rate_governor=self.rate_gov,
+                timeout_seconds=0.15,
+                connection_factory=lambda ip, host, timeout, deadline=None: http.client.HTTPConnection("127.0.0.1", port=port, timeout=timeout),
+                addrinfo_fn=lambda h, p, **k: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("104.16.132.229", 443))],
+            )
+
+            t0 = time.monotonic()
+            with self.assertRaises((TimeoutError, socket.timeout)):
+                collector.collect("example.com", "dns_a")
+            elapsed = time.monotonic() - t0
+
+            # Execution must abort promptly within ~0.15s - 0.45s, not wait 2.2s for slow-trickle
+            self.assertLess(elapsed, 0.6)
+        finally:
+            server.close()
+            server_thread.join(timeout=1.0)
 
     def test_tls_connection_stall_exhausts_deadline(self):
         # Connection factory stalls during connect

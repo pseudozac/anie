@@ -24,6 +24,7 @@ import base64
 from datetime import datetime, timezone
 from hashlib import sha256
 import http.client
+import io
 from pathlib import Path
 import socket
 import ssl
@@ -53,6 +54,66 @@ from .real_models import (
 
 SOURCE_ID = "first_party:doh:cloudflare"
 RESOLVER_IDENTITY = "cloudflare_doh"
+
+
+class DeadlineSocketWrapper:
+    """Wraps an underlying socket or SSLSocket to cooperatively enforce monotonic deadline.
+    
+    Mitigates slow-trickle attacks where an upstream server transmits single bytes
+    just before individual socket timeouts expire. On each recv, recv_into, or read call,
+    recalculates remaining monotonic deadline and updates the socket timeout.
+    If the monotonic deadline has expired, raises TimeoutError.
+    
+    Operational Boundary Note:
+    This wrapper provides cooperative in-process timeout clamping at userspace I/O boundaries.
+    It does not guarantee hard real-time preemption if an underlying C library or kernel driver
+    enters an uninterruptible sleep state. Full outer cancellation guarantees require an
+    independent supervisor watchdog (such as systemd RuntimeMaxSec in PR 3).
+    """
+
+    def __init__(self, raw_sock: Any, deadline: float):
+        self._sock = raw_sock
+        self._deadline = deadline
+
+    def _check_deadline(self) -> float:
+        rem = self._deadline - time.monotonic()
+        if rem <= 0:
+            raise TimeoutError("monotonic deadline exceeded during socket receive")
+        if hasattr(self._sock, "settimeout"):
+            self._sock.settimeout(rem)
+        return rem
+
+    def recv_into(self, b: Any, *args: Any, **kwargs: Any) -> int:
+        self._check_deadline()
+        return self._sock.recv_into(b, *args, **kwargs)
+
+    def recv(self, *args: Any, **kwargs: Any) -> bytes:
+        self._check_deadline()
+        return self._sock.recv(*args, **kwargs)
+
+    def read(self, *args: Any, **kwargs: Any) -> bytes:
+        self._check_deadline()
+        if hasattr(self._sock, "read"):
+            return self._sock.read(*args, **kwargs)
+        return self._sock.recv(*args, **kwargs)
+
+    def makefile(
+        self,
+        mode: str = "r",
+        buffering: int | None = None,
+        *,
+        encoding: str | None = None,
+        errors: str | None = None,
+        newline: str | None = None,
+    ) -> Any:
+        if "b" in mode:
+            raw = socket.SocketIO(self, mode)
+            buf_size = buffering if (buffering is not None and buffering > 0) else io.DEFAULT_BUFFER_SIZE
+            return io.BufferedReader(raw, buf_size)
+        return self._sock.makefile(mode, buffering, encoding=encoding, errors=errors, newline=newline)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._sock, name)
 
 
 class _PinnedHttpsConnection(http.client.HTTPSConnection):
@@ -89,7 +150,12 @@ class _PinnedHttpsConnection(http.client.HTTPSConnection):
             # 2. TLS handshake using fresh remaining deadline
             rem_tls = self._get_remaining()
             sock.settimeout(rem_tls)
-            self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+            ssl_sock = self._context.wrap_socket(sock, server_hostname=self.host)
+            # 3. Wrap socket with deadline enforcement
+            if self._deadline is not None:
+                self.sock = DeadlineSocketWrapper(ssl_sock, self._deadline)
+            else:
+                self.sock = ssl_sock
         except BaseException:
             sock.close()
             raise
@@ -160,6 +226,10 @@ class DohCollector:
                 if not hasattr(conn, "sock") or conn.sock is None:
                     if hasattr(conn, "connect"):
                         conn.connect()
+
+                # Wrap raw socket with DeadlineSocketWrapper if not already wrapped
+                if hasattr(conn, "sock") and conn.sock is not None and not isinstance(conn.sock, DeadlineSocketWrapper):
+                    conn.sock = DeadlineSocketWrapper(conn.sock, deadline)
 
                 # HTTP request transmission under actual remaining deadline
                 rem_req = deadline - time.monotonic()

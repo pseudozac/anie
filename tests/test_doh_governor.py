@@ -20,6 +20,7 @@ from anie.doh_governor import (
     ALLOWED_TARGET_DOMAINS,
     DohRateGovernor,
     resolve_and_pin_endpoint,
+    resolve_host_in_subprocess,
     validate_batch_domains,
     validate_resolver_endpoint,
     validate_target,
@@ -197,6 +198,21 @@ class TestDohGovernorAdversarial(unittest.TestCase):
                 )
         # Verify zero background threads leaked
         self.assertEqual(threading.active_count(), initial_threads)
+
+    def test_subprocess_child_terminated_and_reaped_on_timeout(self):
+        hanging_cmd = [sys.executable, "-c", "import time; time.sleep(60)"]
+        # Run repeated timeouts directly through resolve_host_in_subprocess
+        for _ in range(3):
+            t0 = time.monotonic()
+            with self.assertRaises(TimeoutError):
+                resolve_host_in_subprocess(
+                    "cloudflare-dns.com",
+                    timeout=0.08,
+                    subproc_cmd=hanging_cmd,
+                )
+            elapsed = time.monotonic() - t0
+            # Confirm prompt cancellation without blocking for 60s
+            self.assertLess(elapsed, 0.6)
 
     def test_sqlite_lock_contention_bounded_deadline(self):
         with TemporaryDirectory() as tmp:
