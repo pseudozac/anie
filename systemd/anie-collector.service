@@ -1,0 +1,60 @@
+[Unit]
+Description=ANIE First-Party Intelligence Bounded Batch Collector
+Documentation=file:///opt/anie/systemd/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=anie
+Group=anie
+WorkingDirectory=/var/lib/anie
+
+# Optional environment configuration for authorization and flags
+EnvironmentFile=-/etc/default/anie-collector
+
+# Default execution is safe offline dry-run; live collection requires
+# explicit operator configuration in /etc/default/anie-collector
+# (ANIE_LIVE_COLLECTION_AUTHORIZED=1 and EXTRA_OPTS="--live")
+ExecStart=/opt/anie/venv/bin/python -m anie collect-batch \
+    --quota-db /var/lib/anie/doh_quota.sqlite \
+    --store-db /var/lib/anie/real_intelligence.sqlite \
+    --log-file /var/log/anie/collector.jsonl \
+    --lock-file /var/lib/anie/collector.lock \
+    $EXTRA_OPTS
+
+# Strict supervisor timeouts (RuntimeMaxSec does NOT apply to Type=oneshot)
+TimeoutStartSec=30s
+TimeoutStopSec=15s
+KillMode=control-group
+Restart=no
+
+# Host resource boundaries (designed for Oracle Cloud 1 GiB micro VM)
+MemoryMax=128M
+MemoryHigh=96M
+CPUQuota=20%
+Nice=19
+
+# Security sandbox and filesystem boundaries
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+
+# Explicit read/write storage access
+ReadWritePaths=/var/lib/anie /var/log/anie
+ReadOnlyPaths=/opt/anie
+
+# Journal logging
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
