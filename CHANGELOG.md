@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- PR 2: First-party DNS-over-HTTPS (DoH) collection engine (`DohCollector`) and policy governor (`DohRateGovernor`).
+- Strict target allowlist limited to `example.com` and `iana.org`, query kinds `dns_a` and `dns_aaaa`, and batch domain size limit ($\le 2$ domains per invocation).
+- Anti-rebinding resolver endpoint resolution requiring all returned IPs to be verified global addresses before socket allocation, with isolated subprocess-based execution guaranteeing hard cancellation without blocking context managers or leaking threads/processes.
+- Persistent SQLite-backed rate governor with atomic `BEGIN IMMEDIATE` multi-process locking, deadline-bounded lock acquisition, per-target 30-minute cooldown, conservative hourly quotas, and fail-closed error handling. Ephemeral in-memory storage restricted strictly to explicit test mode.
+- Full RFC 8484 wire-format exchange with bounded response capture ($\le 65,535$ bytes) and SHA-256 evidence integrity.
+- Comprehensive monotonic wall-clock deadline enforcement encompassing SQLite lock acquisition, endpoint resolution, TCP connect, TLS handshake, HTTP request transmission, response headers, chunked body streaming, and bounded retries without deadline reset.
+- Cooperative deadline socket wrapper (`DeadlineSocketWrapper`) preventing slow-trickle servers from extending request durations via sub-timeout byte streaming during header or body reads; operational boundaries and external watchdog architecture documented for PR 3.
+- Explicit DNS response classification for ANSWER, NXDOMAIN, NODATA, SERVFAIL, and REFUSED.
+- Resolver AD flag recorded strictly as an untrusted third-party claim (`resolver_ad_claim=True`) while `dnssec_status` remains `'indeterminate'` without independent cryptographic proof.
+- Mandatory invariants: SERVFAIL recorded as error without inferring DNSSEC-bogus; analytical confidence kept strictly nullable (`None`).
 - PR 1: Introduce Phase 2 first-party intelligence data models (`RealObservation`, `RealCollectionEvent`, `FactualVerification`) and SQLite store (`RealObservationStore`).
 - Replace arbitrary confidence multipliers with distinct empirical factual verification attributes and explicitly nullable analytical confidence.
 - Enforce strict cross-pipeline isolation: real observations require `synthetic=False` and are rejected by synthetic publishers; synthetic fixtures are rejected by `RealObservationStore`.

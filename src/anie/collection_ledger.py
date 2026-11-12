@@ -57,26 +57,37 @@ class CollectionLedger:
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.path, timeout=10) as db:
-            db.execute("""CREATE TABLE IF NOT EXISTS collection_events (
-                event_id TEXT PRIMARY KEY,
-                subject TEXT NOT NULL,
-                observed_at TEXT NOT NULL,
-                payload TEXT NOT NULL
-            )""")
-            db.execute("CREATE INDEX IF NOT EXISTS events_by_subject_time ON collection_events(subject, observed_at, event_id)")
+        db = sqlite3.connect(self.path, timeout=10)
+        try:
+            with db:
+                db.execute("""CREATE TABLE IF NOT EXISTS collection_events (
+                    event_id TEXT PRIMARY KEY,
+                    subject TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                )""")
+                db.execute("CREATE INDEX IF NOT EXISTS events_by_subject_time ON collection_events(subject, observed_at, event_id)")
+        finally:
+            db.close()
 
     def add(self, event: CollectionEvent) -> bool:
         validated = _validated_event(event.to_dict())
-        with sqlite3.connect(self.path, timeout=10) as db:
-            cur = db.execute("INSERT OR IGNORE INTO collection_events (event_id,subject,observed_at,payload) VALUES (?,?,?,?)", (
-                validated.event_id, event.request.subject, event.request.observed_at, canonical_json(event.to_dict()),
-            ))
-            return cur.rowcount == 1
+        db = sqlite3.connect(self.path, timeout=10)
+        try:
+            with db:
+                cur = db.execute("INSERT OR IGNORE INTO collection_events (event_id,subject,observed_at,payload) VALUES (?,?,?,?)", (
+                    validated.event_id, event.request.subject, event.request.observed_at, canonical_json(event.to_dict()),
+                ))
+                return cur.rowcount == 1
+        finally:
+            db.close()
 
     def by_subject(self, subject: str) -> list[CollectionEvent]:
-        with sqlite3.connect(self.path, timeout=10) as db:
+        db = sqlite3.connect(self.path, timeout=10)
+        try:
             rows = db.execute("SELECT event_id,payload FROM collection_events WHERE subject=? ORDER BY observed_at,event_id LIMIT 10000", (subject,)).fetchall()
+        finally:
+            db.close()
         events = []
         for event_id, payload in rows:
             event = _validated_event(json.loads(payload))
