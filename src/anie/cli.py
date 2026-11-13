@@ -76,6 +76,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--quota-db", default="/var/lib/anie/doh_quota.sqlite", help="path to doh_quota.sqlite database")
     p.add_argument("--sentinel-file", default=None, help="path to pilot completed sentinel file")
     p.add_argument("--pilot-start-date", default=None, help="explicit starting UTC date (YYYY-MM-DD) for 72-hour pilot window")
+    p = sub.add_parser("backup", help="create verified online SQLite backup of databases")
+    p.add_argument("--dbs", nargs="+", default=["/var/lib/anie/real_intelligence.sqlite", "/var/lib/anie/doh_quota.sqlite"], help="SQLite databases to back up")
+    p.add_argument("--out", default="/var/lib/anie/backups", help="destination directory for backup snapshots")
+    p.add_argument("--retention", type=int, default=7, help="number of non-milestone snapshots to retain")
+    p = sub.add_parser("restore", help="validate and restore SQLite backup into isolated directory")
+    p.add_argument("--backup-dir", required=True, help="source backup directory containing SHA256SUMS")
+    p.add_argument("--target", required=True, help="isolated destination directory for restored databases")
+    p.add_argument("--allow-overwrite", action="store_true", help="permit overwriting existing files in destination")
     args = parser.parse_args(argv)
     try:
         if args.command == "demo":
@@ -233,6 +241,18 @@ def main(argv: list[str] | None = None) -> int:
             gov = PilotGovernor(args.quota_db, sentinel_path=args.sentinel_file, pilot_start_date=args.pilot_start_date)
             print(json.dumps(gov.get_pilot_summary(), indent=2))
             return 0
+        elif args.command == "backup":
+            from dataclasses import asdict
+            from .backup import create_evidence_backup
+            res = create_evidence_backup(args.dbs, args.out, retention_limit=args.retention)
+            print(json.dumps(asdict(res), indent=2))
+            return 0 if res.success else 1
+        elif args.command == "restore":
+            from dataclasses import asdict
+            from .backup import restore_evidence_backup
+            res = restore_evidence_backup(args.backup_dir, args.target, allow_overwrite=args.allow_overwrite)
+            print(json.dumps(asdict(res), indent=2))
+            return 0 if res.success else 1
         return 0
     except (ValueError, PermissionError, FileNotFoundError, FileExistsError, json.JSONDecodeError) as exc:
         print(f"ANIE error: {exc}", file=sys.stderr)

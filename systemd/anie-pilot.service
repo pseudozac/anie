@@ -16,6 +16,7 @@ WorkingDirectory=/var/lib/anie
 # Optional environment configuration for authorization and flags
 EnvironmentFile=-/etc/default/anie-pilot
 Environment=ANIE_LIVE_COLLECTION_AUTHORIZED=1
+Environment=PYTHONPATH=/opt/anie-phase2/src
 
 # Fail-Closed Security Preflight: ExecStartPre fails the unit (observable failed state)
 # if IMDS 169.254.169.254 is reachable, egress filtering is inactive, or preflight checks fail.
