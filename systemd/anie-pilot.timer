@@ -9,6 +9,7 @@ ConditionPathExists=/etc/systemd/system/anie-pilot.service
 # Persistent=false strictly prevents catch-up runs after host downtime or reboots.
 OnCalendar=*-*-* 06:00:00 UTC
 RandomizedDelaySec=900s
+AccuracySec=1us
 Persistent=false
 Unit=anie-pilot.service
 

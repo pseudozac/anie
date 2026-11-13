@@ -135,6 +135,74 @@ class PilotGovernor:
             (start_str,),
         )
 
+    def initialize_pilot(self, start_date_str: str) -> dict[str, Any]:
+        """Atomically initialize and anchor the immutable pilot start date.
+
+        Invariants:
+        1. Initialize start_date_str only if no start date exists.
+        2. Accept an existing identical date without modification (idempotent).
+        3. Reject any conflicting existing date with ScopeDenied.
+        4. Reject initialization if prior pilot activity exists in pilot_schedule_state.
+        5. Never reset or overwrite existing pilot state.
+        """
+        try:
+            target_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+        except ValueError as exc:
+            raise ValueError(f"invalid start date format '{start_date_str}', expected YYYY-MM-DD") from exc
+
+        target_str = target_date.strftime("%Y-%m-%d")
+
+        with self._connect() as conn:
+            cur = conn.cursor()
+            cur.execute("BEGIN IMMEDIATE")
+            try:
+                row = cur.execute(
+                    "SELECT value FROM pilot_metadata WHERE key = 'start_date_utc'"
+                ).fetchone()
+                existing_start = row[0] if row else None
+
+                runs_count_row = cur.execute(
+                    "SELECT COUNT(*) FROM pilot_schedule_state"
+                ).fetchone()
+                runs_count = runs_count_row[0] if runs_count_row else 0
+
+                if existing_start is not None:
+                    if existing_start == target_str:
+                        cur.execute("COMMIT")
+                        return {
+                            "status": "ALREADY_INITIALIZED",
+                            "start_date_utc": existing_start,
+                            "authorized_window": self.get_authorized_dates(),
+                            "message": f"Pilot start date is already anchored to {existing_start}; no changes made.",
+                        }
+                    else:
+                        raise ScopeDenied(
+                            f"conflicting pilot start date already anchored: existing '{existing_start}' "
+                            f"!= requested '{target_str}'. Start date is immutable and cannot be overwritten."
+                        )
+
+                if runs_count > 0:
+                    raise ScopeDenied(
+                        f"cannot initialize pilot start date: pilot_schedule_state already contains {runs_count} "
+                        "recorded runs without an anchored start date. Manual inspection required."
+                    )
+
+                cur.execute(
+                    "INSERT INTO pilot_metadata (key, value) VALUES ('start_date_utc', ?)",
+                    (target_str,),
+                )
+                cur.execute("COMMIT")
+
+                return {
+                    "status": "INITIALIZED",
+                    "start_date_utc": target_str,
+                    "authorized_window": self.get_authorized_dates(),
+                    "message": f"Pilot successfully initialized with immutable start date {target_str}.",
+                }
+            except Exception:
+                cur.execute("ROLLBACK")
+                raise
+
     def get_authorized_dates(self, now_dt: datetime | None = None) -> list[str]:
         """Return the list of exactly 3 authorized consecutive UTC dates (YYYY-MM-DD)."""
         start_d = self.get_start_date(now_dt)

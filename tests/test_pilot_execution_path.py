@@ -252,6 +252,60 @@ class TestPilotExecutionPath(unittest.TestCase):
         self.assertEqual(summary["missed_days"], 0)
         self.assertEqual(len(summary["runs"]), 2)
 
+    # Condition 13: Controlled immutable pilot initialization
+    def test_13_initialize_pilot_immutable_and_idempotent(self):
+        from anie.cli import main as cli_main
+        import io
+        from contextlib import redirect_stdout
+
+        gov = PilotGovernor(self.quota_db, sentinel_path=self.sentinel_file)
+        
+        # 1. Clean first-time initialization
+        res = gov.initialize_pilot("2026-11-14")
+        self.assertEqual(res["status"], "INITIALIZED")
+        self.assertEqual(res["start_date_utc"], "2026-11-14")
+        self.assertEqual(res["authorized_window"], ["2026-11-14", "2026-11-15", "2026-11-16"])
+
+        # 2. Repeated initialization with identical date is idempotent
+        res2 = gov.initialize_pilot("2026-11-14")
+        self.assertEqual(res2["status"], "ALREADY_INITIALIZED")
+        self.assertEqual(res2["start_date_utc"], "2026-11-14")
+
+        # 3. Conflicting initialization with different date is rejected
+        with self.assertRaises(ScopeDenied) as ctx:
+            gov.initialize_pilot("2026-11-15")
+        self.assertIn("conflicting pilot start date already anchored", str(ctx.exception))
+
+        # 4. Invalid date format raises ValueError
+        with self.assertRaises(ValueError):
+            gov.initialize_pilot("invalid-date")
+
+        # 5. CLI invocation test
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            ret = cli_main(["init-pilot", "--quota-db", str(self.quota_db), "--start-date", "2026-11-14"])
+        self.assertEqual(ret, 0)
+        cli_out = json.loads(buf.getvalue())
+        self.assertEqual(cli_out["status"], "ALREADY_INITIALIZED")
+
+    def test_14_initialize_pilot_rejected_if_prior_activity_exists(self):
+        # Create un-initialized governor and record a run
+        gov = PilotGovernor(self.quota_db, sentinel_path=self.sentinel_file)
+        d1 = datetime(2026, 11, 14, 6, 0, 0, tzinfo=timezone.utc)
+        r1, _, _ = gov.check_and_plan_pilot_batch(now_dt=d1)
+        gov.record_pilot_outcome(r1, "SUCCESS", batch_id="b1", now_dt=d1)
+
+        # Remove metadata to simulate unanchored state with existing runs
+        import sqlite3
+        with sqlite3.connect(str(self.quota_db)) as conn:
+            conn.execute("DELETE FROM pilot_metadata WHERE key = 'start_date_utc'")
+
+        # Initialization must now fail because runs already exist
+        gov2 = PilotGovernor(self.quota_db, sentinel_path=self.sentinel_file)
+        with self.assertRaises(ScopeDenied) as ctx:
+            gov2.initialize_pilot("2026-11-20")
+        self.assertIn("already contains 1 recorded runs", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

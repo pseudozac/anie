@@ -76,6 +76,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--quota-db", default="/var/lib/anie/doh_quota.sqlite", help="path to doh_quota.sqlite database")
     p.add_argument("--sentinel-file", default=None, help="path to pilot completed sentinel file")
     p.add_argument("--pilot-start-date", default=None, help="explicit starting UTC date (YYYY-MM-DD) for 72-hour pilot window")
+    p = sub.add_parser("init-pilot", help="atomically initialize and anchor immutable pilot start date")
+    p.add_argument("--start-date", default="2026-11-14", help="approved UTC start date (YYYY-MM-DD)")
+    p.add_argument("--quota-db", default="/var/lib/anie/doh_quota.sqlite", help="path to doh_quota.sqlite database")
+    p.add_argument("--sentinel-file", default=None, help="path to pilot completed sentinel file")
     p = sub.add_parser("backup", help="create verified online SQLite backup of databases")
     p.add_argument("--dbs", nargs="+", default=["/var/lib/anie/real_intelligence.sqlite", "/var/lib/anie/doh_quota.sqlite"], help="SQLite databases to back up")
     p.add_argument("--out", default="/var/lib/anie/backups", help="destination directory for backup snapshots")
@@ -240,6 +244,12 @@ def main(argv: list[str] | None = None) -> int:
             from .pilot_governor import PilotGovernor
             gov = PilotGovernor(args.quota_db, sentinel_path=args.sentinel_file, pilot_start_date=args.pilot_start_date)
             print(json.dumps(gov.get_pilot_summary(), indent=2))
+            return 0
+        elif args.command == "init-pilot":
+            from .pilot_governor import PilotGovernor
+            gov = PilotGovernor(args.quota_db, sentinel_path=args.sentinel_file)
+            res = gov.initialize_pilot(args.start_date)
+            print(json.dumps(res, indent=2))
             return 0
         elif args.command == "backup":
             from dataclasses import asdict
