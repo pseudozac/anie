@@ -13,6 +13,12 @@ Covers all operational and safety conditions required by Phase 2.1:
 10. Expired pilot authorization creates completion sentinel; service condition blocks collection
 11. Invocation before authorization window start date is rejected
 12. Pilot summary accurately distinguishes completed batches, failed attempts, and missed days
+13. Controlled immutable pilot initialization and idempotency
+14. Pilot initialization rejected if unanchored prior run activity exists
+15. Failed final day writes completion sentinel and prohibits further runs
+16. Interrupted final day creates completion sentinel upon subsequent reconciliation
+17. Missed final day creates completion sentinel upon subsequent reconciliation
+18. Idempotent sentinel enforcement prevents execution without database mutation
 """
 from __future__ import annotations
 
@@ -305,6 +311,101 @@ class TestPilotExecutionPath(unittest.TestCase):
         with self.assertRaises(ScopeDenied) as ctx:
             gov2.initialize_pilot("2026-11-20")
         self.assertIn("already contains 1 recorded runs", str(ctx.exception))
+
+    def test_15_failed_final_day_creates_sentinel_and_denies_further_runs(self):
+        """Failed Day 3 writes completion sentinel; no subsequent or retry runs are permitted."""
+        gov = PilotGovernor(self.quota_db, sentinel_path=self.sentinel_file, pilot_start_date=self.start_date)
+        for day, date_str in [(1, "2026-11-13"), (2, "2026-11-14")]:
+            dt = datetime.fromisoformat(f"{date_str}T06:00:00+00:00")
+            r, _, _ = gov.check_and_plan_pilot_batch(now_dt=dt)
+            gov.record_pilot_outcome(r, "SUCCESS", batch_id=f"batch_day{day}", now_dt=dt)
+
+        d3 = datetime(2026, 11, 15, 6, 0, 0, tzinfo=timezone.utc)
+        r3, day_num, _ = gov.check_and_plan_pilot_batch(now_dt=d3)
+        self.assertEqual(day_num, 3)
+
+        # Day 3 fails
+        gov.record_pilot_outcome(r3, "FAILED", batch_id="batch_day3_fail", error_reason="upstream timeout", now_dt=d3)
+
+        # Sentinel must be written immediately upon concluding the final authorized calendar date
+        self.assertTrue(self.sentinel_file.exists())
+        sentinel_data = json.loads(self.sentinel_file.read_text(encoding="utf-8"))
+        self.assertEqual(sentinel_data["completed_batches"], 2)
+        self.assertEqual(sentinel_data["failed_attempts"], 1)
+        self.assertEqual(sentinel_data["missed_days"], 0)
+
+        # Immediate retry on Day 3 is prohibited
+        d3_retry = datetime(2026, 11, 15, 7, 0, 0, tzinfo=timezone.utc)
+        with self.assertRaises(ScopeDenied) as ctx:
+            gov.check_and_plan_pilot_batch(now_dt=d3_retry)
+        self.assertIn("sentinel file 'pilot_completed.sentinel' present", str(ctx.exception))
+
+        # Day 4 attempt is also blocked by sentinel
+        d4 = datetime(2026, 11, 16, 6, 0, 0, tzinfo=timezone.utc)
+        with self.assertRaises(ScopeDenied) as ctx:
+            gov.check_and_plan_pilot_batch(now_dt=d4)
+        self.assertIn("sentinel file 'pilot_completed.sentinel' present", str(ctx.exception))
+
+    def test_16_interrupted_final_day_creates_sentinel_on_subsequent_invocation(self):
+        """If Day 3 crashes in PLANNED state, Day 4 marks it FAILED, writes sentinel, and denies run."""
+        gov = PilotGovernor(self.quota_db, sentinel_path=self.sentinel_file, pilot_start_date=self.start_date)
+        for day, date_str in [(1, "2026-11-13"), (2, "2026-11-14")]:
+            dt = datetime.fromisoformat(f"{date_str}T06:00:00+00:00")
+            r, _, _ = gov.check_and_plan_pilot_batch(now_dt=dt)
+            gov.record_pilot_outcome(r, "SUCCESS", batch_id=f"batch_day{day}", now_dt=dt)
+
+        # Day 3 reserves batch but process crashes before record_pilot_outcome
+        d3 = datetime(2026, 11, 15, 6, 0, 0, tzinfo=timezone.utc)
+        r3, day_num, _ = gov.check_and_plan_pilot_batch(now_dt=d3)
+        self.assertEqual(day_num, 3)
+
+        # Day 4 invocation occurs: governor reconciles expired window, marks crash FAILED, writes sentinel
+        d4 = datetime(2026, 11, 16, 6, 0, 0, tzinfo=timezone.utc)
+        with self.assertRaises(ScopeDenied) as ctx:
+            gov.check_and_plan_pilot_batch(now_dt=d4)
+        self.assertIn("expired", str(ctx.exception).lower())
+
+        self.assertTrue(self.sentinel_file.exists())
+        summary = gov.get_pilot_summary(d4)
+        self.assertEqual(summary["completed_batches"], 2)
+        # Crash before completion is classified as a failed attempt upon reconciliation
+        self.assertEqual(summary["failed_attempts"], 1)
+
+    def test_17_missed_final_day_creates_sentinel_on_subsequent_invocation(self):
+        """If Day 3 is completely missed (host offline), Day 4 writes sentinel and marks Day 3 missed."""
+        gov = PilotGovernor(self.quota_db, sentinel_path=self.sentinel_file, pilot_start_date=self.start_date)
+        for day, date_str in [(1, "2026-11-13"), (2, "2026-11-14")]:
+            dt = datetime.fromisoformat(f"{date_str}T06:00:00+00:00")
+            r, _, _ = gov.check_and_plan_pilot_batch(now_dt=dt)
+            gov.record_pilot_outcome(r, "SUCCESS", batch_id=f"batch_day{day}", now_dt=dt)
+
+        # Day 3 never triggered (collector was turned off)
+        # Day 4 triggers:
+        d4 = datetime(2026, 11, 16, 6, 0, 0, tzinfo=timezone.utc)
+        with self.assertRaises(ScopeDenied) as ctx:
+            gov.check_and_plan_pilot_batch(now_dt=d4)
+        self.assertIn("expired", str(ctx.exception).lower())
+
+        self.assertTrue(self.sentinel_file.exists())
+        summary = gov.get_pilot_summary(d4)
+        self.assertEqual(summary["completed_batches"], 2)
+        self.assertEqual(summary["missed_days"], 1)
+
+    def test_18_idempotent_sentinel_enforcement(self):
+        """Presence of sentinel file halts all operations without database mutation."""
+        gov = PilotGovernor(self.quota_db, sentinel_path=self.sentinel_file, pilot_start_date=self.start_date)
+        self.sentinel_file.write_text('{"status": "72_HOUR_PILOT_COMPLETED"}', encoding="utf-8")
+
+        self.assertTrue(gov.is_pilot_completed())
+
+        d1 = datetime(2026, 11, 13, 6, 0, 0, tzinfo=timezone.utc)
+        with self.assertRaises(ScopeDenied) as ctx:
+            gov.check_and_plan_pilot_batch(now_dt=d1)
+        self.assertIn("sentinel file 'pilot_completed.sentinel' present", str(ctx.exception))
+
+        # Verify no records were inserted into database
+        summary = gov.get_pilot_summary(d1)
+        self.assertEqual(len(summary["runs"]), 0)
 
 
 if __name__ == "__main__":

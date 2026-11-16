@@ -5,9 +5,15 @@ import unittest
 from unittest.mock import MagicMock
 
 from anie.preflight_hardening import (
-    check_imds_blocked,
+    DEFAULT_IMDS_IP,
+    FirewallInspectionStatus,
+    FirewallResult,
+    NetworkProbeStatus,
+    ProbeResult,
     check_egress_filter,
     check_firewall_rule,
+    check_imds_blocked,
+    check_systemd_network_policy,
     run_security_preflight,
 )
 
@@ -117,6 +123,146 @@ class TestPreflightHardeningFailureInjection(unittest.TestCase):
         verified, msg = check_firewall_rule(iptables_path="/nonexistent/iptables")
         self.assertIsNone(verified)
         self.assertIn("not found", msg)
+
+    def test_egress_demonstrably_allowed_fails_preflight(self):
+        """If outbound connection to unauthorized IP succeeds, preflight fails closed."""
+        def mock_connect(addr):
+            ip, port = addr
+            if ip == DEFAULT_IMDS_IP:
+                raise ConnectionRefusedError(111, "Connection refused")
+            return None  # Egress allowed
+
+        mock_sock = MagicMock()
+        mock_sock.connect.side_effect = mock_connect
+
+        report = run_security_preflight(socket_factory=lambda *a, **kw: mock_sock)
+        self.assertFalse(report.passed)
+        self.assertTrue(report.imds_blocked)
+        self.assertEqual(report.egress_status, NetworkProbeStatus.ALLOWED.value)
+        self.assertIn("Unauthorized outbound egress is demonstrably permitted", report.failure_reason)
+
+    def test_firewall_inaccessible_nft_classified_correctly(self):
+        """Address family error inside systemd sandbox is classified as INACCESSIBLE, not MISSING."""
+        mock_runner = MagicMock()
+        mock_runner.return_value.returncode = 1
+        mock_runner.return_value.stderr = "iptables: Failed to initialize nft: Address family not supported by protocol"
+
+        res = check_firewall_rule(iptables_path="/bin/true", runner=mock_runner)
+        self.assertIsNone(res.verified)
+        self.assertEqual(res.status, FirewallInspectionStatus.INACCESSIBLE)
+        self.assertIn("inaccessible inside unprivileged service sandbox", res.message)
+
+    def test_firewall_inaccessible_fails_when_rule_required(self):
+        """When require_firewall_rule=True, an inaccessible netfilter inspection fails preflight closed."""
+        mock_runner = MagicMock()
+        mock_runner.return_value.returncode = 1
+        mock_runner.return_value.stderr = "iptables: Failed to initialize nft: Address family not supported by protocol"
+
+        mock_sock = MagicMock()
+        mock_sock.connect.side_effect = ConnectionRefusedError(111, "Connection refused")
+
+        report = run_security_preflight(
+            require_firewall_rule=True,
+            socket_factory=lambda *a, **kw: mock_sock,
+            runner=mock_runner,
+        )
+        self.assertFalse(report.passed)
+        self.assertEqual(report.firewall_status, FirewallInspectionStatus.INACCESSIBLE.value)
+        self.assertIn("netfilter inspection inaccessible", report.failure_reason)
+
+    def test_firewall_inaccessible_passes_when_rule_advisory(self):
+        """When require_firewall_rule=False, inaccessible inspection does not abort if probes are blocked."""
+        mock_runner = MagicMock()
+        mock_runner.return_value.returncode = 1
+        mock_runner.return_value.stderr = "iptables: Failed to initialize nft: Address family not supported by protocol"
+
+        mock_sock = MagicMock()
+        mock_sock.connect.side_effect = ConnectionRefusedError(111, "Connection refused")
+
+        report = run_security_preflight(
+            require_firewall_rule=False,
+            socket_factory=lambda *a, **kw: mock_sock,
+            runner=mock_runner,
+        )
+        self.assertTrue(report.passed)
+        self.assertEqual(report.firewall_status, FirewallInspectionStatus.INACCESSIBLE.value)
+        self.assertIsNone(report.firewall_rule_verified)
+
+    def test_systemd_network_policy_inspection(self):
+        """check_systemd_network_policy inspects systemctl output correctly."""
+        # Active IPAddressDeny=any
+        mock_runner = MagicMock()
+        mock_runner.return_value.returncode = 0
+        mock_runner.return_value.stdout = "IPAddressDeny=any\nIPAddressAllow=none\n"
+        verified, msg = check_systemd_network_policy(runner=mock_runner)
+        self.assertTrue(verified)
+        self.assertIn("IPAddressDeny active", msg)
+
+        # Inactive / empty IPAddressDeny
+        mock_runner.return_value.stdout = "IPAddressDeny=\nIPAddressAllow=\n"
+        verified, msg = check_systemd_network_policy(runner=mock_runner)
+        self.assertFalse(verified)
+        self.assertIn("does not enforce IPAddressDeny", msg)
+
+        # systemctl command failure
+        mock_runner.return_value.returncode = 1
+        mock_runner.return_value.stderr = "Failed to get properties: Unit not found."
+        verified, msg = check_systemd_network_policy(runner=mock_runner)
+        self.assertIsNone(verified)
+        self.assertIn("systemctl show failed", msg)
+
+    def test_unverifiable_egress_satisfied_by_systemd_policy(self):
+        """When egress probe times out, verified systemd policy satisfies preflight."""
+        mock_sock = MagicMock()
+        mock_sock.connect.side_effect = socket.timeout("timed out")
+
+        mock_runner = MagicMock()
+        mock_runner.return_value.returncode = 0
+        mock_runner.return_value.stdout = "IPAddressDeny=any\nIPAddressAllow=none\n"
+
+        report = run_security_preflight(
+            socket_factory=lambda *a, **kw: mock_sock,
+            runner=mock_runner,
+        )
+        self.assertTrue(report.passed)
+        self.assertTrue(report.egress_filter_active)
+        self.assertTrue(report.systemd_policy_verified)
+        self.assertEqual(report.egress_status, NetworkProbeStatus.UNVERIFIABLE.value)
+
+    def test_unverifiable_egress_fails_without_systemd_policy(self):
+        """When egress probe times out and systemd policy cannot be verified, preflight fails closed."""
+        mock_sock = MagicMock()
+        mock_sock.connect.side_effect = socket.timeout("timed out")
+
+        mock_runner = MagicMock()
+        mock_runner.return_value.returncode = 1
+        mock_runner.return_value.stderr = "Unit not found"
+
+        report = run_security_preflight(
+            socket_factory=lambda *a, **kw: mock_sock,
+            runner=mock_runner,
+        )
+        self.assertFalse(report.passed)
+        self.assertFalse(report.egress_filter_active)
+        self.assertIn("Egress isolation is UNVERIFIABLE", report.failure_reason)
+
+    def test_probe_result_and_firewall_result_backward_compatibility(self):
+        """ProbeResult and FirewallResult behave as standard 2-tuples while exposing rich status."""
+        probe = ProbeResult(True, "kernel denied", NetworkProbeStatus.BLOCKED)
+        self.assertIsInstance(probe, tuple)
+        self.assertEqual(len(probe), 2)
+        is_blocked, msg = probe
+        self.assertTrue(is_blocked)
+        self.assertEqual(msg, "kernel denied")
+        self.assertEqual(probe.status, NetworkProbeStatus.BLOCKED)
+
+        fw = FirewallResult(None, "inaccessible sandbox", FirewallInspectionStatus.INACCESSIBLE)
+        self.assertIsInstance(fw, tuple)
+        self.assertEqual(len(fw), 2)
+        verified, fw_msg = fw
+        self.assertIsNone(verified)
+        self.assertEqual(fw_msg, "inaccessible sandbox")
+        self.assertEqual(fw.status, FirewallInspectionStatus.INACCESSIBLE)
 
 
 if __name__ == "__main__":

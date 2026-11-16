@@ -293,6 +293,7 @@ class PilotGovernor:
 
         with self._connect() as conn:
             cur = conn.cursor()
+            committed = False
             cur.execute("BEGIN IMMEDIATE")
             try:
                 # 1. Check for critical block state
@@ -322,7 +323,41 @@ class PilotGovernor:
                         "Collection is prohibited before the approved start date."
                     )
                 if today > end_d:
-                    # Authorization expired: write completion sentinel
+                    # Authorization expired: reconcile any remaining uncompleted days/crashes before sealing sentinel
+                    stale_planned = cur.execute(
+                        "SELECT run_id, execution_date_utc, started_at FROM pilot_schedule_state WHERE status = 'PLANNED'"
+                    ).fetchall()
+                    for s_id, s_date, s_started in stale_planned:
+                        cur.execute(
+                            """
+                            UPDATE pilot_schedule_state 
+                            SET status = 'FAILED', completed_at = ?, error_reason = ? 
+                            WHERE run_id = ?
+                            """,
+                            (now_iso, f"interrupted: process crashed or terminated before completion (started {s_started})", s_id),
+                        )
+
+                    for offset in range(self.max_runs):
+                        w_date = (start_d + timedelta(days=offset)).strftime("%Y-%m-%d")
+                        w_run = cur.execute(
+                            "SELECT run_id FROM pilot_schedule_state WHERE execution_date_utc = ?",
+                            (w_date,),
+                        ).fetchone()
+                        if not w_run:
+                            w_day_num = offset + 1
+                            w_plan = json.dumps(PILOT_DAY_QUERIES.get(w_day_num, []))
+                            cur.execute(
+                                """
+                                INSERT INTO pilot_schedule_state (
+                                    day_number, authorized_max_runs, status, execution_date_utc,
+                                    started_at, completed_at, query_plan, error_reason
+                                ) VALUES (?, ?, 'MISSED', ?, ?, ?, ?, 'no execution attempt recorded on scheduled date')
+                                """,
+                                (w_day_num, self.max_runs, w_date, now_iso, now_iso, w_plan),
+                            )
+
+                    cur.execute("COMMIT")
+                    committed = True
                     self.write_completion_sentinel(now_iso)
                     raise ScopeDenied(
                         f"72-hour pilot authorization window expired on {end_str} "
@@ -423,9 +458,14 @@ class PilotGovernor:
                 )
                 run_id = cur.lastrowid
                 cur.execute("COMMIT")
+                committed = True
                 return run_id, day_number, query_plan
             except Exception:
-                cur.execute("ROLLBACK")
+                if not committed:
+                    try:
+                        cur.execute("ROLLBACK")
+                    except Exception:
+                        pass
                 raise
 
     def record_pilot_outcome(
