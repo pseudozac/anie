@@ -60,6 +60,9 @@ def get_process_rss() -> dict[str, int]:
         except Exception:
             current_rss = peak_rss
 
+    if peak_rss < current_rss:
+        peak_rss = current_rss
+
     return {
         "current_rss_bytes": current_rss,
         "peak_rss_bytes": peak_rss,
