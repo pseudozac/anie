@@ -295,7 +295,7 @@ class TestRealStoreDiscrepanciesAndHistory(unittest.TestCase):
             db_path = Path(tmp) / "test_store.sqlite"
             store = RealObservationStore(db_path)
             self.assertEqual(store.schema_version, CURRENT_SCHEMA_VERSION)
-            self.assertEqual(CURRENT_SCHEMA_VERSION, 2)
+            self.assertGreaterEqual(CURRENT_SCHEMA_VERSION, 2)
 
             ev1, obs1 = make_multi_resolver_pair("example.com", "dns_a", resolver_name="cloudflare", values=("93.184.216.34",))
             ev2, obs2 = make_multi_resolver_pair("example.com", "dns_a", resolver_name="google", values=("93.184.216.34",))

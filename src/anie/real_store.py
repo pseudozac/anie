@@ -72,8 +72,9 @@ from .real_models import (
     RealObservation,
 )
 from .discrepancy_models import RealDiscrepancyReport, DISCREPANCY_REPORT_SCHEMA
+from .graph_models import GraphEdge, GraphNode, IntelligenceClaim
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 
 class RealObservationStore:
@@ -193,6 +194,65 @@ class RealObservationStore:
             ON real_discrepancies(verdict)
         """)
 
+        # 4. Graph-Native Intelligence Tables (Milestone M3.3.1)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS graph_nodes (
+                node_id TEXT PRIMARY KEY,
+                node_type TEXT NOT NULL,
+                canonical_name TEXT NOT NULL,
+                layer TEXT NOT NULL,
+                first_observed_at TEXT NOT NULL,
+                last_observed_at TEXT NOT NULL,
+                properties_json TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_graph_nodes_type ON graph_nodes(node_type)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_graph_nodes_layer ON graph_nodes(layer)")
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS graph_edges (
+                edge_id TEXT PRIMARY KEY,
+                source_id TEXT NOT NULL REFERENCES graph_nodes(node_id) ON DELETE CASCADE,
+                target_id TEXT NOT NULL REFERENCES graph_nodes(node_id) ON DELETE CASCADE,
+                relation_type TEXT NOT NULL,
+                layer TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                valid_from TEXT NOT NULL,
+                valid_until TEXT,
+                confidence REAL NOT NULL,
+                ruleset_version TEXT NOT NULL,
+                evidence_hashes_json TEXT NOT NULL,
+                properties_json TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_graph_edges_source ON graph_edges(source_id, relation_type)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_graph_edges_target ON graph_edges(target_id, relation_type)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_graph_edges_time ON graph_edges(observed_at)")
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS intelligence_claims (
+                claim_id TEXT PRIMARY KEY,
+                subject_uri TEXT NOT NULL REFERENCES graph_nodes(node_id) ON DELETE CASCADE,
+                claim_type TEXT NOT NULL,
+                layer TEXT NOT NULL,
+                asserted_at TEXT NOT NULL,
+                valid_from TEXT NOT NULL,
+                valid_until TEXT,
+                ruleset_version TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                explanation TEXT NOT NULL,
+                supporting_evidence_hashes_json TEXT NOT NULL,
+                supporting_node_ids_json TEXT NOT NULL,
+                analyst_identity TEXT,
+                attestation_signature TEXT,
+                payload TEXT NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_claims_subject ON intelligence_claims(subject_uri)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_claims_time ON intelligence_claims(asserted_at)")
+
     def _migrate(self, conn: sqlite3.Connection, from_version: int, to_version: int) -> None:
         """Incremental database schema migration framework."""
         if from_version < 2:
@@ -217,6 +277,64 @@ class RealObservationStore:
                 CREATE INDEX IF NOT EXISTS idx_real_discrepancies_verdict 
                 ON real_discrepancies(verdict)
             """)
+        if from_version < 3:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS graph_nodes (
+                    node_id TEXT PRIMARY KEY,
+                    node_type TEXT NOT NULL,
+                    canonical_name TEXT NOT NULL,
+                    layer TEXT NOT NULL,
+                    first_observed_at TEXT NOT NULL,
+                    last_observed_at TEXT NOT NULL,
+                    properties_json TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_graph_nodes_type ON graph_nodes(node_type)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_graph_nodes_layer ON graph_nodes(layer)")
+
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS graph_edges (
+                    edge_id TEXT PRIMARY KEY,
+                    source_id TEXT NOT NULL REFERENCES graph_nodes(node_id) ON DELETE CASCADE,
+                    target_id TEXT NOT NULL REFERENCES graph_nodes(node_id) ON DELETE CASCADE,
+                    relation_type TEXT NOT NULL,
+                    layer TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    valid_from TEXT NOT NULL,
+                    valid_until TEXT,
+                    confidence REAL NOT NULL,
+                    ruleset_version TEXT NOT NULL,
+                    evidence_hashes_json TEXT NOT NULL,
+                    properties_json TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_graph_edges_source ON graph_edges(source_id, relation_type)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_graph_edges_target ON graph_edges(target_id, relation_type)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_graph_edges_time ON graph_edges(observed_at)")
+
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS intelligence_claims (
+                    claim_id TEXT PRIMARY KEY,
+                    subject_uri TEXT NOT NULL REFERENCES graph_nodes(node_id) ON DELETE CASCADE,
+                    claim_type TEXT NOT NULL,
+                    layer TEXT NOT NULL,
+                    asserted_at TEXT NOT NULL,
+                    valid_from TEXT NOT NULL,
+                    valid_until TEXT,
+                    ruleset_version TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    explanation TEXT NOT NULL,
+                    supporting_evidence_hashes_json TEXT NOT NULL,
+                    supporting_node_ids_json TEXT NOT NULL,
+                    analyst_identity TEXT,
+                    attestation_signature TEXT,
+                    payload TEXT NOT NULL
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_claims_subject ON intelligence_claims(subject_uri)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_claims_time ON intelligence_claims(asserted_at)")
         conn.execute(f"PRAGMA user_version = {to_version}")
 
     def insert_record(self, event: RealCollectionEvent, observation: RealObservation) -> bool:
@@ -849,3 +967,128 @@ class RealObservationStore:
                 "timeline": timeline,
                 "discrepancies": discrepancy_history,
             }
+
+    # --- Graph-Native Intelligence Integration (M3.3.1) ---
+
+    def sync_observation_to_graph(
+        self,
+        event: RealCollectionEvent,
+        observation: RealObservation,
+    ) -> tuple[int, int]:
+        """Extract graph nodes and edges from observation/event and persist to graph tables.
+        
+        Returns (nodes_upserted_count, edges_inserted_count).
+        """
+        from .graph_engine import GraphEngine
+        with self._connect() as conn:
+            engine = GraphEngine(conn)
+            nodes, edges = engine.extract_from_observation(event, observation)
+            for node in nodes:
+                engine.upsert_node(node)
+            inserted_edges = 0
+            for edge in edges:
+                if engine.insert_edge(edge):
+                    inserted_edges += 1
+            return len(nodes), inserted_edges
+
+    def sync_discrepancy_to_graph(
+        self,
+        report: RealDiscrepancyReport,
+    ) -> tuple[int, int]:
+        """Extract graph node and edges from discrepancy report and persist to graph tables.
+        
+        Returns (nodes_upserted_count, edges_inserted_count).
+        """
+        from .graph_engine import GraphEngine
+        with self._connect() as conn:
+            engine = GraphEngine(conn)
+            node, edges = engine.extract_from_discrepancy(report)
+            engine.upsert_node(node)
+            inserted_edges = 0
+            for edge in edges:
+                # Ensure target nodes exist
+                engine.insert_edge(edge)
+                inserted_edges += 1
+            return 1, inserted_edges
+
+    def insert_claim(self, claim: IntelligenceClaim) -> bool:
+        """Insert an attributable intelligence claim into intelligence_claims table."""
+        with self._connect() as conn:
+            # Ensure subject node exists or is created
+            node_row = conn.execute("SELECT node_id FROM graph_nodes WHERE node_id = ?", (claim.subject_uri,)).fetchone()
+            if node_row is None:
+                conn.execute(
+                    """
+                    INSERT INTO graph_nodes (
+                        node_id, node_type, canonical_name, layer,
+                        first_observed_at, last_observed_at, properties_json, payload
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        claim.subject_uri,
+                        "domain" if ":domain:" in claim.subject_uri else "claim",
+                        claim.subject_uri.split(":")[-1],
+                        claim.layer,
+                        claim.asserted_at,
+                        claim.asserted_at,
+                        "{}",
+                        "{}",
+                    ),
+                )
+
+            cur = conn.execute(
+                """
+                INSERT OR IGNORE INTO intelligence_claims (
+                    claim_id, subject_uri, claim_type, layer,
+                    asserted_at, valid_from, valid_until, ruleset_version,
+                    confidence, explanation, supporting_evidence_hashes_json,
+                    supporting_node_ids_json, analyst_identity, attestation_signature,
+                    payload
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    claim.claim_id,
+                    claim.subject_uri,
+                    claim.claim_type,
+                    claim.layer,
+                    claim.asserted_at,
+                    claim.valid_from,
+                    claim.valid_until,
+                    claim.ruleset_version,
+                    claim.confidence,
+                    claim.explanation,
+                    json.dumps(list(claim.supporting_evidence_hashes)),
+                    json.dumps(list(claim.supporting_node_ids)),
+                    claim.analyst_identity,
+                    claim.attestation_signature,
+                    canonical_json(claim.to_dict()),
+                ),
+            )
+            return cur.rowcount > 0
+
+    def get_claim(self, claim_id: str) -> IntelligenceClaim | None:
+        """Fetch intelligence claim by claim_id."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT payload FROM intelligence_claims WHERE claim_id = ?",
+                (claim_id,),
+            ).fetchone()
+            return IntelligenceClaim.from_dict(json.loads(row[0])) if row else None
+
+    def claims_for_subject(self, subject_uri: str) -> list[IntelligenceClaim]:
+        """Fetch all claims for a given subject URI."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT payload FROM intelligence_claims WHERE subject_uri = ? ORDER BY asserted_at ASC",
+                (subject_uri,),
+            ).fetchall()
+            return [IntelligenceClaim.from_dict(json.loads(r[0])) for r in rows]
+
+    def all_claims(self, limit: int = 1000) -> list[IntelligenceClaim]:
+        """Fetch all intelligence claims up to limit."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT payload FROM intelligence_claims ORDER BY asserted_at ASC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            return [IntelligenceClaim.from_dict(json.loads(r[0])) for r in rows]
