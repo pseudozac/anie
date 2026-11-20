@@ -183,3 +183,40 @@ class RealDiscrepancyReport:
             raise ValueError(f"analysis_id integrity mismatch: expected {report.analysis_id}, got {raw['analysis_id']}")
 
         return report
+
+    @classmethod
+    def create(
+        cls,
+        subject: str,
+        kind: str,
+        analyzed_at: str,
+        verdict: str,
+        category: str,
+        explanation: str,
+        confidence: float,
+        participating_resolvers: list[str] | tuple[str, ...],
+        answers_by_resolver: dict[str, list[str]],
+        dnssec_by_resolver: dict[str, str],
+        evidence_hashes: dict[str, str],
+        evidence_ids: dict[str, str],
+        observation_ids: dict[str, str],
+        filtering_metadata: dict[str, Any] | None = None,
+        ruleset_version: str = RULESET_VERSION_V1,
+    ) -> "RealDiscrepancyReport":
+        return cls(
+            subject=subject,
+            kind=kind,
+            analyzed_at=utc_iso(analyzed_at),
+            verdict=verdict,
+            category=category,
+            explanation=explanation,
+            confidence=float(confidence),
+            participating_resolvers=tuple(sorted(participating_resolvers)),
+            answers_by_resolver={k: list(v) for k, v in answers_by_resolver.items()},
+            dnssec_by_resolver=dict(dnssec_by_resolver),
+            filtering_metadata=dict(filtering_metadata or {}),
+            observation_ids=dict(observation_ids),
+            evidence_ids=dict(evidence_ids),
+            evidence_hashes=dict(evidence_hashes),
+            ruleset_version=ruleset_version,
+        )

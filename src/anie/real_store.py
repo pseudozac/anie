@@ -78,6 +78,55 @@ from .graph_models import GraphEdge, GraphNode, IntelligenceClaim
 CURRENT_SCHEMA_VERSION = 3
 
 
+def sync_node_to_fts(
+    conn: sqlite3.Connection,
+    node_id: str,
+    node_type: str,
+    canonical_name: str,
+    layer: str,
+    properties: dict[str, Any],
+) -> None:
+    """Synchronize a graph node entity to the SQLite FTS5 search index."""
+    try:
+        body = f"{node_type} {json.dumps(properties)}"
+        tags = f"anie/{node_type} anie/layer/{layer.lower()}"
+        conn.execute("DELETE FROM intelligence_fts WHERE entity_id = ?", (node_id,))
+        conn.execute(
+            "INSERT INTO intelligence_fts (entity_id, entity_type, title, body, tags) VALUES (?, ?, ?, ?, ?)",
+            (node_id, "node", canonical_name, body, tags),
+        )
+    except Exception:
+        pass
+
+
+def sync_claim_to_fts(conn: sqlite3.Connection, claim: IntelligenceClaim) -> None:
+    """Synchronize an intelligence claim to the SQLite FTS5 search index."""
+    try:
+        body = f"{claim.explanation} {claim.falsifiability_condition} {json.dumps(claim.properties)}"
+        tags = f"claim {claim.claim_type} {claim.verification_state}"
+        conn.execute("DELETE FROM intelligence_fts WHERE entity_id = ?", (claim.claim_id,))
+        conn.execute(
+            "INSERT INTO intelligence_fts (entity_id, entity_type, title, body, tags) VALUES (?, ?, ?, ?, ?)",
+            (claim.claim_id, "claim", f"{claim.claim_type}: {claim.subject_uri}", body, tags),
+        )
+    except Exception:
+        pass
+
+
+def sync_discrepancy_to_fts(conn: sqlite3.Connection, report: RealDiscrepancyReport) -> None:
+    """Synchronize a discrepancy report to the SQLite FTS5 search index."""
+    try:
+        body = f"{report.explanation} category={report.category} resolvers={','.join(report.participating_resolvers)}"
+        tags = f"discrepancy {report.verdict} {report.category}"
+        conn.execute("DELETE FROM intelligence_fts WHERE entity_id = ?", (report.analysis_id,))
+        conn.execute(
+            "INSERT INTO intelligence_fts (entity_id, entity_type, title, body, tags) VALUES (?, ?, ?, ?, ?)",
+            (report.analysis_id, "discrepancy", f"Discrepancy: {report.subject} ({report.kind})", body, tags),
+        )
+    except Exception:
+        pass
+
+
 class RealObservationStore:
     """ACID-compliant SQLite store for genuine first-party observations and evidence."""
 
@@ -231,6 +280,8 @@ class RealObservationStore:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_graph_edges_source ON graph_edges(source_id, relation_type)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_graph_edges_target ON graph_edges(target_id, relation_type)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_graph_edges_time ON graph_edges(observed_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_graph_edges_source_target ON graph_edges(source_id, target_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_graph_edges_target_source ON graph_edges(target_id, source_id)")
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS intelligence_claims (
@@ -269,6 +320,18 @@ class RealObservationStore:
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_consumer_releases_pub ON consumer_releases(publisher, release_sequence)")
+
+        # 6. Local Searchable Knowledge FTS5 (Milestone M3.4)
+        conn.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS intelligence_fts USING fts5(
+                entity_id UNINDEXED,
+                entity_type,
+                title,
+                body,
+                tags,
+                tokenize='unicode61 remove_diacritics 2'
+            )
+        """)
 
     def _migrate(self, conn: sqlite3.Connection, from_version: int, to_version: int) -> None:
         """Incremental database schema migration framework."""
@@ -367,6 +430,19 @@ class RealObservationStore:
                 )
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_consumer_releases_pub ON consumer_releases(publisher, release_sequence)")
+
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_graph_edges_source_target ON graph_edges(source_id, target_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_graph_edges_target_source ON graph_edges(target_id, source_id)")
+            conn.execute("""
+                CREATE VIRTUAL TABLE IF NOT EXISTS intelligence_fts USING fts5(
+                    entity_id UNINDEXED,
+                    entity_type,
+                    title,
+                    body,
+                    tags,
+                    tokenize='unicode61 remove_diacritics 2'
+                )
+            """)
         conn.execute(f"PRAGMA user_version = {to_version}")
 
     def insert_record(
@@ -483,6 +559,7 @@ class RealObservationStore:
                 nodes, edges = engine.extract_from_observation(event, observation)
                 for node in nodes:
                     engine.upsert_node(node)
+                    sync_node_to_fts(conn, node.node_id, node.node_type, node.canonical_name, node.layer, node.properties)
                 for edge in edges:
                     engine.insert_edge(edge)
 
@@ -632,6 +709,7 @@ class RealObservationStore:
                     nodes, edges = engine.extract_from_observation(ev, obs)
                     for node in nodes:
                         engine.upsert_node(node)
+                        sync_node_to_fts(conn, node.node_id, node.node_type, node.canonical_name, node.layer, node.properties)
                     for edge in edges:
                         engine.insert_edge(edge)
 
@@ -898,8 +976,10 @@ class RealObservationStore:
                 engine = GraphEngine(conn)
                 node, edges = engine.extract_from_discrepancy(report)
                 engine.upsert_node(node)
+                sync_node_to_fts(conn, node.node_id, node.node_type, node.canonical_name, node.layer, node.properties)
                 for edge in edges:
                     engine.insert_edge(edge)
+            sync_discrepancy_to_fts(conn, report)
             return True
 
     def get_discrepancy(self, analysis_id: str) -> RealDiscrepancyReport | None:
@@ -1145,6 +1225,8 @@ class RealObservationStore:
                     canonical_json(claim.to_dict()),
                 ),
             )
+            if cur.rowcount > 0:
+                sync_claim_to_fts(conn, claim)
             return cur.rowcount > 0
 
     def get_claim(self, claim_id: str) -> IntelligenceClaim | None:
@@ -1175,15 +1257,16 @@ class RealObservationStore:
             return [IntelligenceClaim.from_dict(json.loads(r[0])) for r in rows]
 
     def rebuild_graph_from_observations(self) -> tuple[int, int]:
-        """Truncate and transactionally rebuild graph tables from authoritative observations and discrepancies.
+        """Truncate and transactionally rebuild graph tables and search index from authoritative records.
         
-        Guarantees that the graph can be completely regenerated from authoritative Layer 1 and 2 records.
+        Guarantees that the graph and searchable knowledge can be completely regenerated from authoritative records.
         Returns (nodes_count, edges_count).
         """
         from .graph_engine import GraphEngine
         with self._connect() as conn:
             conn.execute("DELETE FROM graph_edges")
             conn.execute("DELETE FROM graph_nodes")
+            conn.execute("DELETE FROM intelligence_fts")
             engine = GraphEngine(conn)
 
             # 1. Rebuild from real observations joined with real events
@@ -1200,6 +1283,7 @@ class RealObservationStore:
                 nodes, edges = engine.extract_from_observation(ev, obs)
                 for node in nodes:
                     engine.upsert_node(node)
+                    sync_node_to_fts(conn, node.node_id, node.node_type, node.canonical_name, node.layer, node.properties)
                 for edge in edges:
                     engine.insert_edge(edge)
 
@@ -1209,26 +1293,97 @@ class RealObservationStore:
                 disc = RealDiscrepancyReport.from_dict(json.loads(disc_json))
                 node, edges = engine.extract_from_discrepancy(disc)
                 engine.upsert_node(node)
+                sync_node_to_fts(conn, node.node_id, node.node_type, node.canonical_name, node.layer, node.properties)
                 for edge in edges:
                     engine.insert_edge(edge)
+                sync_discrepancy_to_fts(conn, disc)
 
-            # 3. Ensure nodes exist for any registered intelligence claims
-            claim_rows = conn.execute("SELECT subject_uri, layer, asserted_at FROM intelligence_claims").fetchall()
-            for s_uri, l_val, ass_at in claim_rows:
-                node_exists = conn.execute("SELECT 1 FROM graph_nodes WHERE node_id = ?", (s_uri,)).fetchone()
+            # 3. Ensure nodes and FTS exist for any registered intelligence claims
+            claim_rows = conn.execute("SELECT payload FROM intelligence_claims").fetchall()
+            for (c_json,) in claim_rows:
+                claim = IntelligenceClaim.from_dict(json.loads(c_json))
+                node_exists = conn.execute("SELECT 1 FROM graph_nodes WHERE node_id = ?", (claim.subject_uri,)).fetchone()
                 if not node_exists:
-                    c_name = s_uri.split(":")[-1]
-                    n_type = "domain" if ":domain:" in s_uri else "claim"
+                    c_name = claim.subject_uri.split(":")[-1]
+                    n_type = "domain" if ":domain:" in claim.subject_uri else "claim"
                     conn.execute("""
                         INSERT INTO graph_nodes (
                             node_id, node_type, canonical_name, layer,
                             first_observed_at, last_observed_at, properties_json, payload
                         ) VALUES (?, ?, ?, ?, ?, ?, '{}', '{}')
-                    """, (s_uri, n_type, c_name, l_val, ass_at, ass_at))
+                    """, (claim.subject_uri, n_type, c_name, claim.layer, claim.asserted_at, claim.asserted_at))
+                sync_claim_to_fts(conn, claim)
 
             nodes_count = conn.execute("SELECT COUNT(*) FROM graph_nodes").fetchone()[0]
             edges_count = conn.execute("SELECT COUNT(*) FROM graph_edges").fetchone()[0]
             return nodes_count, edges_count
+
+    def search_intelligence(
+        self,
+        query: str,
+        entity_type: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Search indexed knowledge graph entities, claims, and discrepancies.
+        
+        Pure in-process execution using SQLite FTS5 with BM25 ranking.
+        """
+        clean_q = query.strip()
+        if not clean_q:
+            return []
+
+        with self._connect() as conn:
+            try:
+                if entity_type:
+                    sql = """
+                    SELECT entity_id, entity_type, title, snippet(intelligence_fts, 3, '[', ']', '...', 15) as excerpt, rank
+                    FROM intelligence_fts
+                    WHERE intelligence_fts MATCH ? AND entity_type = ?
+                    ORDER BY rank
+                    LIMIT ?
+                    """
+                    rows = conn.execute(sql, (clean_q, entity_type, limit)).fetchall()
+                else:
+                    sql = """
+                    SELECT entity_id, entity_type, title, snippet(intelligence_fts, 3, '[', ']', '...', 15) as excerpt, rank
+                    FROM intelligence_fts
+                    WHERE intelligence_fts MATCH ?
+                    ORDER BY rank
+                    LIMIT ?
+                    """
+                    rows = conn.execute(sql, (clean_q, limit)).fetchall()
+            except sqlite3.OperationalError:
+                q_escaped = clean_q.replace('"', '""')
+                escaped = f'"{q_escaped}"'
+                if entity_type:
+                    sql = """
+                    SELECT entity_id, entity_type, title, snippet(intelligence_fts, 3, '[', ']', '...', 15) as excerpt, rank
+                    FROM intelligence_fts
+                    WHERE intelligence_fts MATCH ? AND entity_type = ?
+                    ORDER BY rank
+                    LIMIT ?
+                    """
+                    rows = conn.execute(sql, (escaped, entity_type, limit)).fetchall()
+                else:
+                    sql = """
+                    SELECT entity_id, entity_type, title, snippet(intelligence_fts, 3, '[', ']', '...', 15) as excerpt, rank
+                    FROM intelligence_fts
+                    WHERE intelligence_fts MATCH ?
+                    ORDER BY rank
+                    LIMIT ?
+                    """
+                    rows = conn.execute(sql, (escaped, limit)).fetchall()
+
+            return [
+                {
+                    "entity_id": r[0],
+                    "entity_type": r[1],
+                    "title": r[2],
+                    "excerpt": r[3] or "",
+                    "rank": round(float(r[4]), 4),
+                }
+                for r in rows
+            ]
 
     def ingest_release_bundle(
         self,

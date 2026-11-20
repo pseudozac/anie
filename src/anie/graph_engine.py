@@ -19,6 +19,7 @@ from collections import defaultdict
 from dataclasses import asdict
 from datetime import datetime, timezone
 import json
+from pathlib import Path
 import sqlite3
 from typing import Any
 
@@ -166,6 +167,15 @@ class GraphEngine:
         edges: list[GraphEdge] = []
         all_hashes = list(report.evidence_hashes.values())
 
+        # Ensure domain node exists in graph
+        dom_node = GraphNode.create(
+            node_type=NodeType.DOMAIN,
+            canonical_name=report.subject,
+            layer=EpistemicLayer.FACT,
+            observed_at=analyzed_at,
+        )
+        self.upsert_node(dom_node)
+
         # Edge: Claim SUPPORTS_CLAIM or DISCREPANCY_FOR Domain
         edges.append(GraphEdge.create(
             source_id=disc_node.node_id,
@@ -181,7 +191,15 @@ class GraphEngine:
 
         # Edges to participating resolvers
         for res in report.participating_resolvers:
-            res_uri = format_node_id(NodeType.RESOLVER, res)
+            res_node = GraphNode.create(
+                node_type=NodeType.RESOLVER,
+                canonical_name=res,
+                layer=EpistemicLayer.FACT,
+                observed_at=analyzed_at,
+                properties={"resolver_identity": res},
+            )
+            self.upsert_node(res_node)
+            res_uri = res_node.node_id
             res_hashes = [report.evidence_hashes[res]] if res in report.evidence_hashes else []
             edges.append(GraphEdge.create(
                 source_id=disc_node.node_id,
@@ -339,7 +357,62 @@ class GraphEngine:
         if max_edges <= 0:
             raise ValueError("max_edges must be positive")
 
-        # Recursive CTE traversal with exact comma-delimited path token matching
+        if max_depth == 0:
+            node = self.get_node(start_node_id)
+            if not node:
+                return {"root_id": start_node_id, "depth": 0, "nodes": [], "edges": []}
+            return {
+                "root_id": start_node_id,
+                "depth": 0,
+                "nodes": [node.to_dict()],
+                "edges": [],
+            }
+
+        if max_depth == 1:
+            # High-performance direct index seek for 1-hop neighborhood (sub-millisecond)
+            edge_query = """
+            SELECT payload, source_id, target_id FROM graph_edges
+            WHERE source_id = ?
+            UNION ALL
+            SELECT payload, source_id, target_id FROM graph_edges
+            WHERE target_id = ?
+            LIMIT ?
+            """
+            direct_edge_rows = self.conn.execute(edge_query, (start_node_id, start_node_id, max_edges)).fetchall()
+            visited_set = {start_node_id}
+            edge_list = []
+            for r in direct_edge_rows:
+                visited_set.add(r[1])
+                visited_set.add(r[2])
+                edge_list.append(GraphEdge.from_dict(json.loads(r[0])))
+                if len(visited_set) >= max_nodes:
+                    break
+
+            visited_node_ids = list(visited_set)[:max_nodes]
+            placeholders = ",".join("?" for _ in visited_node_ids)
+            node_query = f"SELECT payload FROM graph_nodes WHERE node_id IN ({placeholders})"
+            if layer_filter:
+                l_placeholders = ",".join("?" for _ in layer_filter)
+                node_query += f" AND layer IN ({l_placeholders})"
+                node_rows = self.conn.execute(node_query, (*visited_node_ids, *layer_filter)).fetchall()
+            else:
+                node_rows = self.conn.execute(node_query, visited_node_ids).fetchall()
+
+            nodes = [GraphNode.from_dict(json.loads(r[0])) for r in node_rows]
+            valid_node_ids = {n.node_id for n in nodes}
+            edges = [
+                e for e in edge_list
+                if e.source_id in valid_node_ids and e.target_id in valid_node_ids
+            ][:max_edges]
+
+            return {
+                "root_id": start_node_id,
+                "depth": 1,
+                "nodes": [n.to_dict() for n in nodes],
+                "edges": [e.to_dict() for e in edges],
+            }
+
+        # Recursive CTE traversal with exact comma-delimited path token matching for depth > 1
         query = """
         WITH RECURSIVE traversal(curr_node_id, depth, path) AS (
             SELECT ?, 0, ',' || ? || ','
@@ -373,7 +446,7 @@ class GraphEngine:
         nodes = [GraphNode.from_dict(json.loads(r[0])) for r in node_rows]
         valid_node_ids = {n.node_id for n in nodes}
 
-        # Fetch connecting edges
+        # Fetch connecting edges using composite index seeks
         edge_query = f"""
         SELECT payload FROM graph_edges
         WHERE source_id IN ({placeholders}) AND target_id IN ({placeholders})
@@ -566,4 +639,205 @@ class GraphEngine:
                 s_h = _escape_wikilink_token(h)
                 lines.append(f"- SHA-256: `{s_h}`")
 
+        # Query intelligence claims
+        claims_rows = self.conn.execute(
+            """
+            SELECT payload
+            FROM intelligence_claims
+            WHERE subject_uri = ?
+            ORDER BY asserted_at DESC
+            """,
+            (domain_uri,),
+        ).fetchall()
+
+        if claims_rows:
+            lines.append("")
+            lines.append("## Epistemic Intelligence Claims")
+            for (c_json,) in claims_rows:
+                claim = IntelligenceClaim.from_dict(json.loads(c_json))
+                s_cid = _escape_wikilink_token(claim.claim_id)
+                s_ctype = _escape_wikilink_token(claim.claim_type)
+                s_vstate = _escape_wikilink_token(claim.verification_state)
+                lines.append(f"### [[{s_cid}|{s_ctype}]] (State: `{s_vstate}`, Confidence: {claim.confidence})")
+                lines.append(f"> {claim.explanation}")
+                if claim.falsifiability_condition:
+                    lines.append(f"> *Falsifiability:* {claim.falsifiability_condition}")
+                lines.append("")
+
         return "\n".join(lines) + "\n"
+
+    def export_obsidian_vault(self, output_dir: str | Path) -> dict[str, Any]:
+        """Export the complete graph, entities, and claims into an Obsidian-compatible vault directory."""
+        v_path = Path(output_dir)
+        domains_dir = v_path / "domains"
+        ips_dir = v_path / "ips"
+        claims_dir = v_path / "claims"
+
+        domains_dir.mkdir(parents=True, exist_ok=True)
+        ips_dir.mkdir(parents=True, exist_ok=True)
+        claims_dir.mkdir(parents=True, exist_ok=True)
+
+        exported_domains = 0
+        exported_ips = 0
+        exported_claims = 0
+
+        # 1. Export domains
+        domain_rows = self.conn.execute(
+            "SELECT canonical_name FROM graph_nodes WHERE node_type = 'domain' ORDER BY canonical_name"
+        ).fetchall()
+        for (dom,) in domain_rows:
+            try:
+                md_content = self.export_obsidian_markdown(dom)
+                safe_name = dom.replace("/", "_").replace("\\", "_")
+                (domains_dir / f"{safe_name}.md").write_text(md_content, encoding="utf-8")
+                exported_domains += 1
+            except Exception:
+                pass
+
+        # 2. Export IPs
+        ip_rows = self.conn.execute(
+            "SELECT canonical_name, node_id, first_observed_at, last_observed_at FROM graph_nodes WHERE node_type = 'ip' ORDER BY canonical_name"
+        ).fetchall()
+        for ip, node_id, first_seen, last_seen in ip_rows:
+            co_hosted = self.find_co_hosted_domains(ip)
+            safe_ip = ip.replace(":", "_")
+            ip_lines = [
+                "---",
+                f'id: "{node_id}"',
+                'type: "ip"',
+                f'canonical_name: "{ip}"',
+                f'first_observed_at: "{first_seen}"',
+                f'last_observed_at: "{last_seen}"',
+                "tags:",
+                '  - "anie/ip"',
+                "---",
+                f"# IP: {ip}",
+                "",
+                "## Co-Hosted Domains",
+            ]
+            if co_hosted:
+                for d in co_hosted:
+                    ip_lines.append(f"- [[{d}]]")
+            else:
+                ip_lines.append("*No co-hosted domains identified.*")
+            ip_lines.append("")
+            (ips_dir / f"{safe_ip}.md").write_text("\n".join(ip_lines) + "\n", encoding="utf-8")
+            exported_ips += 1
+
+        # 3. Export Claims
+        claim_rows = self.conn.execute(
+            "SELECT payload FROM intelligence_claims ORDER BY asserted_at DESC"
+        ).fetchall()
+        for (c_json,) in claim_rows:
+            claim = IntelligenceClaim.from_dict(json.loads(c_json))
+            c_lines = [
+                "---",
+                f'id: "{claim.claim_id}"',
+                'type: "claim"',
+                f'claim_type: "{claim.claim_type}"',
+                f'verification_state: "{claim.verification_state}"',
+                f'confidence: {claim.confidence}',
+                f'asserted_at: "{claim.asserted_at}"',
+                "tags:",
+                '  - "anie/claim"',
+                f'  - "anie/claim/{claim.claim_type.lower()}"',
+                "---",
+                f"# Claim: {claim.claim_type}",
+                f"**Subject:** [[{claim.subject_uri}]]",
+                f"**Verification State:** `{claim.verification_state}`",
+                f"**Confidence:** {claim.confidence}",
+                "",
+                "## Assessment Explanation",
+                f"> {claim.explanation}",
+                "",
+                "## Falsifiability Condition",
+                f"> {claim.falsifiability_condition or 'None specified'}",
+                "",
+            ]
+            (claims_dir / f"{claim.claim_id}.md").write_text("\n".join(c_lines) + "\n", encoding="utf-8")
+            exported_claims += 1
+
+        # 4. Vault Readme Index
+        readme = [
+            "# ANIE Knowledge Graph Vault",
+            "",
+            f"- **Domains Indexed:** {exported_domains}",
+            f"- **IPs Indexed:** {exported_ips}",
+            f"- **Intelligence Claims:** {exported_claims}",
+            "",
+            "## Exploration Roots",
+            "- [[domains/|Domain Infrastructure Notes]]",
+            "- [[ips/|IP Infrastructure Notes]]",
+            "- [[claims/|Temporal Intelligence Claims]]",
+        ]
+        (v_path / "README.md").write_text("\n".join(readme) + "\n", encoding="utf-8")
+
+        return {
+            "vault_dir": str(v_path),
+            "domains_exported": exported_domains,
+            "ips_exported": exported_ips,
+            "claims_exported": exported_claims,
+        }
+
+    def search_intelligence(
+        self,
+        query: str,
+        entity_type: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Search the FTS5 intelligence index using the current connection."""
+        clean_q = query.strip()
+        if not clean_q:
+            return []
+
+        try:
+            if entity_type:
+                sql = """
+                SELECT entity_id, entity_type, title, snippet(intelligence_fts, 3, '[', ']', '...', 15) as excerpt, rank
+                FROM intelligence_fts
+                WHERE intelligence_fts MATCH ? AND entity_type = ?
+                ORDER BY rank
+                LIMIT ?
+                """
+                rows = self.conn.execute(sql, (clean_q, entity_type, limit)).fetchall()
+            else:
+                sql = """
+                SELECT entity_id, entity_type, title, snippet(intelligence_fts, 3, '[', ']', '...', 15) as excerpt, rank
+                FROM intelligence_fts
+                WHERE intelligence_fts MATCH ?
+                ORDER BY rank
+                LIMIT ?
+                """
+                rows = self.conn.execute(sql, (clean_q, limit)).fetchall()
+        except sqlite3.OperationalError:
+            q_escaped = clean_q.replace('"', '""')
+            escaped = f'"{q_escaped}"'
+            if entity_type:
+                sql = """
+                SELECT entity_id, entity_type, title, snippet(intelligence_fts, 3, '[', ']', '...', 15) as excerpt, rank
+                FROM intelligence_fts
+                WHERE intelligence_fts MATCH ? AND entity_type = ?
+                ORDER BY rank
+                LIMIT ?
+                """
+                rows = self.conn.execute(sql, (escaped, entity_type, limit)).fetchall()
+            else:
+                sql = """
+                SELECT entity_id, entity_type, title, snippet(intelligence_fts, 3, '[', ']', '...', 15) as excerpt, rank
+                FROM intelligence_fts
+                WHERE intelligence_fts MATCH ?
+                ORDER BY rank
+                LIMIT ?
+                """
+                rows = self.conn.execute(sql, (escaped, limit)).fetchall()
+
+        return [
+            {
+                "entity_id": r[0],
+                "entity_type": r[1],
+                "title": r[2],
+                "excerpt": r[3] or "",
+                "rank": round(float(r[4]), 4),
+            }
+            for r in rows
+        ]

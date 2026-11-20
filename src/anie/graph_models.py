@@ -332,6 +332,7 @@ class IntelligenceClaim:
     attestation_signature: str | None = None
     verification_state: str = ClaimVerificationState.UNVERIFIED_HYPOTHESIS.value
     falsifiability_condition: str | None = None
+    properties: dict[str, Any] = field(default_factory=dict)
     claim_id: str = field(init=False)
     schema: str = INTELLIGENCE_CLAIM_SCHEMA
 
@@ -385,7 +386,49 @@ class IntelligenceClaim:
             "attestation_signature": self.attestation_signature,
             "verification_state": self.verification_state,
             "falsifiability_condition": self.falsifiability_condition,
+            "properties": self.properties,
         }
+
+    @classmethod
+    def create(
+        cls,
+        subject_uri: str,
+        claim_type: str,
+        layer: EpistemicLayer | str,
+        asserted_at: str,
+        valid_from: str,
+        confidence: float,
+        explanation: str,
+        supporting_evidence_hashes: list[str] | tuple[str, ...],
+        supporting_node_ids: list[str] | tuple[str, ...] | None = None,
+        valid_until: str | None = None,
+        ruleset_version: str = "anie.temporal-intelligence.v1",
+        analyst_identity: str | None = None,
+        attestation_signature: str | None = None,
+        verification_state: ClaimVerificationState | str = ClaimVerificationState.UNVERIFIED_HYPOTHESIS,
+        falsifiability_condition: str | None = None,
+        properties: dict[str, Any] | None = None,
+    ) -> "IntelligenceClaim":
+        l_val = layer.value if isinstance(layer, EpistemicLayer) else str(layer).upper()
+        v_val = verification_state.value if isinstance(verification_state, ClaimVerificationState) else str(verification_state)
+        return cls(
+            subject_uri=subject_uri,
+            claim_type=claim_type,
+            layer=l_val,
+            asserted_at=utc_iso(asserted_at),
+            valid_from=utc_iso(valid_from),
+            ruleset_version=ruleset_version,
+            confidence=float(confidence),
+            explanation=explanation.strip(),
+            supporting_evidence_hashes=tuple(supporting_evidence_hashes),
+            supporting_node_ids=tuple(supporting_node_ids or ()),
+            valid_until=utc_iso(valid_until) if valid_until else None,
+            analyst_identity=analyst_identity,
+            attestation_signature=attestation_signature,
+            verification_state=v_val,
+            falsifiability_condition=falsifiability_condition,
+            properties=dict(properties or {}),
+        )
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "IntelligenceClaim":
@@ -413,5 +456,6 @@ class IntelligenceClaim:
             attestation_signature=data.get("attestation_signature"),
             verification_state=v_state,
             falsifiability_condition=data.get("falsifiability_condition"),
+            properties=data.get("properties", {}),
             schema=data.get("schema", INTELLIGENCE_CLAIM_SCHEMA),
         )
