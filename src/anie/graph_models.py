@@ -18,6 +18,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+import base64
 from hashlib import sha256
 import json
 import re
@@ -307,6 +308,9 @@ class GraphEdge:
         )
 
 
+DOMAIN_SEPARATOR_CLAIM = b"ANIE-INTELLIGENCE-CLAIM-V1\x00"
+
+
 @dataclass(frozen=True)
 class IntelligenceClaim:
     """Attributable, explainable derived hypothesis or analyst-validated assertion.
@@ -343,6 +347,11 @@ class IntelligenceClaim:
             raise ValueError(f"claims must belong to HYPOTHESIS or VALIDATED layer, got {self.layer!r}")
         if self.verification_state not in [s.value for s in ClaimVerificationState]:
             raise ValueError(f"unsupported verification_state: {self.verification_state!r}")
+        if self.verification_state == ClaimVerificationState.ATTESTED_ASSERTION.value:
+            if not self.analyst_identity or not self.analyst_identity.strip():
+                raise ValueError("ATTESTED_ASSERTION requires non-empty analyst_identity")
+            if not self.attestation_signature or not self.attestation_signature.strip():
+                raise ValueError("ATTESTED_ASSERTION requires non-empty attestation_signature")
         utc_iso(self.asserted_at)
         utc_iso(self.valid_from)
         if self.valid_until is not None:
@@ -366,6 +375,42 @@ class IntelligenceClaim:
         }
         digest = sha256(canonical_json(id_material).encode("utf-8")).hexdigest()
         object.__setattr__(self, "claim_id", f"claim_{digest}")
+
+    def canonical_signing_bytes(self) -> bytes:
+        """Deterministic byte representation of the claim for Ed25519 signing."""
+        material = {
+            "schema": self.schema,
+            "claim_id": self.claim_id,
+            "subject_uri": self.subject_uri,
+            "claim_type": self.claim_type,
+            "layer": self.layer,
+            "asserted_at": self.asserted_at,
+            "valid_from": self.valid_from,
+            "valid_until": self.valid_until,
+            "ruleset_version": self.ruleset_version,
+            "explanation": self.explanation,
+            "confidence": self.confidence,
+            "supporting_evidence_hashes": sorted(self.supporting_evidence_hashes),
+            "supporting_node_ids": sorted(self.supporting_node_ids),
+            "analyst_identity": self.analyst_identity,
+            "falsifiability_condition": self.falsifiability_condition,
+        }
+        return DOMAIN_SEPARATOR_CLAIM + canonical_json(material).encode("utf-8")
+
+    def verify_attestation(self, public_key_bytes: bytes) -> bool:
+        """Cryptographically verify the claim's Ed25519 attestation signature."""
+        if not self.attestation_signature or not self.analyst_identity:
+            return False
+        try:
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+            sig_raw = base64.b64decode(self.attestation_signature)
+            if len(sig_raw) != 64:
+                return False
+            pub = Ed25519PublicKey.from_public_bytes(public_key_bytes)
+            pub.verify(sig_raw, self.canonical_signing_bytes())
+            return True
+        except Exception:
+            return False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -411,6 +456,9 @@ class IntelligenceClaim:
     ) -> "IntelligenceClaim":
         l_val = layer.value if isinstance(layer, EpistemicLayer) else str(layer).upper()
         v_val = verification_state.value if isinstance(verification_state, ClaimVerificationState) else str(verification_state)
+        if v_val == ClaimVerificationState.ATTESTED_ASSERTION.value:
+            if not analyst_identity or not attestation_signature:
+                raise ValueError("cannot create ATTESTED_ASSERTION without analyst_identity and attestation_signature")
         return cls(
             subject_uri=subject_uri,
             claim_type=claim_type,
@@ -434,12 +482,10 @@ class IntelligenceClaim:
     def from_dict(cls, data: dict[str, Any]) -> "IntelligenceClaim":
         if not isinstance(data, dict):
             raise ValueError("claim record must be a dict")
-        v_state = data.get(
-            "verification_state",
-            ClaimVerificationState.ATTESTED_ASSERTION.value
-            if data.get("attestation_signature")
-            else ClaimVerificationState.UNVERIFIED_HYPOTHESIS.value,
-        )
+        v_state = data.get("verification_state", ClaimVerificationState.UNVERIFIED_HYPOTHESIS.value)
+        if v_state == ClaimVerificationState.ATTESTED_ASSERTION.value:
+            if not data.get("analyst_identity") or not data.get("attestation_signature"):
+                raise ValueError("serialized claim with ATTESTED_ASSERTION lacks required analyst_identity or attestation_signature")
         return cls(
             subject_uri=data["subject_uri"],
             claim_type=data["claim_type"],

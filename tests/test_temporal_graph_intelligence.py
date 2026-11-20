@@ -164,7 +164,7 @@ class TestTemporalGraphIntelligence(unittest.TestCase):
             self.assertEqual(claim.properties["new_ips"], ["198.51.100.2"])
             self.assertIn(ev1.raw_sha256, claim.supporting_evidence_hashes)
             self.assertIn(ev2.raw_sha256, claim.supporting_evidence_hashes)
-            self.assertEqual(claim.verification_state, ClaimVerificationState.ATTESTED_ASSERTION.value)
+            self.assertEqual(claim.verification_state, ClaimVerificationState.UNVERIFIED_HYPOTHESIS.value)
 
     def test_ip_relationship_evolution_and_classification(self):
         """Verify relationship duration and classification (ephemeral vs persistent)."""

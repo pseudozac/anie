@@ -1,23 +1,25 @@
-"""Temporal Graph Intelligence Subsystem for ANIE (Milestone M3.4).
+"""Temporal Graph Intelligence Subsystem for ANIE (Milestone M3.4 & M3.4.1).
 
 Provides deterministic, explainable analysis of historical DNS infrastructure:
-1. Historical DNS infrastructure transitions (IP set changes across observation epochs).
+1. Historical DNS infrastructure transitions (IP set changes across observation epochs and resolvers).
 2. Domain-to-IP relationship evolution (duration, TTL stability, ephemeral/persistent categorization).
 3. Shared infrastructure correlation (co-hosted domains on shared vs Anycast/CDN edge pools).
 4. Resolver discrepancy timelines (persistent disagreement, security-filtering NXDOMAINs).
-5. Fast-flux candidate indicators (rapid IP churn, low TTL, subnet diversity; non-malicious).
+5. Fast-flux candidate indicators (rapid IP churn, low TTL, subnet diversity within 24h; non-malicious).
 6. Unexpected resolution divergence (sudden Anycast-to-unicast shifts or provider divergence).
 
 Strict Epistemic Guardrails:
 - Every finding retains raw wire evidence hashes, timestamps, ruleset version, and uncertainty.
-- Inferences are classified as UNVERIFIED_HYPOTHESIS with explicit falsifiability conditions.
+- Inferences are strictly classified as UNVERIFIED_HYPOTHESIS with explicit falsifiability conditions.
+- Machine-generated claims are NEVER automatically promoted to ATTESTED_ASSERTION without genuine Ed25519 attestation.
+- Confidence scores are explicit heuristic confidence ratings, not calibrated frequentist/Bayesian probabilities.
 - Strictly prohibits inferring malicious intent from infrastructure churn, co-hosting, or discrepancies alone.
 """
 from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 import ipaddress
 import json
@@ -48,57 +50,91 @@ class TemporalClaimType(str, Enum):
     RESOLUTION_DIVERGENCE_INDICATOR = "RESOLUTION_DIVERGENCE_INDICATOR"
 
 
-# Known public Anycast / CDN network prefixes (CIDR blocks)
-_KNOWN_CDN_NETWORKS = [
-    # Cloudflare
-    ipaddress.ip_network("104.16.0.0/12"),
-    ipaddress.ip_network("104.24.0.0/14"),
-    ipaddress.ip_network("172.64.0.0/13"),
-    ipaddress.ip_network("162.158.0.0/15"),
-    ipaddress.ip_network("198.41.128.0/17"),
-    # Fastly
-    ipaddress.ip_network("151.101.0.0/16"),
-    ipaddress.ip_network("199.232.0.0/16"),
-    # AWS CloudFront / Edge
-    ipaddress.ip_network("13.224.0.0/14"),
-    ipaddress.ip_network("13.225.0.0/16"),
-    ipaddress.ip_network("13.32.0.0/15"),
-    ipaddress.ip_network("52.84.0.0/15"),
-    ipaddress.ip_network("54.230.0.0/16"),
-    # Google Cloud / Public DNS
-    ipaddress.ip_network("8.8.8.0/24"),
-    ipaddress.ip_network("8.8.4.0/24"),
-    ipaddress.ip_network("142.250.0.0/15"),
-    ipaddress.ip_network("172.217.0.0/16"),
-    # Quad9
-    ipaddress.ip_network("9.9.9.0/24"),
-    ipaddress.ip_network("149.112.112.0/24"),
+@dataclass(frozen=True)
+class ProvenanceTaggedNetwork:
+    """Provenance-tracked IP network range for heuristic infrastructure classification."""
+    network: ipaddress.IPv4Network | ipaddress.IPv6Network
+    provider: str
+    classification: str
+    provenance: str
+
+
+# Publicly published CDN / Anycast network ranges with explicit provenance attribution
+_PROVENANCE_TAGGED_NETWORKS: list[ProvenanceTaggedNetwork] = [
+    # Cloudflare published edge ranges
+    ProvenanceTaggedNetwork(ipaddress.ip_network("104.16.0.0/12"), "Cloudflare", "CDN_ANYCAST_HEURISTIC", "Cloudflare published prefix range"),
+    ProvenanceTaggedNetwork(ipaddress.ip_network("104.24.0.0/14"), "Cloudflare", "CDN_ANYCAST_HEURISTIC", "Cloudflare published prefix range"),
+    ProvenanceTaggedNetwork(ipaddress.ip_network("172.64.0.0/13"), "Cloudflare", "CDN_ANYCAST_HEURISTIC", "Cloudflare published prefix range"),
+    ProvenanceTaggedNetwork(ipaddress.ip_network("162.158.0.0/15"), "Cloudflare", "CDN_ANYCAST_HEURISTIC", "Cloudflare published prefix range"),
+    ProvenanceTaggedNetwork(ipaddress.ip_network("198.41.128.0/17"), "Cloudflare", "CDN_ANYCAST_HEURISTIC", "Cloudflare published prefix range"),
+    ProvenanceTaggedNetwork(ipaddress.ip_network("2606:4700::/32"), "Cloudflare", "CDN_ANYCAST_HEURISTIC", "Cloudflare published IPv6 range"),
+    # Fastly published edge ranges
+    ProvenanceTaggedNetwork(ipaddress.ip_network("151.101.0.0/16"), "Fastly", "CDN_ANYCAST_HEURISTIC", "Fastly published prefix range"),
+    ProvenanceTaggedNetwork(ipaddress.ip_network("199.232.0.0/16"), "Fastly", "CDN_ANYCAST_HEURISTIC", "Fastly published prefix range"),
+    ProvenanceTaggedNetwork(ipaddress.ip_network("2a04:4e40::/32"), "Fastly", "CDN_ANYCAST_HEURISTIC", "Fastly published IPv6 range"),
+    # AWS CloudFront published ranges (ip-ranges.json)
+    ProvenanceTaggedNetwork(ipaddress.ip_network("13.224.0.0/14"), "AWS CloudFront", "CDN_ANYCAST_HEURISTIC", "AWS ip-ranges.json CLOUDFRONT service"),
+    ProvenanceTaggedNetwork(ipaddress.ip_network("13.225.0.0/16"), "AWS CloudFront", "CDN_ANYCAST_HEURISTIC", "AWS ip-ranges.json CLOUDFRONT service"),
+    ProvenanceTaggedNetwork(ipaddress.ip_network("13.32.0.0/15"), "AWS CloudFront", "CDN_ANYCAST_HEURISTIC", "AWS ip-ranges.json CLOUDFRONT service"),
+    ProvenanceTaggedNetwork(ipaddress.ip_network("52.84.0.0/15"), "AWS CloudFront", "CDN_ANYCAST_HEURISTIC", "AWS ip-ranges.json CLOUDFRONT service"),
+    ProvenanceTaggedNetwork(ipaddress.ip_network("54.230.0.0/16"), "AWS CloudFront", "CDN_ANYCAST_HEURISTIC", "AWS ip-ranges.json CLOUDFRONT service"),
+    # Google Public DNS Anycast
+    ProvenanceTaggedNetwork(ipaddress.ip_network("8.8.8.0/24"), "Google Public DNS", "ANYCAST_RESOLVER_HEURISTIC", "Google Public DNS Anycast documentation"),
+    ProvenanceTaggedNetwork(ipaddress.ip_network("8.8.4.0/24"), "Google Public DNS", "ANYCAST_RESOLVER_HEURISTIC", "Google Public DNS Anycast documentation"),
+    ProvenanceTaggedNetwork(ipaddress.ip_network("142.250.0.0/15"), "Google Edge", "CLOUD_EDGE_HEURISTIC", "Google Cloud / 1e100 net IP blocks"),
+    ProvenanceTaggedNetwork(ipaddress.ip_network("172.217.0.0/16"), "Google Edge", "CLOUD_EDGE_HEURISTIC", "Google Cloud / 1e100 net IP blocks"),
+    # Quad9 Anycast Resolvers
+    ProvenanceTaggedNetwork(ipaddress.ip_network("9.9.9.0/24"), "Quad9", "ANYCAST_RESOLVER_HEURISTIC", "Quad9 Anycast public resolver documentation"),
+    ProvenanceTaggedNetwork(ipaddress.ip_network("149.112.112.0/24"), "Quad9", "ANYCAST_RESOLVER_HEURISTIC", "Quad9 Anycast public resolver documentation"),
 ]
 
 
-def is_known_anycast_ip(ip_str: str) -> tuple[bool, str]:
-    """Check if an IP address belongs to known public CDN/Anycast networks.
+def classify_ip_infrastructure(ip_str: str) -> dict[str, Any]:
+    """Classify an IP address using provenance-tagged prefix references.
     
-    Returns (is_anycast, provider_label).
+    Returns heuristic classification disclaiming authoritative BGP routing proof.
     """
     try:
         ip_obj = ipaddress.ip_address(ip_str)
-        for net in _KNOWN_CDN_NETWORKS:
-            if ip_obj in net:
-                if "104.16" in str(net) or "172.64" in str(net) or "162.158" in str(net):
-                    return True, "Cloudflare Anycast"
-                elif "151.101" in str(net) or "199.232" in str(net):
-                    return True, "Fastly Anycast"
-                elif "13.22" in str(net) or "52.84" in str(net) or "54.230" in str(net):
-                    return True, "AWS CloudFront"
-                elif "8.8" in str(net) or "142.250" in str(net) or "172.217" in str(net):
-                    return True, "Google Edge"
-                elif "9.9.9" in str(net) or "149.112" in str(net):
-                    return True, "Quad9 Anycast"
-                return True, "Known CDN Anycast"
-        return False, "Standard Unicast / Private"
+        for entry in _PROVENANCE_TAGGED_NETWORKS:
+            if ip_obj in entry.network:
+                return {
+                    "ip": ip_str,
+                    "is_known_anycast_heuristic": True,
+                    "provider": entry.provider,
+                    "classification": entry.classification,
+                    "provenance": entry.provenance,
+                    "authoritative": False,
+                    "notice": "Heuristic prefix match only; does not provide authoritative BGP Anycast routing proof.",
+                }
+        return {
+            "ip": ip_str,
+            "is_known_anycast_heuristic": False,
+            "provider": "Standard Unicast / Private",
+            "classification": "UNICAST_OR_UNCLASSIFIED",
+            "provenance": "unmatched_public_prefix",
+            "authoritative": False,
+            "notice": "No matching published CDN/Anycast prefix found.",
+        }
     except ValueError:
-        return False, "Invalid IP"
+        return {
+            "ip": ip_str,
+            "is_known_anycast_heuristic": False,
+            "provider": "Invalid IP",
+            "classification": "INVALID_IP",
+            "provenance": "none",
+            "authoritative": False,
+            "notice": "Failed to parse IP address string.",
+        }
+
+
+def is_known_anycast_ip(ip_str: str) -> tuple[bool, str]:
+    """Check if an IP belongs to known CDN/Anycast networks (backward-compatible wrapper).
+    
+    Returns (is_anycast_heuristic, provider_label).
+    """
+    res = classify_ip_infrastructure(ip_str)
+    return res["is_known_anycast_heuristic"], res["provider"]
 
 
 class TemporalIntelligenceEngine:
@@ -117,21 +153,33 @@ class TemporalIntelligenceEngine:
     ) -> list[IntelligenceClaim]:
         """Execute all temporal intelligence detectors for a specific domain.
         
+        Evaluates both IPv4 (dns_a) and IPv6 (dns_aaaa) observations, strictly bounded by as_of.
         Returns a list of evidence-backed IntelligenceClaim objects.
         """
         now_iso = utc_iso(as_of) if as_of else datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
         claims: list[IntelligenceClaim] = []
 
-        # 1. Fetch all observations for domain
-        obs_rows = self.conn.execute(
-            """
-            SELECT payload, observed_at, status
-            FROM real_observations
-            WHERE subject = ? AND kind = 'dns_a'
-            ORDER BY observed_at ASC, observation_id ASC
-            """,
-            (domain,),
-        ).fetchall()
+        # 1. Fetch all observations for domain (both IPv4 and IPv6, respecting as_of)
+        if as_of:
+            obs_rows = self.conn.execute(
+                """
+                SELECT payload, observed_at, status
+                FROM real_observations
+                WHERE subject = ? AND kind IN ('dns_a', 'dns_aaaa') AND observed_at <= ?
+                ORDER BY observed_at ASC, observation_id ASC
+                """,
+                (domain, now_iso),
+            ).fetchall()
+        else:
+            obs_rows = self.conn.execute(
+                """
+                SELECT payload, observed_at, status
+                FROM real_observations
+                WHERE subject = ? AND kind IN ('dns_a', 'dns_aaaa')
+                ORDER BY observed_at ASC, observation_id ASC
+                """,
+                (domain,),
+            ).fetchall()
 
         if not obs_rows:
             return claims
@@ -155,7 +203,7 @@ class TemporalIntelligenceEngine:
         claims.extend(self._detect_infrastructure_transitions(domain, observations, events_by_id, now_iso))
         claims.extend(self._detect_ip_evolution(domain, observations, events_by_id, now_iso))
         claims.extend(self._detect_shared_infrastructure(domain, observations, events_by_id, now_iso))
-        claims.extend(self._detect_discrepancy_timeline(domain, now_iso))
+        claims.extend(self._detect_discrepancy_timeline(domain, now_iso, as_of=as_of))
         claims.extend(self._detect_fast_flux_indicators(domain, observations, events_by_id, now_iso))
         claims.extend(self._detect_resolution_divergence(domain, observations, events_by_id, now_iso))
 
@@ -167,11 +215,18 @@ class TemporalIntelligenceEngine:
         limit_domains: int | None = None,
     ) -> list[IntelligenceClaim]:
         """Analyze all domain entities registered in the store and return claims."""
-        sql = "SELECT DISTINCT subject FROM real_observations WHERE kind = 'dns_a' ORDER BY subject"
+        now_iso = utc_iso(as_of) if as_of else datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+        sql = "SELECT DISTINCT subject FROM real_observations WHERE kind IN ('dns_a', 'dns_aaaa')"
+        params: list[Any] = []
+        if as_of:
+            sql += " AND observed_at <= ?"
+            params.append(now_iso)
+
+        sql += " ORDER BY subject ASC"
         if limit_domains:
             sql += f" LIMIT {int(limit_domains)}"
 
-        domains = [r[0] for r in self.conn.execute(sql).fetchall()]
+        domains = [r[0] for r in self.conn.execute(sql, params).fetchall()]
         all_claims: list[IntelligenceClaim] = []
 
         for dom in domains:
@@ -189,17 +244,19 @@ class TemporalIntelligenceEngine:
         events_by_id: dict[str, RealCollectionEvent],
         now_iso: str,
     ) -> list[IntelligenceClaim]:
-        """Detect transitions in resolved IP sets between distinct observation epochs."""
+        """Detect transitions in resolved IP sets between distinct observation epochs and resolvers."""
         claims: list[IntelligenceClaim] = []
         domain_uri = format_node_id(NodeType.DOMAIN, domain)
 
-        # Group by observation time (epoch)
+        # Group by observation time (epoch) and by resolver
         by_time: dict[str, set[str]] = defaultdict(set)
+        by_resolver_time: dict[tuple[str, str], set[str]] = defaultdict(set)
         evidence_by_time: dict[str, set[str]] = defaultdict(set)
 
         for ob in observations:
             if ob.status == "ok" and ob.values:
                 by_time[ob.observed_at].update(ob.values)
+                by_resolver_time[(ob.source_id, ob.observed_at)].update(ob.values)
                 ev = events_by_id.get(ob.evidence_id)
                 if ev:
                     evidence_by_time[ob.observed_at].add(ev.raw_sha256)
@@ -214,9 +271,13 @@ class TemporalIntelligenceEngine:
 
             if prev_ips != curr_ips:
                 combined_hashes = sorted(evidence_by_time[t_prev] | evidence_by_time[t_curr])
+                added_ips = sorted(set(curr_ips) - set(prev_ips))
+                removed_ips = sorted(set(prev_ips) - set(curr_ips))
+
                 explanation = (
                     f"Infrastructure transition observed for {domain}: IP set changed from "
-                    f"{prev_ips} at {t_prev} to {curr_ips} at {t_curr}."
+                    f"{prev_ips} at {t_prev} to {curr_ips} at {t_curr} "
+                    f"(added: {added_ips or 'none'}, removed: {removed_ips or 'none'})."
                 )
 
                 claim = IntelligenceClaim.create(
@@ -225,11 +286,11 @@ class TemporalIntelligenceEngine:
                     layer=EpistemicLayer.HYPOTHESIS,
                     asserted_at=now_iso,
                     valid_from=t_curr,
-                    confidence=1.0,
+                    confidence=0.85,
                     explanation=explanation,
                     supporting_evidence_hashes=combined_hashes,
                     supporting_node_ids=[domain_uri] + [format_node_id(NodeType.IP, ip) for ip in curr_ips],
-                    verification_state=ClaimVerificationState.ATTESTED_ASSERTION.value,
+                    verification_state=ClaimVerificationState.UNVERIFIED_HYPOTHESIS.value,
                     falsifiability_condition=(
                         "Falsified if intermediate unobserved queries demonstrate gradual rollover or "
                         "if multi-region DNS Anycast returns geographically differentiated responses."
@@ -237,8 +298,11 @@ class TemporalIntelligenceEngine:
                     properties={
                         "previous_ips": prev_ips,
                         "new_ips": curr_ips,
+                        "added_ips": added_ips,
+                        "removed_ips": removed_ips,
                         "transition_time": t_curr,
                         "previous_time": t_prev,
+                        "confidence_type": "heuristic_uncalibrated",
                     },
                 )
                 claims.append(claim)
@@ -308,11 +372,11 @@ class TemporalIntelligenceEngine:
                 asserted_at=now_iso,
                 valid_from=stats["first_seen"],
                 valid_until=stats["last_seen"],
-                confidence=0.95,
+                confidence=0.80,
                 explanation=explanation,
                 supporting_evidence_hashes=sorted(stats["evidence_hashes"]),
                 supporting_node_ids=[domain_uri, ip_uri],
-                verification_state=ClaimVerificationState.ATTESTED_ASSERTION.value,
+                verification_state=ClaimVerificationState.UNVERIFIED_HYPOTHESIS.value,
                 falsifiability_condition="Defeated if authoritative zone apex records record differing glue or delegations.",
                 properties={
                     "ip": ip,
@@ -322,6 +386,7 @@ class TemporalIntelligenceEngine:
                     "is_known_anycast": is_anycast,
                     "provider": provider,
                     "observation_count": stats["count"],
+                    "confidence_type": "heuristic_uncalibrated",
                 },
             )
             claims.append(claim)
@@ -376,11 +441,11 @@ class TemporalIntelligenceEngine:
                     layer=EpistemicLayer.HYPOTHESIS,
                     asserted_at=now_iso,
                     valid_from=latest_time or now_iso,
-                    confidence=0.90,
+                    confidence=0.75,
                     explanation=explanation,
                     supporting_evidence_hashes=sorted(evidence_hashes),
                     supporting_node_ids=[domain_uri, ip_uri] + [format_node_id(NodeType.DOMAIN, d) for d in other_domains[:10]],
-                    verification_state=ClaimVerificationState.ATTESTED_ASSERTION.value,
+                    verification_state=ClaimVerificationState.UNVERIFIED_HYPOTHESIS.value,
                     falsifiability_condition="Invalidated if SNI inspection or reverse DNS demonstrates dedicated non-shared allocation.",
                     properties={
                         "ip": ip,
@@ -389,6 +454,7 @@ class TemporalIntelligenceEngine:
                         "is_known_anycast": is_anycast,
                         "provider": provider,
                         "guardrail_status": "PASS_NO_MALICIOUS_INFERENCE",
+                        "confidence_type": "heuristic_uncalibrated",
                     },
                 )
                 claims.append(claim)
@@ -399,20 +465,32 @@ class TemporalIntelligenceEngine:
         self,
         domain: str,
         now_iso: str,
+        as_of: str | None = None,
     ) -> list[IntelligenceClaim]:
         """Track multi-resolver consensus history and security-filtering divergence."""
         claims: list[IntelligenceClaim] = []
         domain_uri = format_node_id(NodeType.DOMAIN, domain)
 
-        rows = self.conn.execute(
-            """
-            SELECT payload, analyzed_at, verdict, category
-            FROM real_discrepancies
-            WHERE subject = ?
-            ORDER BY analyzed_at ASC
-            """,
-            (domain,),
-        ).fetchall()
+        if as_of:
+            rows = self.conn.execute(
+                """
+                SELECT payload, analyzed_at, verdict, category
+                FROM real_discrepancies
+                WHERE subject = ? AND analyzed_at <= ?
+                ORDER BY analyzed_at ASC
+                """,
+                (domain, now_iso),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                """
+                SELECT payload, analyzed_at, verdict, category
+                FROM real_discrepancies
+                WHERE subject = ?
+                ORDER BY analyzed_at ASC
+                """,
+                (domain,),
+            ).fetchall()
 
         if not rows:
             return claims
@@ -452,11 +530,11 @@ class TemporalIntelligenceEngine:
             asserted_at=now_iso,
             valid_from=first_analyzed,
             valid_until=last_analyzed,
-            confidence=0.95,
+            confidence=0.85,
             explanation=explanation,
             supporting_evidence_hashes=sorted(evidence_hashes),
             supporting_node_ids=[domain_uri],
-            verification_state=ClaimVerificationState.ATTESTED_ASSERTION.value,
+            verification_state=ClaimVerificationState.UNVERIFIED_HYPOTHESIS.value,
             falsifiability_condition="Defeated if resolver authority proves upstream authoritative server failure during collection window.",
             properties={
                 "total_analyses": total_analyses,
@@ -464,6 +542,7 @@ class TemporalIntelligenceEngine:
                 "filtering_events": filtering_events,
                 "verdict_breakdown": dict(verdict_counts),
                 "category_breakdown": dict(category_counts),
+                "confidence_type": "heuristic_uncalibrated",
             },
         )
         claims.append(claim)
@@ -476,23 +555,34 @@ class TemporalIntelligenceEngine:
         events_by_id: dict[str, RealCollectionEvent],
         now_iso: str,
     ) -> list[IntelligenceClaim]:
-        """Detect deterministic indicators of high-frequency IP rotation with low TTL.
+        """Detect deterministic indicators of high-frequency IP rotation with low TTL within 24 hours.
         
         Strict Epistemic Guardrail:
+        - Strictly bounded to past 24-hour window from now_iso.
         - Must NOT infer maliciousness.
         - Must state falsifiability criteria (Anycast, CDN edge rotation, GSLB).
         """
         claims: list[IntelligenceClaim] = []
         domain_uri = format_node_id(NodeType.DOMAIN, domain)
 
-        # Collect unique IPs, /24 subnets, and TTLs across past 24 hours
+        t_now = datetime.fromisoformat(now_iso.replace("Z", "+00:00"))
+        t_window_start = t_now - timedelta(hours=24)
+        t_window_start_iso = t_window_start.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+        # Collect unique IPs, subnets, and TTLs strictly across past 24 hours
         observed_ips: set[str] = set()
         subnets_v4: set[str] = set()
+        subnets_v6: set[str] = set()
         ttls: list[int] = []
         evidence_hashes: set[str] = set()
         anycast_present = False
 
-        for ob in observations:
+        window_obs = [
+            ob for ob in observations
+            if t_window_start_iso <= ob.observed_at <= now_iso
+        ]
+
+        for ob in window_obs:
             if ob.status == "ok" and ob.values:
                 for ip in ob.values:
                     observed_ips.add(ip)
@@ -503,6 +593,8 @@ class TemporalIntelligenceEngine:
                         ip_obj = ipaddress.ip_address(ip)
                         if isinstance(ip_obj, ipaddress.IPv4Address):
                             subnets_v4.add(str(ipaddress.ip_network(f"{ip}/24", strict=False)))
+                        elif isinstance(ip_obj, ipaddress.IPv6Address):
+                            subnets_v6.add(str(ipaddress.ip_network(f"{ip}/48", strict=False)))
                     except ValueError:
                         pass
                 if ob.ttl_seconds is not None:
@@ -511,17 +603,19 @@ class TemporalIntelligenceEngine:
                 if ev:
                     evidence_hashes.add(ev.raw_sha256)
 
+        total_subnets = len(subnets_v4) + len(subnets_v6)
         median_ttl = sorted(ttls)[len(ttls) // 2] if ttls else 300
 
         # Fast-Flux Heuristic Condition:
-        # 1. >= 5 unique IPs observed
+        # 1. >= 5 unique IPs observed within 24h
         # 2. Short median TTL <= 300s
-        # 3. >= 2 distinct /24 subnets
+        # 3. >= 2 distinct /24 (IPv4) or /48 (IPv6) subnets
         # 4. Not in known CDN Anycast pool
-        if len(observed_ips) >= 5 and median_ttl <= 300 and len(subnets_v4) >= 2 and not anycast_present:
+        if len(observed_ips) >= 5 and median_ttl <= 300 and total_subnets >= 2 and not anycast_present:
             explanation = (
                 f"Fast-flux candidate indicator detected for {domain}: Observed {len(observed_ips)} unique IPs "
-                f"across {len(subnets_v4)} distinct /24 subnets with low median TTL ({median_ttl}s). "
+                f"across {total_subnets} distinct subnets ({len(subnets_v4)} IPv4 /24, {len(subnets_v6)} IPv6 /48) "
+                f"with low median TTL ({median_ttl}s) in past 24 hours. "
                 f"Notice: Fast-flux indicators measure dynamic volatility and do NOT infer maliciousness."
             )
 
@@ -530,8 +624,8 @@ class TemporalIntelligenceEngine:
                 claim_type=TemporalClaimType.FAST_FLUX_INDICATOR.value,
                 layer=EpistemicLayer.HYPOTHESIS,
                 asserted_at=now_iso,
-                valid_from=now_iso,
-                confidence=0.75,
+                valid_from=t_window_start_iso,
+                confidence=0.70,
                 explanation=explanation,
                 supporting_evidence_hashes=sorted(evidence_hashes),
                 supporting_node_ids=[domain_uri] + [format_node_id(NodeType.IP, ip) for ip in list(observed_ips)[:10]],
@@ -542,10 +636,15 @@ class TemporalIntelligenceEngine:
                 ),
                 properties={
                     "unique_ip_count": len(observed_ips),
-                    "subnet_count": len(subnets_v4),
+                    "total_subnet_count": total_subnets,
+                    "subnet_count": total_subnets,
+                    "ipv4_subnet_count": len(subnets_v4),
+                    "ipv6_subnet_count": len(subnets_v6),
                     "median_ttl": median_ttl,
-                    "subnets": sorted(subnets_v4)[:10],
+                    "window_start": t_window_start_iso,
+                    "window_end": now_iso,
                     "guardrail_status": "PASS_NO_MALICIOUS_INFERENCE",
+                    "confidence_type": "heuristic_uncalibrated",
                 },
             )
             claims.append(claim)
@@ -600,7 +699,7 @@ class TemporalIntelligenceEngine:
                     layer=EpistemicLayer.HYPOTHESIS,
                     asserted_at=now_iso,
                     valid_from=t2,
-                    confidence=0.85,
+                    confidence=0.80,
                     explanation=explanation,
                     supporting_evidence_hashes=combined_hashes,
                     supporting_node_ids=[domain_uri] + [format_node_id(NodeType.IP, ip) for ip in ips2],
@@ -615,6 +714,7 @@ class TemporalIntelligenceEngine:
                         "from_ips": sorted(ips1),
                         "to_ips": sorted(ips2),
                         "transition_time": t2,
+                        "confidence_type": "heuristic_uncalibrated",
                     },
                 )
                 claims.append(claim)

@@ -216,8 +216,8 @@ class GraphEngine:
 
     # --- Ingestion into SQLite Graph Tables ---
 
-    def upsert_node(self, node: GraphNode) -> None:
-        """Insert or update a graph node (merging observation timestamps)."""
+    def upsert_node(self, node: GraphNode) -> bool:
+        """Insert or update a graph node (merging observation timestamps). Returns True if newly inserted."""
         row = self.conn.execute(
             "SELECT first_observed_at, last_observed_at, properties_json FROM graph_nodes WHERE node_id = ?",
             (node.node_id,),
@@ -242,6 +242,7 @@ class GraphEngine:
                     canonical_json(node.to_dict()),
                 ),
             )
+            return True
         else:
             old_first, old_last, old_props_json = row
             new_first = min(old_first, node.first_observed_at)
@@ -261,6 +262,7 @@ class GraphEngine:
                 """,
                 (new_first, new_last, canonical_json(props), canonical_json(updated_dict), node.node_id),
             )
+            return False
 
     def insert_edge(self, edge: GraphEdge) -> bool:
         """Insert a graph edge, or merge evidence hashes if edge_id already exists.
@@ -360,37 +362,59 @@ class GraphEngine:
         if max_depth == 0:
             node = self.get_node(start_node_id)
             if not node:
-                return {"root_id": start_node_id, "depth": 0, "nodes": [], "edges": []}
+                return {
+                    "root_id": start_node_id,
+                    "depth": 0,
+                    "truncated": False,
+                    "total_nodes_visited": 0,
+                    "total_edges_visited": 0,
+                    "max_depth_reached": 0,
+                    "limit_nodes": max_nodes,
+                    "limit_edges": max_edges,
+                    "nodes": [],
+                    "edges": [],
+                }
             return {
                 "root_id": start_node_id,
                 "depth": 0,
+                "truncated": False,
+                "total_nodes_visited": 1,
+                "total_edges_visited": 0,
+                "max_depth_reached": 0,
+                "limit_nodes": max_nodes,
+                "limit_edges": max_edges,
                 "nodes": [node.to_dict()],
                 "edges": [],
             }
 
         if max_depth == 1:
-            # High-performance direct index seek for 1-hop neighborhood (sub-millisecond)
+            # High-performance direct index seek for 1-hop neighborhood with deterministic ordering
             edge_query = """
             SELECT payload, source_id, target_id FROM graph_edges
             WHERE source_id = ?
             UNION ALL
             SELECT payload, source_id, target_id FROM graph_edges
             WHERE target_id = ?
+            ORDER BY source_id ASC, target_id ASC
             LIMIT ?
             """
-            direct_edge_rows = self.conn.execute(edge_query, (start_node_id, start_node_id, max_edges)).fetchall()
+            direct_edge_rows = self.conn.execute(edge_query, (start_node_id, start_node_id, max_edges + 1)).fetchall()
+            is_truncated_edges = len(direct_edge_rows) > max_edges
+            direct_edge_rows = direct_edge_rows[:max_edges]
+
             visited_set = {start_node_id}
             edge_list = []
             for r in direct_edge_rows:
                 visited_set.add(r[1])
                 visited_set.add(r[2])
                 edge_list.append(GraphEdge.from_dict(json.loads(r[0])))
-                if len(visited_set) >= max_nodes:
+                if len(visited_set) > max_nodes:
                     break
 
-            visited_node_ids = list(visited_set)[:max_nodes]
+            is_truncated_nodes = len(visited_set) > max_nodes
+            visited_node_ids = sorted(list(visited_set)[:max_nodes])
             placeholders = ",".join("?" for _ in visited_node_ids)
-            node_query = f"SELECT payload FROM graph_nodes WHERE node_id IN ({placeholders})"
+            node_query = f"SELECT payload FROM graph_nodes WHERE node_id IN ({placeholders}) ORDER BY node_id ASC"
             if layer_filter:
                 l_placeholders = ",".join("?" for _ in layer_filter)
                 node_query += f" AND layer IN ({l_placeholders})"
@@ -408,6 +432,12 @@ class GraphEngine:
             return {
                 "root_id": start_node_id,
                 "depth": 1,
+                "truncated": is_truncated_nodes or is_truncated_edges,
+                "total_nodes_visited": len(visited_set),
+                "total_edges_visited": len(edge_list),
+                "max_depth_reached": 1 if edges else 0,
+                "limit_nodes": max_nodes,
+                "limit_edges": max_edges,
                 "nodes": [n.to_dict() for n in nodes],
                 "edges": [e.to_dict() for e in edges],
             }
@@ -426,16 +456,30 @@ class GraphEngine:
             WHERE t.depth < ?
               AND instr(t.path, ',' || (CASE WHEN e.source_id = t.curr_node_id THEN e.target_id ELSE e.source_id END) || ',') = 0
         )
-        SELECT DISTINCT curr_node_id, depth FROM traversal LIMIT ?;
+        SELECT DISTINCT curr_node_id, depth FROM traversal ORDER BY depth ASC, curr_node_id ASC LIMIT ?;
         """
-        rows = self.conn.execute(query, (start_node_id, start_node_id, max_depth, max_nodes)).fetchall()
-        visited_node_ids = [r[0] for r in rows][:max_nodes]
+        rows = self.conn.execute(query, (start_node_id, start_node_id, max_depth, max_nodes + 1)).fetchall()
+        is_truncated_nodes = len(rows) > max_nodes
+        rows = rows[:max_nodes]
+        visited_node_ids = sorted([r[0] for r in rows])
+        max_d_reached = max((r[1] for r in rows), default=0)
 
         if not visited_node_ids:
-            return {"nodes": [], "edges": []}
+            return {
+                "root_id": start_node_id,
+                "depth": max_depth,
+                "truncated": False,
+                "total_nodes_visited": 0,
+                "total_edges_visited": 0,
+                "max_depth_reached": 0,
+                "limit_nodes": max_nodes,
+                "limit_edges": max_edges,
+                "nodes": [],
+                "edges": [],
+            }
 
         placeholders = ",".join("?" for _ in visited_node_ids)
-        node_query = f"SELECT payload FROM graph_nodes WHERE node_id IN ({placeholders})"
+        node_query = f"SELECT payload FROM graph_nodes WHERE node_id IN ({placeholders}) ORDER BY node_id ASC"
         if layer_filter:
             l_placeholders = ",".join("?" for _ in layer_filter)
             node_query += f" AND layer IN ({l_placeholders})"
@@ -446,24 +490,31 @@ class GraphEngine:
         nodes = [GraphNode.from_dict(json.loads(r[0])) for r in node_rows]
         valid_node_ids = {n.node_id for n in nodes}
 
-        # Fetch connecting edges using composite index seeks
+        # Fetch connecting edges using composite index seeks with deterministic ordering
         edge_query = f"""
         SELECT payload FROM graph_edges
         WHERE source_id IN ({placeholders}) AND target_id IN ({placeholders})
+        ORDER BY source_id ASC, target_id ASC, edge_id ASC
         LIMIT ?
         """
-        edge_rows = self.conn.execute(edge_query, (*visited_node_ids, *visited_node_ids, max_edges)).fetchall()
+        edge_rows = self.conn.execute(edge_query, (*visited_node_ids, *visited_node_ids, max_edges + 1)).fetchall()
+        is_truncated_edges = len(edge_rows) > max_edges
+        edge_rows = edge_rows[:max_edges]
         edges = []
         for r in edge_rows:
             e = GraphEdge.from_dict(json.loads(r[0]))
             if e.source_id in valid_node_ids and e.target_id in valid_node_ids:
                 edges.append(e)
-            if len(edges) >= max_edges:
-                break
 
         return {
             "root_id": start_node_id,
             "depth": max_depth,
+            "truncated": is_truncated_nodes or is_truncated_edges,
+            "total_nodes_visited": len(visited_node_ids),
+            "total_edges_visited": len(edges),
+            "max_depth_reached": max_d_reached,
+            "limit_nodes": max_nodes,
+            "limit_edges": max_edges,
             "nodes": [n.to_dict() for n in nodes],
             "edges": [e.to_dict() for e in edges],
         }
