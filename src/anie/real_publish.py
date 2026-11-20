@@ -50,13 +50,32 @@ from .real_models import (
 from .real_store import RealObservationStore
 
 # --- Schema & Identifier Constants ---
-REAL_MANIFEST_SCHEMA = "anie.real-dataset-manifest.v1"
+REAL_MANIFEST_SCHEMA_V1 = "anie.real-dataset-manifest.v1"
+REAL_MANIFEST_SCHEMA_V2 = "anie.real-dataset-manifest.v2"
+REAL_MANIFEST_SCHEMA = REAL_MANIFEST_SCHEMA_V2
+REAL_MANIFEST_SCHEMAS = frozenset({REAL_MANIFEST_SCHEMA_V1, REAL_MANIFEST_SCHEMA_V2})
+
 DATASET_TYPE_REAL = "first_party_intelligence"
-REAL_SIGNATURE_SCHEMA = "anie.real-ed25519-attestation.v1"
-REAL_PAYLOAD_SCHEMA = "anie.real-release-attestation.v1"
+
+REAL_SIGNATURE_SCHEMA_V1 = "anie.real-ed25519-attestation.v1"
+REAL_SIGNATURE_SCHEMA_V2 = "anie.real-ed25519-attestation.v2"
+REAL_SIGNATURE_SCHEMA = REAL_SIGNATURE_SCHEMA_V2
+REAL_SIGNATURE_SCHEMAS = frozenset({REAL_SIGNATURE_SCHEMA_V1, REAL_SIGNATURE_SCHEMA_V2})
+
+REAL_PAYLOAD_SCHEMA_V1 = "anie.real-release-attestation.v1"
+REAL_PAYLOAD_SCHEMA_V2 = "anie.real-release-attestation.v2"
+REAL_PAYLOAD_SCHEMA = REAL_PAYLOAD_SCHEMA_V2
+REAL_PAYLOAD_SCHEMAS = frozenset({REAL_PAYLOAD_SCHEMA_V1, REAL_PAYLOAD_SCHEMA_V2})
+
 ATTESTATION_NAME = "signature.ed25519.json"
-DOMAIN_SEPARATOR_REAL = b"ANIE-REAL-ED25519-RELEASE-V1\x00"
-TRACKER_SCHEMA = "anie.verifier-sequence-tracker.v1"
+DOMAIN_SEPARATOR_REAL_V1 = b"ANIE-REAL-ED25519-RELEASE-V1\x00"
+DOMAIN_SEPARATOR_REAL_V2 = b"ANIE-REAL-ED25519-RELEASE-V2\x00"
+DOMAIN_SEPARATOR_REAL = DOMAIN_SEPARATOR_REAL_V2
+
+TRACKER_SCHEMA_V1 = "anie.verifier-sequence-tracker.v1"
+TRACKER_SCHEMA_V2 = "anie.verifier-sequence-tracker.v2"
+TRACKER_SCHEMA = TRACKER_SCHEMA_V2
+TRACKER_SCHEMAS = frozenset({TRACKER_SCHEMA_V1, TRACKER_SCHEMA_V2})
 
 REAL_PARTITION_FILES = frozenset({"real_observations.jsonl.gz", "real_events.jsonl.gz"})
 
@@ -349,6 +368,7 @@ def publish_real(
     *,
     publisher_identity: str = "anie-first-party",
     release_sequence: int = 1,
+    prev_manifest_sha256: str | None = None,
     source_commit: str | None = None,
     published_at: str | None = None,
     limit: int = MAX_RECORDS_PER_PARTITION,
@@ -366,6 +386,17 @@ def publish_real(
 
     if not isinstance(release_sequence, int) or release_sequence < 1:
         raise ValueError(f"release_sequence must be a positive integer >= 1: got {release_sequence}")
+
+    if release_sequence == 1:
+        if prev_manifest_sha256 is not None:
+            raise ValueError(
+                f"prev_manifest_sha256 must be None for initial release sequence 1, got {prev_manifest_sha256!r}"
+            )
+    else:
+        if prev_manifest_sha256 is not None and not _SHA256_RE.fullmatch(prev_manifest_sha256):
+            raise ValueError(
+                f"prev_manifest_sha256 must be a valid 64-character hex SHA-256 digest: got {prev_manifest_sha256!r}"
+            )
 
     as_of_iso = utc_iso(as_of)
     now_iso = utc_iso(published_at) if published_at is not None else datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -420,10 +451,11 @@ def publish_real(
             raise ValueError(f"invalid source_commit: {commit_val!r} (must be 40-character hex)")
 
         manifest = {
-            "schema": REAL_MANIFEST_SCHEMA,
+            "schema": REAL_MANIFEST_SCHEMA_V2,
             "dataset_type": DATASET_TYPE_REAL,
             "publisher": publisher_identity,
             "release_sequence": release_sequence,
+            "prev_manifest_sha256": prev_manifest_sha256,
             "as_of": as_of_iso,
             "published_at": now_iso,
             "source_commit": commit_val,
@@ -468,10 +500,19 @@ def _read_and_validate_manifest(directory: Path) -> tuple[bytes, str, dict[str, 
 
     if not isinstance(manifest, dict):
         raise ValueError("manifest must be a JSON object")
-    if manifest.get("schema") != REAL_MANIFEST_SCHEMA:
+    if manifest.get("schema") not in REAL_MANIFEST_SCHEMAS:
         raise ValueError(f"unsupported manifest schema: {manifest.get('schema')!r}")
     if manifest.get("dataset_type") != DATASET_TYPE_REAL:
         raise ValueError(f"unsupported dataset_type: {manifest.get('dataset_type')!r}")
+
+    if manifest.get("schema") == REAL_MANIFEST_SCHEMA_V2:
+        seq = manifest.get("release_sequence")
+        prev_sha = manifest.get("prev_manifest_sha256")
+        if seq == 1 and prev_sha is not None:
+            raise ValueError("prev_manifest_sha256 must be null for release_sequence 1 in v2 manifest")
+        if isinstance(seq, int) and seq > 1 and prev_sha is not None:
+            if not isinstance(prev_sha, str) or not _SHA256_RE.fullmatch(prev_sha):
+                raise ValueError(f"invalid prev_manifest_sha256 in v2 manifest: {prev_sha!r}")
 
     files = manifest.get("files")
     if not isinstance(files, list) or len(files) != 2:
@@ -494,6 +535,7 @@ def sign_manifest_detached(
     expires_at: str,
     publisher_identity: str = "anie-first-party",
     source_commit: str | None = None,
+    prev_manifest_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Sign an exported manifest in a detached operator environment.
     
@@ -501,6 +543,7 @@ def sign_manifest_detached(
     - Publisher identity must match manifest publisher.
     - Release sequence must match manifest sequence.
     - Source commit must match manifest source commit.
+    - Previous manifest SHA-256 hash must match manifest prev_manifest_sha256.
     - Outer envelope key ID and fingerprint must match inner payload.
     - Existing attestation files cannot be overwritten.
     """
@@ -543,6 +586,27 @@ def sign_manifest_detached(
     else:
         source_commit = manifest_commit
 
+    # 4. Enforce hash chain agreement
+    manifest_prev = manifest.get("prev_manifest_sha256")
+    if prev_manifest_sha256 is not None:
+        if manifest_prev != prev_manifest_sha256:
+            raise ValueError(
+                f"prev_manifest_sha256 mismatch: manifest specifies {manifest_prev!r}, "
+                f"signing requested {prev_manifest_sha256!r}"
+            )
+    else:
+        prev_manifest_sha256 = manifest_prev
+
+    manifest_schema = manifest.get("schema")
+    is_v2 = (
+        manifest_schema == REAL_MANIFEST_SCHEMA_V2
+        or prev_manifest_sha256 is not None
+        or release_sequence > 1
+    )
+    payload_schema = REAL_PAYLOAD_SCHEMA_V2 if is_v2 else REAL_PAYLOAD_SCHEMA_V1
+    sig_schema = REAL_SIGNATURE_SCHEMA_V2 if is_v2 else REAL_SIGNATURE_SCHEMA_V1
+    domain_sep = DOMAIN_SEPARATOR_REAL_V2 if is_v2 else DOMAIN_SEPARATOR_REAL_V1
+
     issued_dt = _dt(issued_at)
     expires_dt = _dt(expires_at)
     if issued_dt >= expires_dt:
@@ -558,7 +622,7 @@ def sign_manifest_detached(
     fingerprint = key_fingerprint(raw_public)
 
     payload = {
-        "schema": REAL_PAYLOAD_SCHEMA,
+        "schema": payload_schema,
         "publisher": publisher_identity,
         "key_id": key_id,
         "key_fingerprint": fingerprint,
@@ -569,13 +633,15 @@ def sign_manifest_detached(
         "issued_at": utc_iso(issued_at),
         "expires_at": utc_iso(expires_at),
     }
+    if is_v2:
+        payload["prev_manifest_sha256"] = prev_manifest_sha256
 
-    message = DOMAIN_SEPARATOR_REAL + canonical_json(payload).encode("utf-8")
+    message = domain_sep + canonical_json(payload).encode("utf-8")
     sig_bytes = private_key.sign(message)
     sig_b64 = base64.b64encode(sig_bytes).decode("ascii")
 
     attestation = {
-        "schema": REAL_SIGNATURE_SCHEMA,
+        "schema": sig_schema,
         "key_id": key_id,
         "key_fingerprint": fingerprint,
         "payload": payload,
@@ -616,6 +682,7 @@ class RealReleaseTrust:
     max_age_seconds: int = 90 * 86400
     revoked_fingerprints: frozenset[str] = field(default_factory=frozenset)
     revoked_key_ids: frozenset[str] = field(default_factory=frozenset)
+    require_hash_chain: bool = False
 
     @classmethod
     def from_single_key(
@@ -709,10 +776,11 @@ class ReleaseSequenceTracker:
                 raise FileExistsError(f"sequence tracker state file already exists: '{self.state_path}'")
             now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
             data = {
-                "schema": TRACKER_SCHEMA,
+                "schema": TRACKER_SCHEMA_V2,
                 "initialized_at": now_iso,
                 "updated_at": now_iso,
                 "sequences": {},
+                "publishers": {},
             }
             self._write_state_atomic(data)
 
@@ -745,18 +813,45 @@ class ReleaseSequenceTracker:
 
         if not isinstance(data, dict):
             raise TrackerStateError("tracker state file must contain a JSON object")
-        if data.get("schema") != TRACKER_SCHEMA:
+        if data.get("schema") not in TRACKER_SCHEMAS:
             raise TrackerStateError(f"unsupported tracker state schema: {data.get('schema')!r}")
 
         sequences = data.get("sequences")
-        if not isinstance(sequences, dict):
-            raise TrackerStateError("tracker state 'sequences' field must be a dictionary")
+        if sequences is not None:
+            if not isinstance(sequences, dict):
+                raise TrackerStateError("tracker state 'sequences' field must be a dictionary")
+            for pub, seq in sequences.items():
+                if not isinstance(pub, str) or not pub:
+                    raise TrackerStateError(f"invalid publisher key in tracker sequences: {pub!r}")
+                if type(seq) is not int or seq < 0:
+                    raise TrackerStateError(f"invalid sequence value for publisher '{pub}': {seq!r} (must be int >= 0)")
+        else:
+            sequences = {}
+            data["sequences"] = sequences
 
-        for pub, seq in sequences.items():
-            if not isinstance(pub, str) or not pub:
-                raise TrackerStateError(f"invalid publisher key in tracker sequences: {pub!r}")
-            if type(seq) is not int or seq < 0:
-                raise TrackerStateError(f"invalid sequence value for publisher '{pub}': {seq!r} (must be int >= 0)")
+        publishers = data.get("publishers")
+        if publishers is not None:
+            if not isinstance(publishers, dict):
+                raise TrackerStateError("tracker state 'publishers' field must be a dictionary")
+            for pub, pinfo in publishers.items():
+                if not isinstance(pub, str) or not pub:
+                    raise TrackerStateError(f"invalid publisher key in tracker publishers: {pub!r}")
+                if not isinstance(pinfo, dict):
+                    raise TrackerStateError(f"invalid publisher entry for '{pub}': must be dict")
+                pseq = pinfo.get("last_sequence")
+                if type(pseq) is not int or pseq < 0:
+                    raise TrackerStateError(f"invalid last_sequence for publisher '{pub}': {pseq!r}")
+                pdigest = pinfo.get("last_manifest_sha256")
+                if pdigest is not None and (not isinstance(pdigest, str) or not _SHA256_RE.fullmatch(pdigest)):
+                    raise TrackerStateError(f"invalid last_manifest_sha256 for publisher '{pub}': {pdigest!r}")
+                if pub not in sequences:
+                    sequences[pub] = pseq
+        else:
+            # Populate from sequences for v1 migration
+            data["publishers"] = {
+                pub: {"last_sequence": seq, "last_manifest_sha256": None}
+                for pub, seq in sequences.items()
+            }
 
         return data
 
@@ -784,25 +879,45 @@ class ReleaseSequenceTracker:
             data = self._read_state_locked()
             return int(data["sequences"].get(publisher, 0))
 
-    def update_accepted_sequence(
+    def get_last_accepted_digest(self, publisher: str, *, allow_uninitialized: bool = False) -> str | None:
+        """Get last accepted manifest SHA-256 digest for publisher."""
+        with _tracker_file_lock(self.lock_path):
+            if not self.state_path.exists():
+                if allow_uninitialized:
+                    return None
+                raise TrackerStateLostError(
+                    f"sequence tracker state file '{self.state_path}' does not exist (uninitialized or state lost)"
+                )
+            data = self._read_state_locked()
+            pub_info = data.get("publishers", {}).get(publisher)
+            if pub_info and isinstance(pub_info, dict):
+                return pub_info.get("last_manifest_sha256")
+            return None
+
+    def update_accepted(
         self,
         publisher: str,
         sequence: int,
+        manifest_sha256: str | None = None,
         *,
         allow_uninitialized: bool = False,
     ) -> None:
-        """Atomically advance accepted sequence. Fails closed on rollback or concurrency conflict."""
+        """Atomically advance accepted sequence and recorded digest. Fails closed on rollback."""
         if type(sequence) is not int or sequence < 1:
             raise ValueError(f"sequence must be an integer >= 1: got {sequence!r}")
+        if manifest_sha256 is not None and not _SHA256_RE.fullmatch(manifest_sha256):
+            raise ValueError(f"invalid manifest_sha256: got {manifest_sha256!r}")
+
         with _tracker_file_lock(self.lock_path):
             if not self.state_path.exists():
                 if allow_uninitialized:
                     now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
                     data = {
-                        "schema": TRACKER_SCHEMA,
+                        "schema": TRACKER_SCHEMA_V2,
                         "initialized_at": now_iso,
                         "updated_at": now_iso,
                         "sequences": {},
+                        "publishers": {},
                     }
                 else:
                     raise TrackerStateLostError(
@@ -811,16 +926,36 @@ class ReleaseSequenceTracker:
             else:
                 data = self._read_state_locked()
 
-            current = int(data["sequences"].get(publisher, 0))
+            current = int(data.get("sequences", {}).get(publisher, 0))
             if sequence <= current:
                 raise ValueError(
                     f"cannot advance sequence to {sequence}: current accepted sequence for '{publisher}' "
                     f"is {current} (rollback/downgrade prevented)"
                 )
 
+            data["schema"] = TRACKER_SCHEMA_V2
+            if "sequences" not in data:
+                data["sequences"] = {}
+            if "publishers" not in data:
+                data["publishers"] = {}
+
             data["sequences"][publisher] = sequence
+            data["publishers"][publisher] = {
+                "last_sequence": sequence,
+                "last_manifest_sha256": manifest_sha256,
+            }
             data["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
             self._write_state_atomic(data)
+
+    def update_accepted_sequence(
+        self,
+        publisher: str,
+        sequence: int,
+        *,
+        allow_uninitialized: bool = False,
+    ) -> None:
+        """Atomically advance accepted sequence (backward-compatible method)."""
+        self.update_accepted(publisher, sequence, manifest_sha256=None, allow_uninitialized=allow_uninitialized)
 
 
 def _iter_bounded_gzip_records(
@@ -1027,8 +1162,10 @@ def verify_real_release(
             "evidence_integrity_valid": True,
             "publisher_authenticated": False,
             "anti_rollback_verified": False,
+            "hash_chain_verified": False,
             "dataset_type": DATASET_TYPE_REAL,
             "release_sequence": manifest.get("release_sequence"),
+            "prev_manifest_sha256": manifest.get("prev_manifest_sha256"),
             "total_observations": obs_count,
             "total_events": event_count,
             "manifest_sha256": manifest_sha,
@@ -1056,14 +1193,29 @@ def verify_real_release(
 
     if not isinstance(att, dict) or set(att) != {"schema", "key_id", "key_fingerprint", "payload", "signature_base64"}:
         raise ValueError("invalid attestation structure or fields")
-    if att["schema"] != REAL_SIGNATURE_SCHEMA:
+    if att["schema"] not in REAL_SIGNATURE_SCHEMAS:
         raise ValueError(f"unsupported attestation schema: {att['schema']!r}")
 
     payload = att["payload"]
-    if not isinstance(payload, dict) or payload.get("schema") != REAL_PAYLOAD_SCHEMA:
+    if not isinstance(payload, dict) or payload.get("schema") not in REAL_PAYLOAD_SCHEMAS:
         raise ValueError("invalid attestation payload schema")
     if payload.get("dataset_type") != DATASET_TYPE_REAL:
         raise ValueError("attestation dataset_type mismatch")
+
+    # Domain separator selection
+    if att["schema"] == REAL_SIGNATURE_SCHEMA_V2 or payload.get("schema") == REAL_PAYLOAD_SCHEMA_V2:
+        domain_sep = DOMAIN_SEPARATOR_REAL_V2
+    else:
+        domain_sep = DOMAIN_SEPARATOR_REAL_V1
+
+    # Check prev_manifest_sha256 if v2
+    if payload.get("schema") == REAL_PAYLOAD_SCHEMA_V2:
+        if payload.get("prev_manifest_sha256") != manifest.get("prev_manifest_sha256"):
+            raise ValueError(
+                f"signed payload prev_manifest_sha256 mismatch with manifest: "
+                f"payload specifies {payload.get('prev_manifest_sha256')!r}, "
+                f"manifest specifies {manifest.get('prev_manifest_sha256')!r}"
+            )
 
     # P0: Enforce strict metadata agreement between attestation, payload, manifest, and trust
     key_id = att["key_id"]
@@ -1135,7 +1287,7 @@ def verify_real_release(
     if len(sig_raw) != 64:
         raise ValueError(f"invalid Ed25519 signature length: {len(sig_raw)} bytes")
 
-    message = DOMAIN_SEPARATOR_REAL + canonical_json(payload).encode("utf-8")
+    message = domain_sep + canonical_json(payload).encode("utf-8")
     try:
         Ed25519PublicKey.from_public_bytes(trusted_key.public_key_raw).verify(sig_raw, message)
     except InvalidSignature as exc:
@@ -1154,14 +1306,21 @@ def verify_real_release(
     if age_seconds > trust.max_age_seconds:
         raise ValueError(f"dataset is stale: age ({age_seconds:.0f}s) exceeds max_age_seconds ({trust.max_age_seconds}s)")
 
-    # 6. Monotonic Sequence & Anti-Rollback Verification
+    # 6. Monotonic Sequence, Hash Chain & Anti-Rollback Verification
     seq = payload["release_sequence"]
     if seq < trust.min_sequence:
         raise ValueError(f"release sequence {seq} is below trust min_sequence {trust.min_sequence}")
 
     anti_rollback_verified = False
+    hash_chain_verified = False
+    manifest_prev = manifest.get("prev_manifest_sha256")
+
     if sequence_tracker is not None:
         last_accepted = sequence_tracker.get_last_accepted_sequence(
+            payload["publisher"],
+            allow_uninitialized=allow_uninitialized_state,
+        )
+        last_digest = sequence_tracker.get_last_accepted_digest(
             payload["publisher"],
             allow_uninitialized=allow_uninitialized_state,
         )
@@ -1171,14 +1330,41 @@ def verify_real_release(
                 f"(last accepted sequence was {last_accepted}); rejection enforced for rollback protection"
             )
         if not allow_rollback:
-            sequence_tracker.update_accepted_sequence(
+            if last_accepted > 0:
+                if manifest_prev is not None:
+                    if last_digest is not None and manifest_prev != last_digest:
+                        raise ValueError(
+                            f"release hash chain broken for publisher '{payload['publisher']}': "
+                            f"manifest prev_manifest_sha256 '{manifest_prev}' does not match "
+                            f"last accepted manifest digest '{last_digest}'"
+                        )
+                    hash_chain_verified = True
+                elif trust.require_hash_chain:
+                    raise ValueError(
+                        f"release hash chain required by trust policy but release sequence {seq} "
+                        f"does not specify prev_manifest_sha256"
+                    )
+            else:
+                if seq == 1:
+                    hash_chain_verified = True
+                elif manifest_prev is not None:
+                    hash_chain_verified = True
+                elif trust.require_hash_chain:
+                    raise ValueError(
+                        f"release hash chain required by trust policy but release sequence {seq} "
+                        f"does not specify prev_manifest_sha256"
+                    )
+
+            sequence_tracker.update_accepted(
                 payload["publisher"],
                 seq,
+                manifest_sha256=manifest_sha,
                 allow_uninitialized=allow_uninitialized_state,
             )
             anti_rollback_verified = True
         else:
             anti_rollback_verified = False
+            hash_chain_verified = False
 
     return {
         "status": "AUTHENTICATED",
@@ -1188,8 +1374,10 @@ def verify_real_release(
         "evidence_integrity_valid": True,
         "publisher_authenticated": True,
         "anti_rollback_verified": anti_rollback_verified,
+        "hash_chain_verified": hash_chain_verified,
         "dataset_type": DATASET_TYPE_REAL,
         "release_sequence": seq,
+        "prev_manifest_sha256": manifest_prev,
         "total_observations": obs_count,
         "total_events": event_count,
         "manifest_sha256": manifest_sha,
@@ -1199,3 +1387,190 @@ def verify_real_release(
         "safe_to_autonomously_act": False,
         "publisher_real_world_identity_verified": False,
     }
+
+
+def generate_keypair(
+    out_dir: str | Path,
+    key_id: str,
+    *,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Generate a new Ed25519 signing keypair with strict file permissions.
+    
+    Writes:
+    - {out_dir}/{key_id}.priv: Private key PEM, mode 0600 (POSIX).
+    - {out_dir}/{key_id}.pub: Public key PEM, mode 0644.
+    - {out_dir}/{key_id}.meta.json: Key metadata (key_id, fingerprint, created_at, schema).
+    
+    Zero network access. Atomic write with fail-closed protection against overwrite.
+    """
+    if not isinstance(key_id, str) or not _KEY_ID_RE.fullmatch(key_id):
+        raise ValueError(f"invalid key_id: {key_id!r}")
+
+    out_p = Path(out_dir)
+    out_p.mkdir(parents=True, exist_ok=True)
+
+    priv_path = out_p / f"{key_id}.priv"
+    pub_path = out_p / f"{key_id}.pub"
+    meta_path = out_p / f"{key_id}.meta.json"
+
+    if not force:
+        for p in (priv_path, pub_path, meta_path):
+            if p.exists():
+                raise FileExistsError(f"key file already exists: '{p}' (use force=True to overwrite)")
+
+    _, Ed25519PrivateKey, _, serialization = _crypto()
+    priv_key = Ed25519PrivateKey.generate()
+    priv_pem = priv_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    pub_pem = priv_key.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    raw_public = _public_key_raw(priv_key)
+    fp = key_fingerprint(raw_public)
+
+    # Write private key with 0600 permissions
+    if os.name != "nt":
+        fd = os.open(str(priv_path), os.O_WRONLY | os.O_CREAT | (os.O_TRUNC if force else os.O_EXCL), 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(priv_pem)
+    else:
+        with priv_path.open("wb" if force else "xb") as f:
+            f.write(priv_pem)
+
+    # Write public key with 0644 permissions
+    if os.name != "nt":
+        fd = os.open(str(pub_path), os.O_WRONLY | os.O_CREAT | (os.O_TRUNC if force else os.O_EXCL), 0o644)
+        with os.fdopen(fd, "wb") as f:
+            f.write(pub_pem)
+    else:
+        with pub_path.open("wb" if force else "xb") as f:
+            f.write(pub_pem)
+
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    meta = {
+        "schema": "anie.operator-key-metadata.v1",
+        "key_id": key_id,
+        "key_fingerprint": fp,
+        "algorithm": "Ed25519",
+        "created_at": now_iso,
+        "private_key_file": priv_path.name,
+        "public_key_file": pub_path.name,
+    }
+
+    if os.name != "nt":
+        fd = os.open(str(meta_path), os.O_WRONLY | os.O_CREAT | (os.O_TRUNC if force else os.O_EXCL), 0o644)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(canonical_json(meta) + "\n")
+    else:
+        with meta_path.open("w" if force else "x", encoding="utf-8") as f:
+            f.write(canonical_json(meta) + "\n")
+
+    return {
+        "key_id": key_id,
+        "key_fingerprint": fp,
+        "private_key_path": str(priv_path),
+        "public_key_path": str(pub_path),
+        "metadata_path": str(meta_path),
+    }
+
+
+def inspect_candidate(directory: str | Path) -> dict[str, Any]:
+    """Inspect an unsigned release candidate bundle without requiring keys or trust configuration.
+    
+    Performs full structural and evidence verification (integrity_only=True) and extracts
+    operational intelligence summaries for human review before offline signing.
+    """
+    res = verify_real_release(directory, integrity_only=True)
+    dir_path = Path(directory)
+    _, _, manifest = _read_and_validate_manifest(dir_path)
+
+    domains: set[str] = set()
+    query_kinds: set[str] = set()
+    timestamps: list[str] = []
+
+    obs_path = dir_path / "real_observations.jsonl.gz"
+    with gzip.open(obs_path, "rb") as gz:
+        for _, line_bytes in _iter_bounded_gzip_records(gz, partition_name="real_observations.jsonl.gz"):
+            record = json.loads(line_bytes.decode("utf-8"))
+            if "subject" in record:
+                domains.add(record["subject"])
+            if "kind" in record:
+                query_kinds.add(record["kind"])
+            if "observed_at" in record:
+                timestamps.append(record["observed_at"])
+
+    observation_window = {
+        "first_seen": min(timestamps) if timestamps else None,
+        "last_seen": max(timestamps) if timestamps else None,
+    }
+
+    return {
+        "status": res["status"],
+        "manifest_sha256": res["manifest_sha256"],
+        "release_sequence": res["release_sequence"],
+        "prev_manifest_sha256": res["prev_manifest_sha256"],
+        "publisher": res["publisher_identity"],
+        "as_of": manifest.get("as_of"),
+        "published_at": manifest.get("published_at"),
+        "source_commit": manifest.get("source_commit"),
+        "total_observations": res["total_observations"],
+        "total_events": res["total_events"],
+        "observation_window": observation_window,
+        "domains": sorted(domains),
+        "query_kinds": sorted(query_kinds),
+        "partition_files": manifest.get("files", []),
+    }
+
+
+class AegisReleaseConsumer:
+    """Consumer interface for transactional verification and ingestion of ANIE releases into AEGIS.
+    
+    Guarantees that state updates (e.g. sequence tracker advancement) occur only if
+    complete cryptographic and referential verification passes.
+    """
+
+    def __init__(
+        self,
+        trust: RealReleaseTrust,
+        sequence_tracker: ReleaseSequenceTracker | None = None,
+        *,
+        allow_uninitialized_state: bool = False,
+    ):
+        self.trust = trust
+        self.sequence_tracker = sequence_tracker
+        self.allow_uninitialized_state = allow_uninitialized_state
+
+    def verify_and_load(
+        self,
+        directory: str | Path,
+        *,
+        now: str | None = None,
+        allow_rollback: bool = False,
+    ) -> tuple[dict[str, Any], list[RealObservation], list[RealCollectionEvent]]:
+        """Verify release integrity and provenance, advance tracker state, and load reconstructed models."""
+        res = verify_real_release(
+            directory,
+            trust=self.trust,
+            sequence_tracker=self.sequence_tracker,
+            now=now,
+            allow_rollback=allow_rollback,
+            allow_uninitialized_state=self.allow_uninitialized_state,
+        )
+
+        dir_path = Path(directory)
+        events: list[RealCollectionEvent] = []
+        with gzip.open(dir_path / "real_events.jsonl.gz", "rb") as gz:
+            for _, line in _iter_bounded_gzip_records(gz, partition_name="real_events.jsonl.gz"):
+                events.append(RealCollectionEvent.from_dict(json.loads(line.decode("utf-8"))))
+
+        observations: list[RealObservation] = []
+        with gzip.open(dir_path / "real_observations.jsonl.gz", "rb") as gz:
+            for _, line in _iter_bounded_gzip_records(gz, partition_name="real_observations.jsonl.gz"):
+                observations.append(RealObservation.from_dict(json.loads(line.decode("utf-8"))))
+
+        return res, observations, events

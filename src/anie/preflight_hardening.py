@@ -76,6 +76,7 @@ class SecurityPreflightReport:
     egress_status: str = "BLOCKED"
     firewall_status: str = "INACCESSIBLE"
     systemd_policy_verified: bool | None = None
+    signing_keys_absent: bool = True
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2)
@@ -311,6 +312,56 @@ def check_firewall_rule(
         )
 
 
+def check_no_signing_keys(
+    search_paths: list[str | Path] | None = None,
+) -> tuple[bool, str]:
+    """Assert that no private cryptographic signing keys exist in collector state directories.
+
+    Protects the collector/operator air-gap boundary: signing keys must only ever
+    reside in isolated operator environments and must never be staged or stored on the collector.
+    """
+    if search_paths is None:
+        search_paths = [Path("/var/lib/anie"), Path("/etc/anie")]
+
+    target_extensions = {".priv", ".key"}
+    pem_private_indicators = [
+        b"BEGIN PRIVATE KEY",
+        b"BEGIN EC PRIVATE KEY",
+        b"BEGIN RSA PRIVATE KEY",
+        b"BEGIN ED25519 PRIVATE KEY",
+        b"BEGIN OPENSSH PRIVATE KEY",
+    ]
+
+    for base in search_paths:
+        base_p = Path(base)
+        if not base_p.exists():
+            continue
+        try:
+            for root, dirs, files in os.walk(base_p):
+                for fname in files:
+                    fpath = Path(root) / fname
+                    if fpath.is_symlink():
+                        continue
+
+                    ext = fpath.suffix.lower()
+                    if ext in target_extensions or "id_ed25519" in fname.lower() or "id_rsa" in fname.lower():
+                        return False, f"Private signing key file detected at '{fpath}'; collector air-gap violated"
+
+                    try:
+                        sz = fpath.stat().st_size
+                        if 0 < sz <= 1048576:
+                            with fpath.open("rb") as f:
+                                head = f.read(1024)
+                                if any(ind in head for ind in pem_private_indicators):
+                                    return False, f"Private key PEM header detected in '{fpath}'; collector air-gap violated"
+                    except (OSError, PermissionError):
+                        continue
+        except (OSError, PermissionError):
+            continue
+
+    return True, "No private signing keys detected in collector directories"
+
+
 def run_security_preflight(
     require_firewall_rule: bool = False,
     imds_ip: str = DEFAULT_IMDS_IP,
@@ -320,6 +371,7 @@ def run_security_preflight(
     runner: Any = None,
     unit_name: str = "anie-pilot.service",
     systemd_runner: Any = None,
+    signing_key_paths: list[str | Path] | None = None,
 ) -> SecurityPreflightReport:
     """Execute complete fail-closed security preflight assertions."""
     checks: dict[str, str] = {}
@@ -346,7 +398,27 @@ def run_security_preflight(
     fw_res = check_firewall_rule(uid=uid, runner=runner)
     checks["firewall_rule"] = fw_res.message
 
+    # 5. Signing key isolation check
+    keys_absent, keys_msg = check_no_signing_keys(search_paths=signing_key_paths)
+    checks["no_signing_keys"] = keys_msg
+
     # --- FAIL-CLOSED EVALUATION ---
+
+    # Critical Assertion 0: Signing private keys must NEVER reside on collector
+    if not keys_absent:
+        return SecurityPreflightReport(
+            passed=False,
+            imds_blocked=imds_res.status == NetworkProbeStatus.BLOCKED,
+            egress_filter_active=egress_res.status == NetworkProbeStatus.BLOCKED,
+            firewall_rule_verified=fw_res.verified,
+            failure_reason=f"SECURITY FAILURE: {keys_msg}",
+            checks=checks,
+            imds_status=imds_res.status.value,
+            egress_status=egress_res.status.value,
+            firewall_status=fw_res.status.value,
+            systemd_policy_verified=systemd_policy_verified,
+            signing_keys_absent=False,
+        )
 
     # Critical Assertion A: IMDS must NEVER be accessible
     if imds_res.status == NetworkProbeStatus.ALLOWED:
@@ -361,6 +433,7 @@ def run_security_preflight(
             egress_status=egress_res.status.value,
             firewall_status=fw_res.status.value,
             systemd_policy_verified=systemd_policy_verified,
+            signing_keys_absent=True,
         )
 
     # Critical Assertion B: Unauthorized egress must NEVER be permitted
@@ -376,6 +449,7 @@ def run_security_preflight(
             egress_status=egress_res.status.value,
             firewall_status=fw_res.status.value,
             systemd_policy_verified=systemd_policy_verified,
+            signing_keys_absent=True,
         )
 
     # Assertion C: Egress isolation verification
@@ -400,6 +474,7 @@ def run_security_preflight(
                 egress_status=egress_res.status.value,
                 firewall_status=fw_res.status.value,
                 systemd_policy_verified=systemd_policy_verified,
+                signing_keys_absent=True,
             )
 
     # Assertion D: IMDS isolation verification
@@ -423,6 +498,7 @@ def run_security_preflight(
                 egress_status=egress_res.status.value,
                 firewall_status=fw_res.status.value,
                 systemd_policy_verified=systemd_policy_verified,
+                signing_keys_absent=True,
             )
 
     # Assertion E: Required firewall rule enforcement
@@ -439,6 +515,7 @@ def run_security_preflight(
                 egress_status=egress_res.status.value,
                 firewall_status=fw_res.status.value,
                 systemd_policy_verified=systemd_policy_verified,
+                signing_keys_absent=True,
             )
         elif fw_res.status == FirewallInspectionStatus.INACCESSIBLE:
             return SecurityPreflightReport(
@@ -452,6 +529,7 @@ def run_security_preflight(
                 egress_status=egress_res.status.value,
                 firewall_status=fw_res.status.value,
                 systemd_policy_verified=systemd_policy_verified,
+                signing_keys_absent=True,
             )
 
     return SecurityPreflightReport(
@@ -465,6 +543,7 @@ def run_security_preflight(
         egress_status=egress_res.status.value,
         firewall_status=fw_res.status.value,
         systemd_policy_verified=systemd_policy_verified,
+        signing_keys_absent=True,
     )
 
 
@@ -475,12 +554,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-firewall", action="store_true", help="enforce kernel firewall rule presence")
     parser.add_argument("--imds-ip", default=DEFAULT_IMDS_IP, help="target IMDS IP to verify blocked")
     parser.add_argument("--unit-name", default="anie-pilot.service", help="systemd unit name for policy verification")
+    parser.add_argument("--check-key-path", dest="check_key_paths", action="append", default=None, help="directory path to scan for forbidden private keys")
     args = parser.parse_args(argv)
 
     report = run_security_preflight(
         require_firewall_rule=args.require_firewall,
         imds_ip=args.imds_ip,
         unit_name=args.unit_name,
+        signing_key_paths=args.check_key_paths,
     )
 
     if not report.passed:
