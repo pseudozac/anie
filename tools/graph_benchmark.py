@@ -470,7 +470,7 @@ def run_benchmarks(
                 "target_ram_gb": 12,
                 "storage": "50 GB OCI Block Volume (~3000 IOPS / 480 MB/s)",
                 "free_tier_entitlement": "Always Free (2 OCPUs / 12 GB RAM)",
-                "expected_arm64_throughput": "1.2x - 1.8x local single-thread; zero memory pressure",
+                "target_specifications": "2 OCPUs, 12 GB RAM, 50 GB block volume (target hardware specification; no speculative projections)",
             },
         }
 
@@ -481,7 +481,7 @@ def run_benchmarks(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="ANIE M3.3.1 / M3.3.2 Graph and Storage Benchmark Suite")
+    parser = argparse.ArgumentParser(description="ANIE M3.4.1 Graph and Storage Benchmark Suite")
     parser.add_argument("--domains", type=int, default=100, help="number of domains in test workload (default: 100)")
     parser.add_argument("--rounds", type=int, default=1, help="number of repeated collection rounds (default: 1)")
     parser.add_argument("--scale", choices=["small", "10k", "100k"], default=None, help="preset scale benchmark (small: 300 obs, 10k: 10,000 obs, 100k: 100,000 obs)")
@@ -502,7 +502,7 @@ def main() -> int:
         print(json.dumps(results, indent=2))
     else:
         print("==============================================================================")
-        print("ANIE M3.4 GRAPH & STORAGE ARCHITECTURE BENCHMARK REPORT")
+        print("ANIE M3.4.1 GRAPH & STORAGE ARCHITECTURE BENCHMARK REPORT")
         print("==============================================================================")
         print(f"Workload: {results['workload']['num_domains']} domains x 3 resolvers x {results['workload']['rounds']} rounds ({results['workload']['total_observations']} observations)")
         print("\n--- INGESTION & STORAGE ---")
@@ -534,7 +534,7 @@ def main() -> int:
         print(f"Local Host:           {local['os']} {local['release']} ({local['architecture']}), Python {local['python_version']}")
         print(f"Oracle OCI Target:    {target['shape']} ({target['cpu_architecture']}, {target['target_ocpus']} OCPUs, {target['target_ram_gb']} GB RAM)")
         print(f"OCI Storage Specs:    {target['storage']}")
-        print(f"Performance Contrast: {target['expected_arm64_throughput']}")
+        print(f"Target Specs:         {target['target_specifications']}")
         print("==============================================================================")
 
     return 0

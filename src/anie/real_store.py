@@ -77,6 +77,18 @@ from .graph_models import GraphEdge, GraphNode, IntelligenceClaim
 
 CURRENT_SCHEMA_VERSION = 3
 
+_FTS_SYNC_ERRORS: list[str] = []
+
+
+def get_fts_sync_errors() -> list[str]:
+    """Retrieve observable FTS indexing errors."""
+    return list(_FTS_SYNC_ERRORS)
+
+
+def clear_fts_sync_errors() -> None:
+    """Clear observable FTS indexing error log."""
+    _FTS_SYNC_ERRORS.clear()
+
 
 def sync_node_to_fts(
     conn: sqlite3.Connection,
@@ -95,22 +107,22 @@ def sync_node_to_fts(
             "INSERT INTO intelligence_fts (entity_id, entity_type, title, body, tags) VALUES (?, ?, ?, ?, ?)",
             (node_id, "node", canonical_name, body, tags),
         )
-    except Exception:
-        pass
+    except sqlite3.Error as exc:
+        _FTS_SYNC_ERRORS.append(f"FTS sync error for node {node_id}: {exc}")
 
 
 def sync_claim_to_fts(conn: sqlite3.Connection, claim: IntelligenceClaim) -> None:
     """Synchronize an intelligence claim to the SQLite FTS5 search index."""
     try:
-        body = f"{claim.explanation} {claim.falsifiability_condition} {json.dumps(claim.properties)}"
+        body = f"{claim.explanation} {claim.falsifiability_condition or ''} {json.dumps(claim.properties)}"
         tags = f"claim {claim.claim_type} {claim.verification_state}"
         conn.execute("DELETE FROM intelligence_fts WHERE entity_id = ?", (claim.claim_id,))
         conn.execute(
             "INSERT INTO intelligence_fts (entity_id, entity_type, title, body, tags) VALUES (?, ?, ?, ?, ?)",
             (claim.claim_id, "claim", f"{claim.claim_type}: {claim.subject_uri}", body, tags),
         )
-    except Exception:
-        pass
+    except sqlite3.Error as exc:
+        _FTS_SYNC_ERRORS.append(f"FTS sync error for claim {claim.claim_id}: {exc}")
 
 
 def sync_discrepancy_to_fts(conn: sqlite3.Connection, report: RealDiscrepancyReport) -> None:
@@ -123,8 +135,8 @@ def sync_discrepancy_to_fts(conn: sqlite3.Connection, report: RealDiscrepancyRep
             "INSERT INTO intelligence_fts (entity_id, entity_type, title, body, tags) VALUES (?, ?, ?, ?, ?)",
             (report.analysis_id, "discrepancy", f"Discrepancy: {report.subject} ({report.kind})", body, tags),
         )
-    except Exception:
-        pass
+    except sqlite3.Error as exc:
+        _FTS_SYNC_ERRORS.append(f"FTS sync error for discrepancy {report.analysis_id}: {exc}")
 
 
 class RealObservationStore:
@@ -286,7 +298,7 @@ class RealObservationStore:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS intelligence_claims (
                 claim_id TEXT PRIMARY KEY,
-                subject_uri TEXT NOT NULL REFERENCES graph_nodes(node_id) ON DELETE CASCADE,
+                subject_uri TEXT NOT NULL,
                 claim_type TEXT NOT NULL,
                 layer TEXT NOT NULL,
                 asserted_at TEXT NOT NULL,
@@ -397,7 +409,7 @@ class RealObservationStore:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS intelligence_claims (
                     claim_id TEXT PRIMARY KEY,
-                    subject_uri TEXT NOT NULL REFERENCES graph_nodes(node_id) ON DELETE CASCADE,
+                    subject_uri TEXT NOT NULL,
                     claim_type TEXT NOT NULL,
                     layer TEXT NOT NULL,
                     asserted_at TEXT NOT NULL,
@@ -443,6 +455,33 @@ class RealObservationStore:
                     tokenize='unicode61 remove_diacritics 2'
                 )
             """)
+        if from_version < 4:
+            table_info = conn.execute("PRAGMA table_info(intelligence_claims)").fetchall()
+            if table_info:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS intelligence_claims_v4 (
+                        claim_id TEXT PRIMARY KEY,
+                        subject_uri TEXT NOT NULL,
+                        claim_type TEXT NOT NULL,
+                        layer TEXT NOT NULL,
+                        asserted_at TEXT NOT NULL,
+                        valid_from TEXT NOT NULL,
+                        valid_until TEXT,
+                        ruleset_version TEXT NOT NULL,
+                        confidence REAL NOT NULL,
+                        explanation TEXT NOT NULL,
+                        supporting_evidence_hashes_json TEXT NOT NULL,
+                        supporting_node_ids_json TEXT NOT NULL,
+                        analyst_identity TEXT,
+                        attestation_signature TEXT,
+                        payload TEXT NOT NULL
+                    )
+                """)
+                conn.execute("INSERT OR REPLACE INTO intelligence_claims_v4 SELECT * FROM intelligence_claims")
+                conn.execute("DROP TABLE intelligence_claims")
+                conn.execute("ALTER TABLE intelligence_claims_v4 RENAME TO intelligence_claims")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_claims_subject ON intelligence_claims(subject_uri)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_claims_time ON intelligence_claims(asserted_at)")
         conn.execute(f"PRAGMA user_version = {to_version}")
 
     def insert_record(
@@ -558,8 +597,9 @@ class RealObservationStore:
                 engine = GraphEngine(conn)
                 nodes, edges = engine.extract_from_observation(event, observation)
                 for node in nodes:
-                    engine.upsert_node(node)
-                    sync_node_to_fts(conn, node.node_id, node.node_type, node.canonical_name, node.layer, node.properties)
+                    is_new = engine.upsert_node(node)
+                    if is_new:
+                        sync_node_to_fts(conn, node.node_id, node.node_type, node.canonical_name, node.layer, node.properties)
                 for edge in edges:
                     engine.insert_edge(edge)
 
@@ -704,14 +744,22 @@ class RealObservationStore:
             if auto_sync_graph:
                 from .graph_engine import GraphEngine
                 engine = GraphEngine(conn)
+                unique_nodes: dict[str, GraphNode] = {}
+                batch_extracted_edges: list[GraphEdge] = []
                 for obs_id, (obs, _) in batch_observations.items():
                     ev = batch_events[obs.evidence_id][0]
                     nodes, edges = engine.extract_from_observation(ev, obs)
                     for node in nodes:
-                        engine.upsert_node(node)
+                        unique_nodes[node.node_id] = node
+                    batch_extracted_edges.extend(edges)
+
+                for node in unique_nodes.values():
+                    is_new = engine.upsert_node(node)
+                    if is_new:
                         sync_node_to_fts(conn, node.node_id, node.node_type, node.canonical_name, node.layer, node.properties)
-                    for edge in edges:
-                        engine.insert_edge(edge)
+
+                for edge in batch_extracted_edges:
+                    engine.insert_edge(edge)
 
             return (len(new_events), len(new_observations))
 
@@ -1259,15 +1307,53 @@ class RealObservationStore:
     def rebuild_graph_from_observations(self) -> tuple[int, int]:
         """Truncate and transactionally rebuild graph tables and search index from authoritative records.
         
-        Guarantees that the graph and searchable knowledge can be completely regenerated from authoritative records.
+        Guarantees that the graph and searchable knowledge can be completely regenerated from authoritative records,
+        while strictly preserving all independently authored, signed, validated, contested, or revoked intelligence claims.
         Returns (nodes_count, edges_count).
         """
         from .graph_engine import GraphEngine
         with self._connect() as conn:
+            # Preserve all existing claims to ensure complete zero-data-loss durability
+            existing_claims = conn.execute("SELECT payload FROM intelligence_claims").fetchall()
+
+            conn.execute("PRAGMA foreign_keys = OFF")
             conn.execute("DELETE FROM graph_edges")
             conn.execute("DELETE FROM graph_nodes")
             conn.execute("DELETE FROM intelligence_fts")
+            conn.execute("PRAGMA foreign_keys = ON")
             engine = GraphEngine(conn)
+
+            # Defensive restoration in case an unmigrated database had ON DELETE CASCADE
+            if existing_claims:
+                remaining_claims = conn.execute("SELECT COUNT(*) FROM intelligence_claims").fetchone()[0]
+                if remaining_claims == 0 and len(existing_claims) > 0:
+                    for (c_json,) in existing_claims:
+                        claim_obj = json.loads(c_json)
+                        conn.execute("""
+                            INSERT OR REPLACE INTO intelligence_claims (
+                                claim_id, subject_uri, claim_type, layer, asserted_at,
+                                valid_from, valid_until, ruleset_version, confidence,
+                                explanation, supporting_evidence_hashes_json,
+                                supporting_node_ids_json, analyst_identity,
+                                attestation_signature, payload
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            claim_obj["claim_id"],
+                            claim_obj["subject_uri"],
+                            claim_obj["claim_type"],
+                            claim_obj["layer"],
+                            claim_obj["asserted_at"],
+                            claim_obj["valid_from"],
+                            claim_obj.get("valid_until"),
+                            claim_obj["ruleset_version"],
+                            float(claim_obj["confidence"]),
+                            claim_obj["explanation"],
+                            json.dumps(claim_obj["supporting_evidence_hashes"]),
+                            json.dumps(claim_obj.get("supporting_node_ids", [])),
+                            claim_obj.get("analyst_identity"),
+                            claim_obj.get("attestation_signature"),
+                            c_json,
+                        ))
 
             # 1. Rebuild from real observations joined with real events
             obs_rows = conn.execute("""
@@ -1277,15 +1363,22 @@ class RealObservationStore:
                 ORDER BY o.observed_at ASC
             """).fetchall()
 
+            unique_nodes: dict[str, GraphNode] = {}
+            all_edges: list[GraphEdge] = []
             for obs_json, ev_json in obs_rows:
                 obs = RealObservation.from_dict(json.loads(obs_json))
                 ev = RealCollectionEvent.from_dict(json.loads(ev_json))
                 nodes, edges = engine.extract_from_observation(ev, obs)
                 for node in nodes:
-                    engine.upsert_node(node)
-                    sync_node_to_fts(conn, node.node_id, node.node_type, node.canonical_name, node.layer, node.properties)
-                for edge in edges:
-                    engine.insert_edge(edge)
+                    unique_nodes[node.node_id] = node
+                all_edges.extend(edges)
+
+            for node in unique_nodes.values():
+                engine.upsert_node(node)
+                sync_node_to_fts(conn, node.node_id, node.node_type, node.canonical_name, node.layer, node.properties)
+
+            for edge in all_edges:
+                engine.insert_edge(edge)
 
             # 2. Rebuild from real discrepancies
             disc_rows = conn.execute("SELECT payload FROM real_discrepancies ORDER BY analyzed_at ASC").fetchall()
@@ -1298,14 +1391,14 @@ class RealObservationStore:
                     engine.insert_edge(edge)
                 sync_discrepancy_to_fts(conn, disc)
 
-            # 3. Ensure nodes and FTS exist for any registered intelligence claims
+            # 3. Ensure nodes and FTS exist for all preserved intelligence claims
             claim_rows = conn.execute("SELECT payload FROM intelligence_claims").fetchall()
             for (c_json,) in claim_rows:
                 claim = IntelligenceClaim.from_dict(json.loads(c_json))
                 node_exists = conn.execute("SELECT 1 FROM graph_nodes WHERE node_id = ?", (claim.subject_uri,)).fetchone()
                 if not node_exists:
                     c_name = claim.subject_uri.split(":")[-1]
-                    n_type = "domain" if ":domain:" in claim.subject_uri else "claim"
+                    n_type = "domain" if ":domain:" in claim.subject_uri else ("ip" if ":ip:" in claim.subject_uri else "claim")
                     conn.execute("""
                         INSERT INTO graph_nodes (
                             node_id, node_type, canonical_name, layer,
@@ -1317,6 +1410,50 @@ class RealObservationStore:
             nodes_count = conn.execute("SELECT COUNT(*) FROM graph_nodes").fetchone()[0]
             edges_count = conn.execute("SELECT COUNT(*) FROM graph_edges").fetchone()[0]
             return nodes_count, edges_count
+
+    def reindex_fts(self) -> dict[str, int]:
+        """Deterministically wipe and rebuild SQLite FTS5 search index from source tables."""
+        with self._connect() as conn:
+            conn.execute("DELETE FROM intelligence_fts")
+            # 1. Nodes
+            node_rows = conn.execute("SELECT node_id, node_type, canonical_name, layer, properties_json FROM graph_nodes").fetchall()
+            for n_id, n_type, c_name, layer, props_json in node_rows:
+                props = json.loads(props_json) if props_json else {}
+                sync_node_to_fts(conn, n_id, n_type, c_name, layer, props)
+            # 2. Claims
+            claim_rows = conn.execute("SELECT payload FROM intelligence_claims").fetchall()
+            for (c_json,) in claim_rows:
+                claim = IntelligenceClaim.from_dict(json.loads(c_json))
+                sync_claim_to_fts(conn, claim)
+            # 3. Discrepancies
+            disc_rows = conn.execute("SELECT payload FROM real_discrepancies").fetchall()
+            for (d_json,) in disc_rows:
+                disc = RealDiscrepancyReport.from_dict(json.loads(d_json))
+                sync_discrepancy_to_fts(conn, disc)
+
+            fts_count = conn.execute("SELECT COUNT(*) FROM intelligence_fts").fetchone()[0]
+            return {
+                "nodes_indexed": len(node_rows),
+                "claims_indexed": len(claim_rows),
+                "discrepancies_indexed": len(disc_rows),
+                "total_fts_rows": fts_count,
+            }
+
+    def verify_fts_integrity(self) -> dict[str, Any]:
+        """Verify that FTS index row count corresponds to source graph entities and claims."""
+        with self._connect() as conn:
+            nodes_count = conn.execute("SELECT COUNT(*) FROM graph_nodes").fetchone()[0]
+            claims_count = conn.execute("SELECT COUNT(*) FROM intelligence_claims").fetchone()[0]
+            disc_count = conn.execute("SELECT COUNT(*) FROM real_discrepancies").fetchone()[0]
+            fts_count = conn.execute("SELECT COUNT(*) FROM intelligence_fts").fetchone()[0]
+            return {
+                "nodes_count": nodes_count,
+                "claims_count": claims_count,
+                "discrepancies_count": disc_count,
+                "fts_count": fts_count,
+                "is_consistent": fts_count >= (claims_count + disc_count),
+                "sync_errors": get_fts_sync_errors(),
+            }
 
     def search_intelligence(
         self,
