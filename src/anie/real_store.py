@@ -57,6 +57,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -253,6 +254,22 @@ class RealObservationStore:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_claims_subject ON intelligence_claims(subject_uri)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_claims_time ON intelligence_claims(asserted_at)")
 
+        # 5. Consumer Release Journal (Milestone M3.3.2)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS consumer_releases (
+                publisher TEXT NOT NULL,
+                release_sequence INTEGER NOT NULL,
+                manifest_sha256 TEXT NOT NULL,
+                accepted_at TEXT NOT NULL,
+                total_observations INTEGER NOT NULL,
+                total_events INTEGER NOT NULL,
+                total_discrepancies INTEGER NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('COMMITTED', 'INSPECTION')),
+                PRIMARY KEY (publisher, release_sequence)
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_consumer_releases_pub ON consumer_releases(publisher, release_sequence)")
+
     def _migrate(self, conn: sqlite3.Connection, from_version: int, to_version: int) -> None:
         """Incremental database schema migration framework."""
         if from_version < 2:
@@ -335,14 +352,36 @@ class RealObservationStore:
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_claims_subject ON intelligence_claims(subject_uri)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_claims_time ON intelligence_claims(asserted_at)")
+
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS consumer_releases (
+                    publisher TEXT NOT NULL,
+                    release_sequence INTEGER NOT NULL,
+                    manifest_sha256 TEXT NOT NULL,
+                    accepted_at TEXT NOT NULL,
+                    total_observations INTEGER NOT NULL,
+                    total_events INTEGER NOT NULL,
+                    total_discrepancies INTEGER NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('COMMITTED', 'INSPECTION')),
+                    PRIMARY KEY (publisher, release_sequence)
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_consumer_releases_pub ON consumer_releases(publisher, release_sequence)")
         conn.execute(f"PRAGMA user_version = {to_version}")
 
-    def insert_record(self, event: RealCollectionEvent, observation: RealObservation) -> bool:
+    def insert_record(
+        self,
+        event: RealCollectionEvent,
+        observation: RealObservation,
+        *,
+        auto_sync_graph: bool = True,
+    ) -> bool:
         """Atomically insert a provenance event and its dependent observation.
         
         Strict Idempotency:
         - If an identical record exists, it is accepted as an idempotent no-op (returns False).
         - If a conflicting record with matching identifier exists, IntegrityError is raised.
+        - Automatically synchronizes graph nodes and edges in the SAME transaction (auto_sync_graph=True).
         
         Returns True if the observation was newly inserted, False if already present identically.
         """
@@ -407,6 +446,14 @@ class RealObservationStore:
                     raise sqlite3.IntegrityError(
                         f"conflicting real_observation with matching observation_id {observation.observation_id}"
                     )
+                if auto_sync_graph:
+                    from .graph_engine import GraphEngine
+                    engine = GraphEngine(conn)
+                    nodes, edges = engine.extract_from_observation(event, observation)
+                    for node in nodes:
+                        engine.upsert_node(node)
+                    for edge in edges:
+                        engine.insert_edge(edge)
                 return False
             else:
                 conn.execute("""
@@ -429,11 +476,23 @@ class RealObservationStore:
                     observation.confidence,
                     obs_canonical,
                 ))
-                return True
+
+            if auto_sync_graph:
+                from .graph_engine import GraphEngine
+                engine = GraphEngine(conn)
+                nodes, edges = engine.extract_from_observation(event, observation)
+                for node in nodes:
+                    engine.upsert_node(node)
+                for edge in edges:
+                    engine.insert_edge(edge)
+
+            return True
 
     def insert_batch(
         self,
         records: Iterable[tuple[RealCollectionEvent, RealObservation]],
+        *,
+        auto_sync_graph: bool = True,
     ) -> tuple[int, int]:
         """Atomically insert a batch of (event, observation) pairs.
         
@@ -563,6 +622,18 @@ class RealObservationStore:
                         synthetic, confidence, payload
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, new_observations)
+
+            # 4. Automatic Graph Synchronization (M3.3.2)
+            if auto_sync_graph:
+                from .graph_engine import GraphEngine
+                engine = GraphEngine(conn)
+                for obs_id, (obs, _) in batch_observations.items():
+                    ev = batch_events[obs.evidence_id][0]
+                    nodes, edges = engine.extract_from_observation(ev, obs)
+                    for node in nodes:
+                        engine.upsert_node(node)
+                    for edge in edges:
+                        engine.insert_edge(edge)
 
             return (len(new_events), len(new_observations))
 
@@ -776,12 +847,13 @@ class RealObservationStore:
 
     # --- Multi-Resolver Discrepancy & Historical Intelligence ---
 
-    def insert_discrepancy(self, report: RealDiscrepancyReport) -> bool:
+    def insert_discrepancy(self, report: RealDiscrepancyReport, *, auto_sync_graph: bool = True) -> bool:
         """Atomically insert a multi-resolver discrepancy analysis report.
         
         Strict Idempotency:
         - If an identical record exists, returns False.
         - If conflicting data with identical analysis_id exists, raises sqlite3.IntegrityError.
+        - Automatically synchronizes graph nodes and edges in the SAME transaction (auto_sync_graph=True).
         """
         payload_json = canonical_json(report.to_dict())
         with self._connect() as conn:
@@ -791,6 +863,13 @@ class RealObservationStore:
             ).fetchone()
             if row is not None:
                 if row[0] == payload_json:
+                    if auto_sync_graph:
+                        from .graph_engine import GraphEngine
+                        engine = GraphEngine(conn)
+                        node, edges = engine.extract_from_discrepancy(report)
+                        engine.upsert_node(node)
+                        for edge in edges:
+                            engine.insert_edge(edge)
                     return False
                 raise sqlite3.IntegrityError(
                     f"conflicting discrepancy record with identical analysis_id '{report.analysis_id}'"
@@ -814,6 +893,13 @@ class RealObservationStore:
                     payload_json,
                 ),
             )
+            if auto_sync_graph:
+                from .graph_engine import GraphEngine
+                engine = GraphEngine(conn)
+                node, edges = engine.extract_from_discrepancy(report)
+                engine.upsert_node(node)
+                for edge in edges:
+                    engine.insert_edge(edge)
             return True
 
     def get_discrepancy(self, analysis_id: str) -> RealDiscrepancyReport | None:
@@ -985,11 +1071,9 @@ class RealObservationStore:
             nodes, edges = engine.extract_from_observation(event, observation)
             for node in nodes:
                 engine.upsert_node(node)
-            inserted_edges = 0
             for edge in edges:
-                if engine.insert_edge(edge):
-                    inserted_edges += 1
-            return len(nodes), inserted_edges
+                engine.insert_edge(edge)
+            return len(nodes), len(edges)
 
     def sync_discrepancy_to_graph(
         self,
@@ -1004,12 +1088,9 @@ class RealObservationStore:
             engine = GraphEngine(conn)
             node, edges = engine.extract_from_discrepancy(report)
             engine.upsert_node(node)
-            inserted_edges = 0
             for edge in edges:
-                # Ensure target nodes exist
                 engine.insert_edge(edge)
-                inserted_edges += 1
-            return 1, inserted_edges
+            return 1, len(edges)
 
     def insert_claim(self, claim: IntelligenceClaim) -> bool:
         """Insert an attributable intelligence claim into intelligence_claims table."""
@@ -1092,3 +1173,225 @@ class RealObservationStore:
                 (limit,),
             ).fetchall()
             return [IntelligenceClaim.from_dict(json.loads(r[0])) for r in rows]
+
+    def rebuild_graph_from_observations(self) -> tuple[int, int]:
+        """Truncate and transactionally rebuild graph tables from authoritative observations and discrepancies.
+        
+        Guarantees that the graph can be completely regenerated from authoritative Layer 1 and 2 records.
+        Returns (nodes_count, edges_count).
+        """
+        from .graph_engine import GraphEngine
+        with self._connect() as conn:
+            conn.execute("DELETE FROM graph_edges")
+            conn.execute("DELETE FROM graph_nodes")
+            engine = GraphEngine(conn)
+
+            # 1. Rebuild from real observations joined with real events
+            obs_rows = conn.execute("""
+                SELECT o.payload, e.payload
+                FROM real_observations o
+                JOIN real_events e ON e.event_id = o.evidence_id
+                ORDER BY o.observed_at ASC
+            """).fetchall()
+
+            for obs_json, ev_json in obs_rows:
+                obs = RealObservation.from_dict(json.loads(obs_json))
+                ev = RealCollectionEvent.from_dict(json.loads(ev_json))
+                nodes, edges = engine.extract_from_observation(ev, obs)
+                for node in nodes:
+                    engine.upsert_node(node)
+                for edge in edges:
+                    engine.insert_edge(edge)
+
+            # 2. Rebuild from real discrepancies
+            disc_rows = conn.execute("SELECT payload FROM real_discrepancies ORDER BY analyzed_at ASC").fetchall()
+            for (disc_json,) in disc_rows:
+                disc = RealDiscrepancyReport.from_dict(json.loads(disc_json))
+                node, edges = engine.extract_from_discrepancy(disc)
+                engine.upsert_node(node)
+                for edge in edges:
+                    engine.insert_edge(edge)
+
+            # 3. Ensure nodes exist for any registered intelligence claims
+            claim_rows = conn.execute("SELECT subject_uri, layer, asserted_at FROM intelligence_claims").fetchall()
+            for s_uri, l_val, ass_at in claim_rows:
+                node_exists = conn.execute("SELECT 1 FROM graph_nodes WHERE node_id = ?", (s_uri,)).fetchone()
+                if not node_exists:
+                    c_name = s_uri.split(":")[-1]
+                    n_type = "domain" if ":domain:" in s_uri else "claim"
+                    conn.execute("""
+                        INSERT INTO graph_nodes (
+                            node_id, node_type, canonical_name, layer,
+                            first_observed_at, last_observed_at, properties_json, payload
+                        ) VALUES (?, ?, ?, ?, ?, ?, '{}', '{}')
+                    """, (s_uri, n_type, c_name, l_val, ass_at, ass_at))
+
+            nodes_count = conn.execute("SELECT COUNT(*) FROM graph_nodes").fetchone()[0]
+            edges_count = conn.execute("SELECT COUNT(*) FROM graph_edges").fetchone()[0]
+            return nodes_count, edges_count
+
+    def ingest_release_bundle(
+        self,
+        observations: list[RealObservation],
+        events: list[RealCollectionEvent],
+        discrepancies: list[RealDiscrepancyReport] | None = None,
+        *,
+        publisher: str,
+        release_sequence: int,
+        manifest_sha256: str,
+        is_historical: bool = False,
+    ) -> bool:
+        """Atomically persist a verified release bundle and advance the consumer release journal.
+        
+        Transactional Guarantee:
+        - All events, observations, discrepancies, graph syncs, and the consumer release record
+          are committed in a SINGLE SQLite transaction.
+        - If a crash or error occurs at any point during persistence, all records are rolled back.
+        - Historical inspection (is_historical=True) persists data without advancing the release journal.
+        - Returns True if newly committed, False if already present identically (idempotent).
+        """
+        discrepancies = discrepancies or []
+        events_by_id = {ev.event_id: ev for ev in events}
+
+        with self._connect() as conn:
+            # Check consumer_releases journal
+            if not is_historical:
+                row = conn.execute(
+                    "SELECT manifest_sha256, status FROM consumer_releases WHERE publisher = ? AND release_sequence = ?",
+                    (publisher, release_sequence),
+                ).fetchone()
+                if row is not None:
+                    if row[0] == manifest_sha256:
+                        # Already committed identically: idempotent success
+                        return False
+                    raise sqlite3.IntegrityError(
+                        f"conflicting release for publisher '{publisher}' sequence {release_sequence}: "
+                        f"existing manifest SHA-256 '{row[0]}' != incoming '{manifest_sha256}'"
+                    )
+
+            from .graph_engine import GraphEngine
+            engine = GraphEngine(conn)
+
+            # Persist events & observations
+            for obs in observations:
+                ev = events_by_id.get(obs.evidence_id)
+                if ev is None:
+                    # Check if event already exists in database
+                    ev_row = conn.execute("SELECT payload FROM real_events WHERE event_id = ?", (obs.evidence_id,)).fetchone()
+                    if ev_row is None:
+                        raise ValueError(f"missing supporting event {obs.evidence_id} for observation {obs.observation_id}")
+                    ev = RealCollectionEvent.from_dict(json.loads(ev_row[0]))
+
+                # Insert event if not present
+                ev_canonical = canonical_json(ev.to_dict())
+                existing_ev = conn.execute("SELECT payload FROM real_events WHERE event_id = ?", (ev.event_id,)).fetchone()
+                if existing_ev is None:
+                    conn.execute("""
+                        INSERT INTO real_events (
+                            event_id, schema, subject, kind, observed_at,
+                            response_code, raw_sha256, raw_evidence_status,
+                            raw_payload, payload
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        ev.event_id, REAL_EVENT_SCHEMA, ev.request.subject, ev.request.kind,
+                        ev.observed_at, ev.response_code, ev.raw_sha256, ev.raw_evidence_status,
+                        ev.raw_payload, ev_canonical
+                    ))
+                elif existing_ev[0] != ev_canonical:
+                    raise sqlite3.IntegrityError(f"conflicting real_event with event_id {ev.event_id}")
+
+                # Insert observation if not present
+                obs_canonical = canonical_json(obs.to_dict())
+                existing_obs = conn.execute("SELECT payload FROM real_observations WHERE observation_id = ?", (obs.observation_id,)).fetchone()
+                if existing_obs is None:
+                    conn.execute("""
+                        INSERT INTO real_observations (
+                            observation_id, evidence_id, subject_type, subject,
+                            kind, observed_at, status, source_id, method,
+                            synthetic, confidence, payload
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        obs.observation_id, obs.evidence_id,
+                        "domain" if obs.kind in {"dns_a", "dns_aaaa"} else "ip",
+                        obs.subject, obs.kind, obs.observed_at, obs.status, obs.source_id,
+                        obs.method, 0, obs.confidence, obs_canonical
+                    ))
+                elif existing_obs[0] != obs_canonical:
+                    raise sqlite3.IntegrityError(f"conflicting real_observation with observation_id {obs.observation_id}")
+
+                # Automatic graph sync
+                nodes, edges = engine.extract_from_observation(ev, obs)
+                for node in nodes:
+                    engine.upsert_node(node)
+                for edge in edges:
+                    engine.insert_edge(edge)
+
+            # Persist discrepancies
+            for disc in discrepancies:
+                disc_canonical = canonical_json(disc.to_dict())
+                existing_disc = conn.execute("SELECT payload FROM real_discrepancies WHERE analysis_id = ?", (disc.analysis_id,)).fetchone()
+                if existing_disc is None:
+                    conn.execute("""
+                        INSERT INTO real_discrepancies (
+                            analysis_id, subject, kind, analyzed_at, verdict, category, confidence, ruleset_version, payload
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        disc.analysis_id, disc.subject, disc.kind, disc.analyzed_at,
+                        disc.verdict, disc.category, disc.confidence, disc.ruleset_version, disc_canonical
+                    ))
+                elif existing_disc[0] != disc_canonical:
+                    raise sqlite3.IntegrityError(f"conflicting real_discrepancy with analysis_id {disc.analysis_id}")
+
+                node, edges = engine.extract_from_discrepancy(disc)
+                engine.upsert_node(node)
+                for edge in edges:
+                    engine.insert_edge(edge)
+
+            # Record consumer release
+            if not is_historical:
+                now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+                conn.execute("""
+                    INSERT INTO consumer_releases (
+                        publisher, release_sequence, manifest_sha256, accepted_at,
+                        total_observations, total_events, total_discrepancies, status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'COMMITTED')
+                """, (
+                    publisher, release_sequence, manifest_sha256, now_iso,
+                    len(observations), len(events), len(discrepancies)
+                ))
+
+            return True
+
+    def get_last_consumer_release_sequence(self, publisher: str) -> int:
+        """Return the highest committed release sequence for the given publisher."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT MAX(release_sequence) FROM consumer_releases WHERE publisher = ? AND status = 'COMMITTED'",
+                (publisher,),
+            ).fetchone()
+            return int(row[0]) if row and row[0] is not None else 0
+
+    def get_consumer_release(self, publisher: str, release_sequence: int) -> dict[str, Any] | None:
+        """Return journal record for specific publisher and sequence."""
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT publisher, release_sequence, manifest_sha256, accepted_at,
+                       total_observations, total_events, total_discrepancies, status
+                FROM consumer_releases
+                WHERE publisher = ? AND release_sequence = ?
+                """,
+                (publisher, release_sequence),
+            ).fetchone()
+            if row is None:
+                return None
+            return {
+                "publisher": row[0],
+                "release_sequence": row[1],
+                "manifest_sha256": row[2],
+                "accepted_at": row[3],
+                "total_observations": row[4],
+                "total_events": row[5],
+                "total_discrepancies": row[6],
+                "status": row[7],
+            }

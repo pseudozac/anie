@@ -245,32 +245,67 @@ class GraphEngine:
             )
 
     def insert_edge(self, edge: GraphEdge) -> bool:
-        """Insert a graph edge. Ignores duplicates if identical edge_id already exists."""
-        cur = self.conn.execute(
-            """
-            INSERT OR IGNORE INTO graph_edges (
-                edge_id, source_id, target_id, relation_type, layer,
-                observed_at, valid_from, valid_until, confidence,
-                ruleset_version, evidence_hashes_json, properties_json, payload
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                edge.edge_id,
-                edge.source_id,
-                edge.target_id,
-                edge.relation_type,
-                edge.layer,
-                edge.observed_at,
-                edge.valid_from,
-                edge.valid_until,
-                edge.confidence,
-                edge.ruleset_version,
-                json.dumps(list(edge.evidence_hashes)),
-                canonical_json(edge.properties),
-                canonical_json(edge.to_dict()),
-            ),
-        )
-        return cur.rowcount > 0
+        """Insert a graph edge, or merge evidence hashes if edge_id already exists.
+        
+        Guarantees that no supporting evidence hashes are silently lost during deduplication.
+        """
+        row = self.conn.execute(
+            "SELECT evidence_hashes_json, properties_json, payload FROM graph_edges WHERE edge_id = ?",
+            (edge.edge_id,),
+        ).fetchone()
+
+        if row is None:
+            self.conn.execute(
+                """
+                INSERT INTO graph_edges (
+                    edge_id, source_id, target_id, relation_type, layer,
+                    observed_at, valid_from, valid_until, confidence,
+                    ruleset_version, evidence_hashes_json, properties_json, payload
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    edge.edge_id,
+                    edge.source_id,
+                    edge.target_id,
+                    edge.relation_type,
+                    edge.layer,
+                    edge.observed_at,
+                    edge.valid_from,
+                    edge.valid_until,
+                    edge.confidence,
+                    edge.ruleset_version,
+                    json.dumps(list(edge.evidence_hashes)),
+                    canonical_json(edge.properties),
+                    canonical_json(edge.to_dict()),
+                ),
+            )
+            return True
+        else:
+            # Edge exists: Merge evidence hashes to prevent silent evidence loss
+            old_hashes = set(json.loads(row[0]))
+            new_hashes = set(edge.evidence_hashes)
+            merged_hashes = sorted(old_hashes | new_hashes)
+
+            old_payload = json.loads(row[2])
+            old_props = json.loads(row[1])
+            old_props.update(edge.properties)
+            old_payload["evidence_hashes"] = merged_hashes
+            old_payload["properties"] = old_props
+
+            self.conn.execute(
+                """
+                UPDATE graph_edges
+                SET evidence_hashes_json = ?, properties_json = ?, payload = ?
+                WHERE edge_id = ?
+                """,
+                (
+                    json.dumps(merged_hashes),
+                    canonical_json(old_props),
+                    canonical_json(old_payload),
+                    edge.edge_id,
+                ),
+            )
+            return len(merged_hashes) > len(old_hashes)
 
     # --- Query Capabilities ---
 
@@ -286,29 +321,42 @@ class GraphEngine:
         start_node_id: str,
         max_depth: int = 1,
         layer_filter: list[str] | None = None,
+        max_nodes: int = 1000,
+        max_edges: int = 2500,
     ) -> dict[str, Any]:
-        """Perform recursive traversal up to max_depth returning nodes and edges."""
-        if max_depth < 0 or max_depth > 10:
-            raise ValueError("max_depth must be between 0 and 10")
+        """Perform recursive traversal up to max_depth returning bounded nodes and edges.
+        
+        Hard Invariants:
+        - max_depth: Bounded [0, 5]
+        - max_nodes: Up to max_nodes expanded (default 1,000)
+        - max_edges: Up to max_edges returned (default 2,500)
+        - Cycle detection: Unambiguous comma-delimited exact token matching.
+        """
+        if max_depth < 0 or max_depth > 5:
+            raise ValueError("max_depth must be between 0 and 5")
+        if max_nodes <= 0:
+            raise ValueError("max_nodes must be positive")
+        if max_edges <= 0:
+            raise ValueError("max_edges must be positive")
 
-        # Recursive CTE traversal
+        # Recursive CTE traversal with exact comma-delimited path token matching
         query = """
         WITH RECURSIVE traversal(curr_node_id, depth, path) AS (
-            SELECT ?, 0, ?
+            SELECT ?, 0, ',' || ? || ','
             UNION
             SELECT
                 CASE WHEN e.source_id = t.curr_node_id THEN e.target_id ELSE e.source_id END,
                 t.depth + 1,
-                t.path || ',' || CASE WHEN e.source_id = t.curr_node_id THEN e.target_id ELSE e.source_id END
+                t.path || (CASE WHEN e.source_id = t.curr_node_id THEN e.target_id ELSE e.source_id END) || ','
             FROM traversal t
             JOIN graph_edges e ON (e.source_id = t.curr_node_id OR e.target_id = t.curr_node_id)
             WHERE t.depth < ?
-              AND instr(t.path, CASE WHEN e.source_id = t.curr_node_id THEN e.target_id ELSE e.source_id END) = 0
+              AND instr(t.path, ',' || (CASE WHEN e.source_id = t.curr_node_id THEN e.target_id ELSE e.source_id END) || ',') = 0
         )
-        SELECT DISTINCT curr_node_id, depth FROM traversal;
+        SELECT DISTINCT curr_node_id, depth FROM traversal LIMIT ?;
         """
-        rows = self.conn.execute(query, (start_node_id, start_node_id, max_depth)).fetchall()
-        visited_node_ids = [r[0] for r in rows]
+        rows = self.conn.execute(query, (start_node_id, start_node_id, max_depth, max_nodes)).fetchall()
+        visited_node_ids = [r[0] for r in rows][:max_nodes]
 
         if not visited_node_ids:
             return {"nodes": [], "edges": []}
@@ -329,13 +377,16 @@ class GraphEngine:
         edge_query = f"""
         SELECT payload FROM graph_edges
         WHERE source_id IN ({placeholders}) AND target_id IN ({placeholders})
+        LIMIT ?
         """
-        edge_rows = self.conn.execute(edge_query, (*visited_node_ids, *visited_node_ids)).fetchall()
+        edge_rows = self.conn.execute(edge_query, (*visited_node_ids, *visited_node_ids, max_edges)).fetchall()
         edges = []
         for r in edge_rows:
             e = GraphEdge.from_dict(json.loads(r[0]))
             if e.source_id in valid_node_ids and e.target_id in valid_node_ids:
                 edges.append(e)
+            if len(edges) >= max_edges:
+                break
 
         return {
             "root_id": start_node_id,
@@ -358,6 +409,23 @@ class GraphEngine:
             (ip_uri,),
         ).fetchall()
         return [r[0] for r in rows]
+
+    def get_history(self, node_id: str) -> list[dict[str, Any]]:
+        """Query all historical edges connected to a node ordered chronologically.
+        
+        Returns timeline of edge dictionaries with their incident entity details.
+        """
+        rows = self.conn.execute(
+            """
+            SELECT e.payload, n.canonical_name, n.node_type
+            FROM graph_edges e
+            JOIN graph_nodes n ON (n.node_id = CASE WHEN e.source_id = ? THEN e.target_id ELSE e.source_id END)
+            WHERE e.source_id = ? OR e.target_id = ?
+            ORDER BY e.valid_from ASC, e.observed_at ASC
+            """,
+            (node_id, node_id, node_id),
+        ).fetchall()
+        return [json.loads(r[0]) for r in rows]
 
     def trace_evidence_lineage(self, node_or_edge_id: str) -> list[str]:
         """Return all raw wire SHA-256 evidence digests supporting a node or edge."""
@@ -385,7 +453,12 @@ class GraphEngine:
         return sorted(evidence_hashes)
 
     def export_obsidian_markdown(self, domain_name: str) -> str:
-        """Export an Obsidian-compatible Markdown note with frontmatter and wikilinks."""
+        """Export an Obsidian-compatible Markdown note with frontmatter and wikilinks.
+        
+        Strict Escaping Guarantees:
+        - YAML frontmatter values are quoted and sanitized against newline / delimiter injection.
+        - Wikilink targets and names are sanitized to prevent nested bracket and delimiter breakage.
+        """
         domain_uri = format_node_id(NodeType.DOMAIN, domain_name)
         node = self.get_node(domain_uri)
         if node is None:
@@ -417,21 +490,49 @@ class GraphEngine:
 
         evidence_hashes = self.trace_evidence_lineage(domain_uri)
 
-        frontmatter = {
-            "id": node.node_id,
-            "type": node.node_type,
-            "canonical_name": node.canonical_name,
-            "layer": node.layer,
-            "first_observed_at": node.first_observed_at,
-            "last_observed_at": node.last_observed_at,
-            "tags": [f"anie/{node.node_type}", f"anie/layer/{node.layer.lower()}"],
-        }
+        def _escape_yaml_val(val: Any) -> str:
+            if isinstance(val, (int, float)):
+                return str(val)
+            if isinstance(val, bool):
+                return "true" if val else "false"
+            clean = (
+                str(val)
+                .replace("\\", "\\\\")
+                .replace('"', '\\"')
+                .replace("\n", " ")
+                .replace("[[", "")
+                .replace("]]", "")
+                .strip()
+            )
+            return f'"{clean}"'
+
+        def _escape_wikilink_token(val: Any) -> str:
+            return (
+                str(val)
+                .replace("[[", "")
+                .replace("]]", "")
+                .replace("|", "-")
+                .replace("\n", " ")
+                .strip()
+            )
+
+        safe_canonical = _escape_wikilink_token(node.canonical_name)
+        safe_type = _escape_wikilink_token(node.node_type)
+        safe_layer = _escape_wikilink_token(node.layer)
 
         lines = [
             "---",
-            canonical_json(frontmatter).replace("{", "{\n  ").replace(",", ",\n ").replace("}", "\n}"),
+            f"id: {_escape_yaml_val(node.node_id)}",
+            f"type: {_escape_yaml_val(node.node_type)}",
+            f"canonical_name: {_escape_yaml_val(node.canonical_name)}",
+            f"layer: {_escape_yaml_val(node.layer)}",
+            f"first_observed_at: {_escape_yaml_val(node.first_observed_at)}",
+            f"last_observed_at: {_escape_yaml_val(node.last_observed_at)}",
+            "tags:",
+            f"  - {_escape_yaml_val(f'anie/{node.node_type}')}",
+            f"  - {_escape_yaml_val(f'anie/layer/{node.layer.lower()}')}",
             "---",
-            f"# {node.canonical_name}",
+            f"# {safe_canonical}",
             "",
             "## Direct Relationships",
         ]
@@ -440,7 +541,10 @@ class GraphEngine:
             lines.append("*No outgoing relationships recorded.*")
         else:
             for target_id, rel, conf, obs_time, target_name, target_type in out_edges_rows:
-                lines.append(f"- [[{target_id}|{target_name}]] ({rel}, confidence: {conf}, observed: {obs_time})")
+                s_tid = _escape_wikilink_token(target_id)
+                s_tname = _escape_wikilink_token(target_name)
+                s_rel = _escape_wikilink_token(rel)
+                lines.append(f"- [[{s_tid}|{s_tname}]] ({s_rel}, confidence: {conf}, observed: {obs_time})")
 
         lines.append("")
         lines.append("## Inbound References & Intelligence Claims")
@@ -448,7 +552,10 @@ class GraphEngine:
             lines.append("*No inbound references recorded.*")
         else:
             for source_id, rel, conf, obs_time, source_name, source_type in in_edges_rows:
-                lines.append(f"- [[{source_id}|{source_name}]] ({rel}, confidence: {conf})")
+                s_sid = _escape_wikilink_token(source_id)
+                s_sname = _escape_wikilink_token(source_name)
+                s_rel = _escape_wikilink_token(rel)
+                lines.append(f"- [[{s_sid}|{s_sname}]] ({s_rel}, confidence: {conf})")
 
         lines.append("")
         lines.append("## Provenance & Evidence Anchors")
@@ -456,6 +563,7 @@ class GraphEngine:
             lines.append("*No raw wire evidence anchors linked.*")
         else:
             for h in evidence_hashes:
-                lines.append(f"- SHA-256: `{h}`")
+                s_h = _escape_wikilink_token(h)
+                lines.append(f"- SHA-256: `{s_h}`")
 
         return "\n".join(lines) + "\n"

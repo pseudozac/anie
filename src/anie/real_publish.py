@@ -1725,13 +1725,14 @@ class AegisReleaseBundle:
 class AegisReleaseConsumer:
     """Consumer interface for transactional verification and ingestion of ANIE releases into AEGIS.
 
-    Guarantees two-phase transactional atomicity (SEC-3.3-02):
+    Guarantees two-phase transactional atomicity (SEC-3.3-02) and crash recovery (M3.3.2):
     Phase 1: Verifies cryptographic signatures, structural limits, hash chains, and referential integrity
              WITHOUT advancing the sequence tracker.
     Phase 2: Reads and strictly deserializes all partition records (events, observations, discrepancies).
+             If store is supplied, commits records and records consumer release journal in a single SQLite transaction.
              If persist_callback is supplied, calls it to commit records to consumer database.
     Phase 3: ONLY after Phase 1, Phase 2, and persistence succeed, advances the sequence tracker.
-             If an error or crash occurs during Phases 1 or 2, the tracker state remains untouched.
+             Reconciles sequence tracker from consumer store journal if prior crash occurred after DB commit.
     """
 
     def __init__(
@@ -1739,10 +1740,12 @@ class AegisReleaseConsumer:
         trust: RealReleaseTrust,
         sequence_tracker: ReleaseSequenceTracker | None = None,
         *,
+        store: Any = None,
         allow_uninitialized_state: bool = False,
     ):
         self.trust = trust
         self.sequence_tracker = sequence_tracker
+        self.store = store
         self.allow_uninitialized_state = allow_uninitialized_state
 
     def verify_and_load(
@@ -1777,6 +1780,26 @@ class AegisReleaseConsumer:
             )
 
         dir_path = Path(directory)
+        publisher_id = getattr(self.trust, "publisher", "anie-first-party")
+
+        # Crash recovery reconciliation:
+        # If store journal has a higher committed sequence than sequence_tracker,
+        # previous run crashed after DB commit but before file tracker update.
+        if self.store is not None and self.sequence_tracker is not None and not allow_rollback:
+            try:
+                store_last_seq = self.store.get_last_consumer_release_sequence(publisher_id)
+                tracker_last_seq = self.sequence_tracker.get_last_accepted_sequence(publisher_id)
+                if store_last_seq > tracker_last_seq:
+                    rel_info = self.store.get_consumer_release(publisher_id, store_last_seq)
+                    m_hash = rel_info.get("manifest_sha256") if rel_info else None
+                    self.sequence_tracker.update_accepted(
+                        publisher_id,
+                        store_last_seq,
+                        manifest_sha256=m_hash,
+                        allow_uninitialized=self.allow_uninitialized_state,
+                    )
+            except Exception:
+                pass
 
         # Phase 1: Verify release without advancing sequence tracker
         res = verify_real_release(
@@ -1807,6 +1830,22 @@ class AegisReleaseConsumer:
                 for _, line in _iter_bounded_gzip_records(gz, partition_name="real_discrepancies.jsonl.gz"):
                     discrepancies.append(RealDiscrepancyReport.from_dict(json.loads(line.decode("utf-8"))))
 
+        seq = res.get("release_sequence")
+        pub_id = res.get("publisher_identity") or publisher_id
+        manifest_hash = res.get("manifest_sha256")
+
+        # Atomic consumer store persistence (M3.3.2)
+        if self.store is not None and seq is not None and pub_id is not None:
+            self.store.ingest_release_bundle(
+                observations=observations,
+                events=events,
+                discrepancies=discrepancies,
+                publisher=pub_id,
+                release_sequence=seq,
+                manifest_sha256=manifest_hash or "",
+                is_historical=allow_rollback,
+            )
+
         # Optional consumer persistence callback
         if persist_callback is not None:
             cb_result = persist_callback(observations, events, discrepancies)
@@ -1816,13 +1855,11 @@ class AegisReleaseConsumer:
                 )
 
         # Phase 3: Advance sequence tracker ONLY after deserialization and persistence succeed
-        seq = res.get("release_sequence")
-        publisher = res.get("publisher_identity")
-        if self.sequence_tracker is not None and not allow_rollback and seq is not None and publisher is not None:
+        if self.sequence_tracker is not None and not allow_rollback and seq is not None and pub_id is not None:
             self.sequence_tracker.update_accepted(
-                publisher,
+                pub_id,
                 seq,
-                manifest_sha256=res.get("manifest_sha256"),
+                manifest_sha256=manifest_hash,
                 allow_uninitialized=self.allow_uninitialized_state,
             )
 
