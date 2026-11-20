@@ -645,9 +645,6 @@ class BatchOrchestrator:
                     emit_telemetry(report.to_dict(), self.config.log_file_path)
                     return report
 
-                # 7. Live Collection Execution under monotonic overall batch deadline
-                collection_t0 = time.monotonic()
-                batch_deadline = collection_t0 + self.config.timeout_seconds
                 governor = DohRateGovernor(self.config.quota_db_path)
                 store = RealObservationStore(self.config.store_db_path)
 
@@ -664,6 +661,10 @@ class BatchOrchestrator:
                 failed = 0
                 persisted_obs: list[str] = []
                 persisted_events: list[str] = []
+
+                # 7. Live Collection Execution under monotonic overall batch deadline
+                collection_t0 = time.monotonic()
+                batch_deadline = collection_t0 + self.config.timeout_seconds
 
                 for domain, kind in batch_queries:
                     remaining_timeout = batch_deadline - time.monotonic()

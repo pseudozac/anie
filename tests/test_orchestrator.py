@@ -320,14 +320,14 @@ class TestMonotonicBatchDeadline(unittest.TestCase):
                 mode="live",
                 quota_db_path=q_db,
                 store_db_path=s_db,
-                timeout_seconds=0.1,  # Strict tight batch timeout
+                timeout_seconds=0.2,  # Strict tight batch timeout
             )
 
             mock_collector = MagicMock()
             event, obs = make_dummy_event_and_obs("example.com", "dns_a")
 
             def slow_first_query(domain, kind, timeout_seconds=None):
-                time.sleep(0.15)  # Exhausts the 0.1s batch deadline
+                time.sleep(0.3)  # Exhausts the 0.2s batch deadline
                 return event, obs
 
             mock_collector.collect.side_effect = slow_first_query
