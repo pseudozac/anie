@@ -31,13 +31,22 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--as-of", required=True, help="cutoff timestamp (UTC ISO format)")
     p.add_argument("--publisher", default="anie-first-party", help="publisher identity")
     p.add_argument("--sequence", type=int, default=1, help="monotonically increasing release sequence")
+    p.add_argument("--prev-manifest", default=None, help="SHA-256 digest of previous release manifest (for sequence > 1)")
+    p.add_argument("--prev-release", default=None, help="path to previous release directory from which to resolve prev-manifest digest")
     p.add_argument("--commit", default=None, help="source repository commit hash")
     p.add_argument("--published-at", default=None, help="optional fixed publication timestamp for reproducible manifest")
+    p = sub.add_parser("keygen", help="generate offline Ed25519 operator signing keypair with 0600 permissions")
+    p.add_argument("--out", default=".", help="output directory for key files (default: .)")
+    p.add_argument("--key-id", default="operator-key-1", help="operator key identifier")
+    p.add_argument("--force", action="store_true", help="overwrite existing key files")
+    p = sub.add_parser("inspect-candidate", help="inspect unsigned candidate release integrity and summarize observations")
+    p.add_argument("--dir", required=True, help="path to candidate release directory")
     p = sub.add_parser("sign-real", help="detached offline Ed25519 signing of candidate release")
     p.add_argument("--dir", required=True, help="path to unsigned candidate release directory")
     p.add_argument("--key-file", required=True, help="path to operator Ed25519 private key (PEM or 32 raw bytes)")
     p.add_argument("--key-id", required=True, help="operator key identifier")
     p.add_argument("--sequence", type=int, required=True, help="expected release sequence (must match manifest)")
+    p.add_argument("--prev-manifest", default=None, help="expected SHA-256 digest of previous manifest (must match candidate manifest)")
     p.add_argument("--publisher", default="anie-first-party", help="expected publisher (must match manifest)")
     p.add_argument("--commit", default=None, help="expected source commit (must match manifest if given)")
     p.add_argument("--issued-at", default=None, help="optional ISO-8601 signature issuance timestamp (defaults to now)")
@@ -50,6 +59,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--state-file", default=None, help="path to sequence tracking state file for rollback protection")
     p.add_argument("--init-state", action="store_true", help="explicitly initialize state file if missing")
     p.add_argument("--allow-rollback", action="store_true", help="allow historical verification without rollback error")
+    p.add_argument("--require-hash-chain", action="store_true", help="require unbroken release hash chain")
     p.add_argument("--integrity-only", action="store_true", help="inspect candidate release integrity without cryptographic authentication")
     p.add_argument("--now", default=None, help="optional frozen timestamp for verification")
     p.add_argument("--expected-publisher", default="anie-first-party", help="expected publisher identity")
@@ -116,8 +126,17 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "verify":
             print(json.dumps(verify_release(args.dir), indent=2))
         elif args.command == "publish-real":
+            from hashlib import sha256
             from .real_publish import publish_real
             from .real_store import RealObservationStore
+            prev_sha = args.prev_manifest
+            if args.prev_release and not prev_sha:
+                prev_dir = Path(args.prev_release)
+                manifest_file = prev_dir / "manifest.json"
+                if not manifest_file.exists():
+                    raise FileNotFoundError(f"previous manifest not found in '{prev_dir}'")
+                prev_sha = sha256(manifest_file.read_bytes()).hexdigest()
+
             store = RealObservationStore(args.db)
             manifest = publish_real(
                 store,
@@ -125,10 +144,21 @@ def main(argv: list[str] | None = None) -> int:
                 args.as_of,
                 publisher_identity=args.publisher,
                 release_sequence=args.sequence,
+                prev_manifest_sha256=prev_sha,
                 source_commit=args.commit,
                 published_at=args.published_at,
             )
             print(json.dumps({"published": True, "manifest": manifest}, indent=2))
+            return 0
+        elif args.command == "keygen":
+            from .real_publish import generate_keypair
+            res = generate_keypair(args.out, args.key_id, force=args.force)
+            print(json.dumps({"keygen": True, **res}, indent=2))
+            return 0
+        elif args.command == "inspect-candidate":
+            from .real_publish import inspect_candidate
+            summary = inspect_candidate(args.dir)
+            print(json.dumps(summary, indent=2))
             return 0
         elif args.command == "sign-real":
             from datetime import datetime, timedelta, timezone
@@ -157,6 +187,7 @@ def main(argv: list[str] | None = None) -> int:
                 expires_at=expires_iso,
                 publisher_identity=args.publisher,
                 source_commit=args.commit,
+                prev_manifest_sha256=args.prev_manifest,
             )
             print(json.dumps({"signed": True, "attestation": attestation}, indent=2))
             return 0
@@ -188,6 +219,7 @@ def main(argv: list[str] | None = None) -> int:
                     valid_until="2030-01-01T00:00:00Z",
                     expected_publisher=args.expected_publisher,
                     expected_source_commit=args.expected_commit,
+                    require_hash_chain=args.require_hash_chain,
                 )
 
             tracker = None
