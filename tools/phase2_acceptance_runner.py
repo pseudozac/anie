@@ -362,10 +362,12 @@ def run_acceptance_tests(verbose: bool = True) -> dict[str, Any]:
         except ValueError as exc:
             assert "replayed or downgraded" in str(exc)
 
-        # Historical audit with allow_rollback=True
-        audit_res = verify_real_release(release_dir, trust=trust, sequence_tracker=tracker, allow_rollback=True)
+        # Historical audit with allow_rollback=True and authorized trust policy
+        audit_trust = RealReleaseTrust(trusted_keys=trust.trusted_keys, allow_rollback=True)
+        audit_res = verify_real_release(release_dir, trust=audit_trust, sequence_tracker=tracker, allow_rollback=True)
         assert audit_res["authenticated"] is True
         assert audit_res["anti_rollback_verified"] is False
+        assert audit_res["status"] == "AUTHENTICATED_HISTORICAL_INSPECTION"
         report["anti_rollback"] = "verified_monotonic_and_replay_rejected"
 
         # 9. Adversarial tampering, corruption, and anti-contamination

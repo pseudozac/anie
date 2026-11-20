@@ -658,6 +658,7 @@ class TestReplayAndRollbackProtection(unittest.TestCase):
             public_key_raw=self.pub_bytes,
             valid_from="2026-01-01T00:00:00Z",
             valid_until="2027-01-01T00:00:00Z",
+            allow_rollback=True,
         )
 
     def test_persistent_sequence_rollback_rejection(self):

@@ -315,15 +315,11 @@ def check_firewall_rule(
 def check_no_signing_keys(
     search_paths: list[str | Path] | None = None,
 ) -> tuple[bool, str]:
-    """Assert that no private cryptographic signing keys exist in collector state directories.
+    """Assert that no private cryptographic signing keys exist in collector state directories or environment.
 
     Protects the collector/operator air-gap boundary: signing keys must only ever
     reside in isolated operator environments and must never be staged or stored on the collector.
     """
-    if search_paths is None:
-        search_paths = [Path("/var/lib/anie"), Path("/etc/anie")]
-
-    target_extensions = {".priv", ".key"}
     pem_private_indicators = [
         b"BEGIN PRIVATE KEY",
         b"BEGIN EC PRIVATE KEY",
@@ -331,6 +327,28 @@ def check_no_signing_keys(
         b"BEGIN ED25519 PRIVATE KEY",
         b"BEGIN OPENSSH PRIVATE KEY",
     ]
+
+    # 1. Environment variable inspection (prevent passing private keys via env)
+    for env_var, val in os.environ.items():
+        var_upper = env_var.upper()
+        if any(k in var_upper for k in ("PRIVATE_KEY", "SIGNING_KEY", "ED25519_KEY")):
+            return False, f"Private signing key name detected in environment variable '{env_var}'; collector air-gap violated"
+        if isinstance(val, str) and any(ind.decode("ascii") in val for ind in pem_private_indicators):
+            return False, f"Private key PEM header detected in environment variable '{env_var}'; collector air-gap violated"
+
+    # 2. File and directory inspection
+    if search_paths is None:
+        search_paths = [
+            Path("/var/lib/anie"),
+            Path("/etc/anie"),
+            Path("/home/anie"),
+            Path("/tmp/anie"),
+        ]
+        state_env = os.environ.get("ANIE_STATE_DIR")
+        if state_env:
+            search_paths.append(Path(state_env))
+
+    target_extensions = {".priv", ".key"}
 
     for base in search_paths:
         base_p = Path(base)
@@ -359,7 +377,7 @@ def check_no_signing_keys(
         except (OSError, PermissionError):
             continue
 
-    return True, "No private signing keys detected in collector directories"
+    return True, "No private signing keys detected in collector directories or environment"
 
 
 def run_security_preflight(

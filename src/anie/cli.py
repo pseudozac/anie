@@ -35,6 +35,17 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--prev-release", default=None, help="path to previous release directory from which to resolve prev-manifest digest")
     p.add_argument("--commit", default=None, help="source repository commit hash")
     p.add_argument("--published-at", default=None, help="optional fixed publication timestamp for reproducible manifest")
+    p.add_argument("--include-discrepancies", action="store_true", help="include discrepancy reports partition in release (v3 manifest)")
+    p = sub.add_parser("analyze-discrepancy", help="evaluate multi-resolver observations for a subject from database and generate discrepancy report")
+    p.add_argument("--db", required=True, help="path to real intelligence SQLite database")
+    p.add_argument("--subject", required=True, help="target domain name to analyze")
+    p.add_argument("--record-type", default=None, help="optional DNS record kind filter (e.g. dns_a, dns_aaaa)")
+    p.add_argument("--window-seconds", type=float, default=60.0, help="maximum temporal clustering window in seconds (default: 60)")
+    p.add_argument("--store", action="store_true", help="persist generated discrepancy report into database")
+    p = sub.add_parser("domain-history", help="display multi-resolver historical intelligence summary for domain")
+    p.add_argument("--db", required=True, help="path to real intelligence SQLite database")
+    p.add_argument("--subject", required=True, help="target domain name")
+    p.add_argument("--record-type", default=None, help="optional DNS record kind filter")
     p = sub.add_parser("keygen", help="generate offline Ed25519 operator signing keypair with 0600 permissions")
     p.add_argument("--out", default=".", help="output directory for key files (default: .)")
     p.add_argument("--key-id", default="operator-key-1", help="operator key identifier")
@@ -147,6 +158,7 @@ def main(argv: list[str] | None = None) -> int:
                 prev_manifest_sha256=prev_sha,
                 source_commit=args.commit,
                 published_at=args.published_at,
+                include_discrepancies=args.include_discrepancies,
             )
             print(json.dumps({"published": True, "manifest": manifest}, indent=2))
             return 0
@@ -220,6 +232,7 @@ def main(argv: list[str] | None = None) -> int:
                     expected_publisher=args.expected_publisher,
                     expected_source_commit=args.expected_commit,
                     require_hash_chain=args.require_hash_chain,
+                    allow_rollback=args.allow_rollback,
                 )
 
             tracker = None
@@ -295,6 +308,31 @@ def main(argv: list[str] | None = None) -> int:
             res = restore_evidence_backup(args.backup_dir, args.target, allow_overwrite=args.allow_overwrite)
             print(json.dumps(asdict(res), indent=2))
             return 0 if res.success else 1
+        elif args.command == "analyze-discrepancy":
+            from .discrepancy_engine import DiscrepancyEngine
+            from .real_store import RealObservationStore
+            store = RealObservationStore(args.db)
+            all_obs = store.all_observations()
+            subj_obs = [o for o in all_obs if o.subject == args.subject]
+            kind = args.record_type or (subj_obs[0].kind if subj_obs else "dns_a")
+            if args.record_type:
+                subj_obs = [o for o in subj_obs if o.kind == args.record_type]
+            if not subj_obs:
+                print(f"ANIE error: no observations found for subject '{args.subject}'", file=sys.stderr)
+                return 1
+            all_events = store.all_events()
+            engine = DiscrepancyEngine(window_seconds=args.window_seconds)
+            report = engine.analyze(args.subject, kind, subj_obs, all_events)
+            if args.store:
+                store.insert_discrepancy(report)
+            print(json.dumps(report.to_dict(), indent=2))
+            return 0
+        elif args.command == "domain-history":
+            from .real_store import RealObservationStore
+            store = RealObservationStore(args.db)
+            summary = store.get_historical_summary(args.subject, record_type=args.record_type)
+            print(json.dumps(summary, indent=2))
+            return 0
         return 0
     except (ValueError, PermissionError, FileNotFoundError, FileExistsError, json.JSONDecodeError) as exc:
         print(f"ANIE error: {exc}", file=sys.stderr)
