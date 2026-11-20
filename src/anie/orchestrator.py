@@ -646,7 +646,8 @@ class BatchOrchestrator:
                     return report
 
                 # 7. Live Collection Execution under monotonic overall batch deadline
-                batch_deadline = t0 + self.config.timeout_seconds
+                collection_t0 = time.monotonic()
+                batch_deadline = collection_t0 + self.config.timeout_seconds
                 governor = DohRateGovernor(self.config.quota_db_path)
                 store = RealObservationStore(self.config.store_db_path)
 
