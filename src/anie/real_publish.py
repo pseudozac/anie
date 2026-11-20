@@ -40,6 +40,10 @@ import time
 from typing import Any, Iterable, Iterator
 import uuid
 
+from .discrepancy_models import (
+    REAL_DISCREPANCY_SCHEMA,
+    RealDiscrepancyReport,
+)
 from .observations import canonical_json, utc_iso
 from .real_models import (
     REAL_EVENT_SCHEMA,
@@ -52,8 +56,9 @@ from .real_store import RealObservationStore
 # --- Schema & Identifier Constants ---
 REAL_MANIFEST_SCHEMA_V1 = "anie.real-dataset-manifest.v1"
 REAL_MANIFEST_SCHEMA_V2 = "anie.real-dataset-manifest.v2"
-REAL_MANIFEST_SCHEMA = REAL_MANIFEST_SCHEMA_V2
-REAL_MANIFEST_SCHEMAS = frozenset({REAL_MANIFEST_SCHEMA_V1, REAL_MANIFEST_SCHEMA_V2})
+REAL_MANIFEST_SCHEMA_V3 = "anie.real-dataset-manifest.v3"
+REAL_MANIFEST_SCHEMA = REAL_MANIFEST_SCHEMA_V3
+REAL_MANIFEST_SCHEMAS = frozenset({REAL_MANIFEST_SCHEMA_V1, REAL_MANIFEST_SCHEMA_V2, REAL_MANIFEST_SCHEMA_V3})
 
 DATASET_TYPE_REAL = "first_party_intelligence"
 
@@ -77,7 +82,10 @@ TRACKER_SCHEMA_V2 = "anie.verifier-sequence-tracker.v2"
 TRACKER_SCHEMA = TRACKER_SCHEMA_V2
 TRACKER_SCHEMAS = frozenset({TRACKER_SCHEMA_V1, TRACKER_SCHEMA_V2})
 
-REAL_PARTITION_FILES = frozenset({"real_observations.jsonl.gz", "real_events.jsonl.gz"})
+REQUIRED_PARTITION_FILES = frozenset({"real_observations.jsonl.gz", "real_events.jsonl.gz"})
+OPTIONAL_PARTITION_FILES = frozenset({"real_discrepancies.jsonl.gz"})
+ALLOWED_PARTITION_FILES = REQUIRED_PARTITION_FILES | OPTIONAL_PARTITION_FILES
+REAL_PARTITION_FILES = REQUIRED_PARTITION_FILES
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _KEY_ID_RE = re.compile(r"^[a-zA-Z0-9_.:-]{1,64}$")
@@ -262,7 +270,9 @@ def export_canonical_dataset(
     store: RealObservationStore,
     as_of: str,
     limit: int = MAX_RECORDS_PER_PARTITION,
-) -> tuple[list[RealObservation], list[RealCollectionEvent]]:
+    *,
+    include_discrepancies: bool = False,
+) -> tuple[list[RealObservation], list[RealCollectionEvent]] | tuple[list[RealObservation], list[RealCollectionEvent], list[RealDiscrepancyReport]]:
     """Export a consistent SQLite snapshot of real observations and referenced events.
     
     Guarantees:
@@ -271,6 +281,8 @@ def export_canonical_dataset(
     - Events ordered by (observed_at ASC, event_id ASC).
     - Referential integrity: all observation evidence_id references exist in events.
     - Raw evidence hashes verified for all exported events.
+    - When include_discrepancies=True, exports real_discrepancies ordered by (analyzed_at ASC, discrepancy_id ASC).
+    - Discrepancy referential integrity: all referenced observation_ids and evidence_ids exist.
     - Rejects any synthetic record unconditionally.
     - Fail-closed if dataset exceeds limit (no silent truncation).
     """
@@ -354,15 +366,62 @@ def export_canonical_dataset(
                     f"missing collection events (sample: {sorted(missing_evidence)[:3]})"
                 )
 
+            if not include_discrepancies:
+                conn.commit()
+                return observations, events
+
+            # Export discrepancies if requested
+            table_check = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='real_discrepancies'"
+            ).fetchone()
+            discrepancies: list[RealDiscrepancyReport] = []
+            if table_check is not None:
+                disc_rows = conn.execute(
+                    """
+                    SELECT payload FROM real_discrepancies
+                    WHERE analyzed_at <= ?
+                    ORDER BY analyzed_at ASC, analysis_id ASC
+                    LIMIT ?
+                    """,
+                    (as_of_iso, limit + 1),
+                ).fetchall()
+
+                if len(disc_rows) > limit:
+                    raise ValueError(
+                        f"dataset exceeds maximum partition limit of {limit} discrepancies "
+                        f"(found >{limit} records at or before as_of '{as_of_iso}'); "
+                        f"silent truncation rejected"
+                    )
+
+                obs_ids = {o.observation_id for o in observations}
+                for (disc_json,) in disc_rows:
+                    raw_disc = json.loads(disc_json)
+                    report = RealDiscrepancyReport.from_dict(raw_disc)
+                    obs_id_vals = list(report.observation_ids.values()) if isinstance(report.observation_ids, dict) else list(report.observation_ids)
+                    for oid in obs_id_vals:
+                        if oid not in obs_ids:
+                            raise ValueError(
+                                f"discrepancy '{report.discrepancy_id}' references observation '{oid}' "
+                                f"not present in exported observations"
+                            )
+                    ev_id_vals = list(report.evidence_ids.values()) if isinstance(report.evidence_ids, dict) else list(report.evidence_ids)
+                    for eid in ev_id_vals:
+                        if eid not in event_ids:
+                            raise ValueError(
+                                f"discrepancy '{report.discrepancy_id}' references evidence '{eid}' "
+                                f"not present in exported events"
+                            )
+                    discrepancies.append(report)
+
             conn.commit()
-            return observations, events
+            return observations, events, discrepancies
         except Exception:
             conn.rollback()
             raise
 
 
 def publish_real(
-    store_or_data: RealObservationStore | tuple[list[RealObservation], list[RealCollectionEvent]],
+    store_or_data: RealObservationStore | tuple[list[RealObservation], list[RealCollectionEvent]] | tuple[list[RealObservation], list[RealCollectionEvent], list[RealDiscrepancyReport]],
     output_dir: str | Path,
     as_of: str,
     *,
@@ -372,6 +431,8 @@ def publish_real(
     source_commit: str | None = None,
     published_at: str | None = None,
     limit: int = MAX_RECORDS_PER_PARTITION,
+    include_discrepancies: bool = False,
+    discrepancies: list[RealDiscrepancyReport] | None = None,
 ) -> dict[str, Any]:
     """Publish a deterministic, canonical real-world intelligence dataset.
     
@@ -401,12 +462,26 @@ def publish_real(
     as_of_iso = utc_iso(as_of)
     now_iso = utc_iso(published_at) if published_at is not None else datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
+    disc_list: list[RealDiscrepancyReport] | None = discrepancies
     if isinstance(store_or_data, RealObservationStore):
-        observations, events = export_canonical_dataset(store_or_data, as_of_iso, limit=limit)
-    elif isinstance(store_or_data, tuple) and len(store_or_data) == 2:
-        observations, events = store_or_data
+        if include_discrepancies or discrepancies is not None:
+            if disc_list is None:
+                exp_res = export_canonical_dataset(store_or_data, as_of_iso, limit=limit, include_discrepancies=True)
+                assert len(exp_res) == 3
+                observations, events, disc_list = exp_res  # type: ignore[misc]
+            else:
+                observations, events = export_canonical_dataset(store_or_data, as_of_iso, limit=limit, include_discrepancies=False)  # type: ignore[misc]
+        else:
+            observations, events = export_canonical_dataset(store_or_data, as_of_iso, limit=limit, include_discrepancies=False)  # type: ignore[misc]
+    elif isinstance(store_or_data, tuple):
+        if len(store_or_data) == 3:
+            observations, events, disc_list = store_or_data  # type: ignore[misc]
+        elif len(store_or_data) == 2:
+            observations, events = store_or_data  # type: ignore[misc]
+        else:
+            raise TypeError("store_or_data tuple must have length 2 or 3")
     else:
-        raise TypeError("store_or_data must be RealObservationStore or (observations, events) tuple")
+        raise TypeError("store_or_data must be RealObservationStore or (observations, events[, discrepancies]) tuple")
 
     if not observations:
         raise ValueError("cannot publish empty observation dataset")
@@ -430,9 +505,24 @@ def publish_real(
         event_ids.add(e.event_id)
 
     # Referential integrity check
+    obs_ids = set()
     for o in observations:
         if o.evidence_id not in event_ids:
             raise ValueError(f"observation '{o.observation_id}' references missing evidence '{o.evidence_id}'")
+        obs_ids.add(o.observation_id)
+
+    # Validate discrepancies if present
+    if disc_list is not None:
+        disc_list = sorted(disc_list, key=lambda d: (d.analyzed_at, d.discrepancy_id))
+        for d in disc_list:
+            obs_id_vals = list(d.observation_ids.values()) if isinstance(d.observation_ids, dict) else list(d.observation_ids)
+            for oid in obs_id_vals:
+                if oid not in obs_ids:
+                    raise ValueError(f"discrepancy '{d.discrepancy_id}' references missing observation '{oid}'")
+            ev_id_vals = list(d.evidence_ids.values()) if isinstance(d.evidence_ids, dict) else list(d.evidence_ids)
+            for eid in ev_id_vals:
+                if eid not in event_ids:
+                    raise ValueError(f"discrepancy '{d.discrepancy_id}' references missing evidence '{eid}'")
 
     # Atomic publication via temporary staging directory
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -446,12 +536,22 @@ def publish_real(
         ev_records = (e.to_dict() for e in events)
         ev_meta = _write_deterministic_gzip(staging_path / "real_events.jsonl.gz", ev_records)
 
+        partition_files = [obs_meta, ev_meta]
+        has_discrepancies = disc_list is not None
+
+        if has_discrepancies:
+            disc_records = (d.to_dict() for d in disc_list)
+            disc_meta = _write_deterministic_gzip(staging_path / "real_discrepancies.jsonl.gz", disc_records)
+            partition_files.append(disc_meta)
+
         commit_val = source_commit or ("0" * 40)
         if not _COMMIT_RE.fullmatch(commit_val):
             raise ValueError(f"invalid source_commit: {commit_val!r} (must be 40-character hex)")
 
+        manifest_schema = REAL_MANIFEST_SCHEMA_V3 if has_discrepancies else REAL_MANIFEST_SCHEMA_V2
+
         manifest = {
-            "schema": REAL_MANIFEST_SCHEMA_V2,
+            "schema": manifest_schema,
             "dataset_type": DATASET_TYPE_REAL,
             "publisher": publisher_identity,
             "release_sequence": release_sequence,
@@ -459,7 +559,7 @@ def publish_real(
             "as_of": as_of_iso,
             "published_at": now_iso,
             "source_commit": commit_val,
-            "files": [obs_meta, ev_meta],
+            "files": partition_files,
             "total_observations": len(observations),
             "total_events": len(events),
             "integrity": "unsigned_candidate_manifest",
@@ -468,6 +568,8 @@ def publish_real(
                 "policy governance. Authenticates publisher provenance, not absolute external truth."
             ),
         }
+        if has_discrepancies:
+            manifest["total_discrepancies"] = len(disc_list)
 
         manifest_path = staging_path / "manifest.json"
         manifest_path.write_text(canonical_json(manifest) + "\n", encoding="utf-8")
@@ -505,21 +607,28 @@ def _read_and_validate_manifest(directory: Path) -> tuple[bytes, str, dict[str, 
     if manifest.get("dataset_type") != DATASET_TYPE_REAL:
         raise ValueError(f"unsupported dataset_type: {manifest.get('dataset_type')!r}")
 
-    if manifest.get("schema") == REAL_MANIFEST_SCHEMA_V2:
+    if manifest.get("schema") in (REAL_MANIFEST_SCHEMA_V2, REAL_MANIFEST_SCHEMA_V3):
         seq = manifest.get("release_sequence")
         prev_sha = manifest.get("prev_manifest_sha256")
         if seq == 1 and prev_sha is not None:
-            raise ValueError("prev_manifest_sha256 must be null for release_sequence 1 in v2 manifest")
+            raise ValueError("prev_manifest_sha256 must be null for release_sequence 1 in v2/v3 manifest")
         if isinstance(seq, int) and seq > 1 and prev_sha is not None:
             if not isinstance(prev_sha, str) or not _SHA256_RE.fullmatch(prev_sha):
-                raise ValueError(f"invalid prev_manifest_sha256 in v2 manifest: {prev_sha!r}")
+                raise ValueError(f"invalid prev_manifest_sha256 in v2/v3 manifest: {prev_sha!r}")
 
     files = manifest.get("files")
-    if not isinstance(files, list) or len(files) != 2:
-        raise ValueError("manifest must specify exactly 2 partition files")
+    if not isinstance(files, list) or len(files) not in (2, 3):
+        raise ValueError("manifest must specify 2 or 3 partition files")
     found_files = {f.get("file") for f in files}
-    if found_files != REAL_PARTITION_FILES:
+    if not REQUIRED_PARTITION_FILES.issubset(found_files) or not found_files.issubset(ALLOWED_PARTITION_FILES):
         raise ValueError(f"unexpected manifest partition files: {found_files}")
+    if len(files) == 3 and "real_discrepancies.jsonl.gz" not in found_files:
+        raise ValueError("3-partition manifest must include real_discrepancies.jsonl.gz")
+    if "real_discrepancies.jsonl.gz" in found_files:
+        if manifest.get("schema") != REAL_MANIFEST_SCHEMA_V3:
+            raise ValueError("releases containing real_discrepancies.jsonl.gz must use V3 manifest schema")
+        if "total_discrepancies" not in manifest or not isinstance(manifest.get("total_discrepancies"), int) or manifest.get("total_discrepancies") < 0:
+            raise ValueError("manifest with real_discrepancies.jsonl.gz must specify valid non-negative integer total_discrepancies")
 
     manifest_sha = sha256(raw_bytes).hexdigest()
     return raw_bytes, manifest_sha, manifest
@@ -598,14 +707,14 @@ def sign_manifest_detached(
         prev_manifest_sha256 = manifest_prev
 
     manifest_schema = manifest.get("schema")
-    is_v2 = (
-        manifest_schema == REAL_MANIFEST_SCHEMA_V2
+    is_v2_or_v3 = (
+        manifest_schema in (REAL_MANIFEST_SCHEMA_V2, REAL_MANIFEST_SCHEMA_V3)
         or prev_manifest_sha256 is not None
         or release_sequence > 1
     )
-    payload_schema = REAL_PAYLOAD_SCHEMA_V2 if is_v2 else REAL_PAYLOAD_SCHEMA_V1
-    sig_schema = REAL_SIGNATURE_SCHEMA_V2 if is_v2 else REAL_SIGNATURE_SCHEMA_V1
-    domain_sep = DOMAIN_SEPARATOR_REAL_V2 if is_v2 else DOMAIN_SEPARATOR_REAL_V1
+    payload_schema = REAL_PAYLOAD_SCHEMA_V2 if is_v2_or_v3 else REAL_PAYLOAD_SCHEMA_V1
+    sig_schema = REAL_SIGNATURE_SCHEMA_V2 if is_v2_or_v3 else REAL_SIGNATURE_SCHEMA_V1
+    domain_sep = DOMAIN_SEPARATOR_REAL_V2 if is_v2_or_v3 else DOMAIN_SEPARATOR_REAL_V1
 
     issued_dt = _dt(issued_at)
     expires_dt = _dt(expires_at)
@@ -633,7 +742,7 @@ def sign_manifest_detached(
         "issued_at": utc_iso(issued_at),
         "expires_at": utc_iso(expires_at),
     }
-    if is_v2:
+    if is_v2_or_v3:
         payload["prev_manifest_sha256"] = prev_manifest_sha256
 
     message = domain_sep + canonical_json(payload).encode("utf-8")
@@ -683,6 +792,7 @@ class RealReleaseTrust:
     revoked_fingerprints: frozenset[str] = field(default_factory=frozenset)
     revoked_key_ids: frozenset[str] = field(default_factory=frozenset)
     require_hash_chain: bool = False
+    allow_rollback: bool = False
 
     @classmethod
     def from_single_key(
@@ -1018,6 +1128,7 @@ def verify_real_release(
     allow_rollback: bool = False,
     sequence_tracker: ReleaseSequenceTracker | None = None,
     allow_uninitialized_state: bool = False,
+    advance_tracker: bool = True,
 ) -> dict[str, Any]:
     """Verify integrity, referential consistency, raw evidence hashes, and signatures.
     
@@ -1047,7 +1158,7 @@ def verify_real_release(
     # 1. Structural Partition File Verification
     files_map = {f["file"]: f for f in manifest["files"]}
 
-    for fname in sorted(REAL_PARTITION_FILES):
+    for fname in sorted(files_map.keys()):
         fpath = dir_path / fname
         if not fpath.is_file() or fpath.is_symlink():
             raise ValueError(f"missing or unsafe partition file: '{fname}'")
@@ -1114,6 +1225,7 @@ def verify_real_release(
     # 3. Bounded Streaming Decompression & Strict Model Reconstruction for Observations
     obs_path = dir_path / "real_observations.jsonl.gz"
     obs_meta = files_map["real_observations.jsonl.gz"]
+    obs_ids: set[str] = set()
     prev_obs_order: tuple[str, str] | None = None
     obs_count = 0
 
@@ -1145,6 +1257,7 @@ def verify_real_release(
             if obs.evidence_id not in event_ids:
                 raise ValueError(f"broken referential integrity: observation '{obs.observation_id}' references unknown evidence_id '{obs.evidence_id}'")
 
+            obs_ids.add(obs.observation_id)
             obs_count += 1
 
     if obs_count != obs_meta.get("records"):
@@ -1152,7 +1265,57 @@ def verify_real_release(
     if manifest.get("total_observations") != obs_count:
         raise ValueError(f"manifest total_observations ({manifest.get('total_observations')}) does not match actual count ({obs_count})")
 
-    # 4. Integrity-Only Early Exit
+    # 4. Bounded Streaming Decompression & Strict Model Reconstruction for Discrepancies (if present)
+    disc_count = 0
+    if "real_discrepancies.jsonl.gz" in files_map:
+        disc_path = dir_path / "real_discrepancies.jsonl.gz"
+        disc_meta = files_map["real_discrepancies.jsonl.gz"]
+        prev_disc_order: tuple[str, str] | None = None
+
+        with gzip.open(disc_path, "rb") as gz:
+            for line_num, line_bytes in _iter_bounded_gzip_records(
+                gz,
+                max_record_bytes=MAX_SINGLE_RECORD_BYTES,
+                max_total_bytes=MAX_PARTITION_DECOMPRESSED_BYTES,
+                max_records=MAX_RECORDS_PER_PARTITION,
+                partition_name="real_discrepancies.jsonl.gz",
+            ):
+                try:
+                    raw_dict = json.loads(line_bytes.decode("utf-8"))
+                except (ValueError, UnicodeDecodeError) as exc:
+                    raise ValueError(f"malformed JSON in real_discrepancies line #{line_num}: {exc}") from exc
+
+                # Strict reconstruction through model validator
+                disc_report = RealDiscrepancyReport.from_dict(raw_dict)
+
+                # Check strict deterministic ordering: (analyzed_at, discrepancy_id) strictly increasing
+                current_order = (disc_report.analyzed_at, disc_report.discrepancy_id)
+                if prev_disc_order is not None and current_order <= prev_disc_order:
+                    if current_order == prev_disc_order:
+                        raise ValueError(f"duplicate discrepancy_id '{disc_report.discrepancy_id}' detected at line #{line_num}")
+                    raise ValueError(f"discrepancies partition out of deterministic order at line #{line_num}: {current_order} <= {prev_disc_order}")
+                prev_disc_order = current_order
+
+                # Referential integrity: check all observation_ids exist in observations partition
+                obs_id_vals = list(disc_report.observation_ids.values()) if isinstance(disc_report.observation_ids, dict) else list(disc_report.observation_ids)
+                for oid in obs_id_vals:
+                    if oid not in obs_ids:
+                        raise ValueError(f"broken referential integrity: discrepancy '{disc_report.discrepancy_id}' references unknown observation_id '{oid}'")
+
+                # Referential integrity: check all evidence_ids exist in events partition
+                ev_id_vals = list(disc_report.evidence_ids.values()) if isinstance(disc_report.evidence_ids, dict) else list(disc_report.evidence_ids)
+                for eid in ev_id_vals:
+                    if eid not in event_ids:
+                        raise ValueError(f"broken referential integrity: discrepancy '{disc_report.discrepancy_id}' references unknown evidence_id '{eid}'")
+
+                disc_count += 1
+
+        if disc_count != disc_meta.get("records"):
+            raise ValueError(f"record count mismatch for real_discrepancies: expected {disc_meta.get('records')}, got {disc_count}")
+        if manifest.get("total_discrepancies") != disc_count:
+            raise ValueError(f"manifest total_discrepancies ({manifest.get('total_discrepancies')}) does not match actual count ({disc_count})")
+
+    # 5. Integrity-Only Early Exit
     if integrity_only:
         return {
             "status": "CANDIDATE_INTEGRITY_VERIFIED",
@@ -1168,6 +1331,7 @@ def verify_real_release(
             "prev_manifest_sha256": manifest.get("prev_manifest_sha256"),
             "total_observations": obs_count,
             "total_events": event_count,
+            "total_discrepancies": disc_count,
             "manifest_sha256": manifest_sha,
             "publisher_identity": manifest.get("publisher"),
             "key_id": None,
@@ -1311,6 +1475,13 @@ def verify_real_release(
     if seq < trust.min_sequence:
         raise ValueError(f"release sequence {seq} is below trust min_sequence {trust.min_sequence}")
 
+    if allow_rollback:
+        if trust is not None and not getattr(trust, "allow_rollback", False):
+            raise PermissionError(
+                "allow_rollback=True is rejected: operator trust policy has not authorized "
+                "rollback bypass (RealReleaseTrust.allow_rollback is False)"
+            )
+
     anti_rollback_verified = False
     hash_chain_verified = False
     manifest_prev = manifest.get("prev_manifest_sha256")
@@ -1355,19 +1526,22 @@ def verify_real_release(
                         f"does not specify prev_manifest_sha256"
                     )
 
-            sequence_tracker.update_accepted(
-                payload["publisher"],
-                seq,
-                manifest_sha256=manifest_sha,
-                allow_uninitialized=allow_uninitialized_state,
-            )
+            if advance_tracker:
+                sequence_tracker.update_accepted(
+                    payload["publisher"],
+                    seq,
+                    manifest_sha256=manifest_sha,
+                    allow_uninitialized=allow_uninitialized_state,
+                )
             anti_rollback_verified = True
         else:
             anti_rollback_verified = False
             hash_chain_verified = False
 
+    status = "AUTHENTICATED_HISTORICAL_INSPECTION" if allow_rollback else "AUTHENTICATED"
+
     return {
-        "status": "AUTHENTICATED",
+        "status": status,
         "authenticated": True,
         "integrity_only": False,
         "structural_valid": True,
@@ -1380,6 +1554,7 @@ def verify_real_release(
         "prev_manifest_sha256": manifest_prev,
         "total_observations": obs_count,
         "total_events": event_count,
+        "total_discrepancies": disc_count,
         "manifest_sha256": manifest_sha,
         "publisher_identity": payload["publisher"],
         "key_id": key_id,
@@ -1504,6 +1679,15 @@ def inspect_candidate(directory: str | Path) -> dict[str, Any]:
             if "observed_at" in record:
                 timestamps.append(record["observed_at"])
 
+    discrepancy_verdicts: dict[str, int] = {}
+    disc_path = dir_path / "real_discrepancies.jsonl.gz"
+    if disc_path.exists():
+        with gzip.open(disc_path, "rb") as gz:
+            for _, line_bytes in _iter_bounded_gzip_records(gz, partition_name="real_discrepancies.jsonl.gz"):
+                disc_rec = json.loads(line_bytes.decode("utf-8"))
+                v = disc_rec.get("verdict", "UNKNOWN")
+                discrepancy_verdicts[v] = discrepancy_verdicts.get(v, 0) + 1
+
     observation_window = {
         "first_seen": min(timestamps) if timestamps else None,
         "last_seen": max(timestamps) if timestamps else None,
@@ -1520,6 +1704,8 @@ def inspect_candidate(directory: str | Path) -> dict[str, Any]:
         "source_commit": manifest.get("source_commit"),
         "total_observations": res["total_observations"],
         "total_events": res["total_events"],
+        "total_discrepancies": res.get("total_discrepancies", 0),
+        "discrepancy_verdicts": discrepancy_verdicts,
         "observation_window": observation_window,
         "domains": sorted(domains),
         "query_kinds": sorted(query_kinds),
@@ -1527,11 +1713,25 @@ def inspect_candidate(directory: str | Path) -> dict[str, Any]:
     }
 
 
+@dataclass(frozen=True)
+class AegisReleaseBundle:
+    """Reconstructed release bundle loaded transactionally by AegisReleaseConsumer."""
+    verification_result: dict[str, Any]
+    observations: list[RealObservation]
+    events: list[RealCollectionEvent]
+    discrepancies: list[RealDiscrepancyReport] = field(default_factory=list)
+
+
 class AegisReleaseConsumer:
     """Consumer interface for transactional verification and ingestion of ANIE releases into AEGIS.
-    
-    Guarantees that state updates (e.g. sequence tracker advancement) occur only if
-    complete cryptographic and referential verification passes.
+
+    Guarantees two-phase transactional atomicity (SEC-3.3-02):
+    Phase 1: Verifies cryptographic signatures, structural limits, hash chains, and referential integrity
+             WITHOUT advancing the sequence tracker.
+    Phase 2: Reads and strictly deserializes all partition records (events, observations, discrepancies).
+             If persist_callback is supplied, calls it to commit records to consumer database.
+    Phase 3: ONLY after Phase 1, Phase 2, and persistence succeed, advances the sequence tracker.
+             If an error or crash occurs during Phases 1 or 2, the tracker state remains untouched.
     """
 
     def __init__(
@@ -1551,8 +1751,34 @@ class AegisReleaseConsumer:
         *,
         now: str | None = None,
         allow_rollback: bool = False,
+        persist_callback: Any = None,
     ) -> tuple[dict[str, Any], list[RealObservation], list[RealCollectionEvent]]:
-        """Verify release integrity and provenance, advance tracker state, and load reconstructed models."""
+        """Verify release integrity and provenance, persist records, advance tracker, and load reconstructed models."""
+        bundle = self.verify_and_load_bundle(
+            directory,
+            now=now,
+            allow_rollback=allow_rollback,
+            persist_callback=persist_callback,
+        )
+        return bundle.verification_result, bundle.observations, bundle.events
+
+    def verify_and_load_bundle(
+        self,
+        directory: str | Path,
+        *,
+        now: str | None = None,
+        allow_rollback: bool = False,
+        persist_callback: Any = None,
+    ) -> AegisReleaseBundle:
+        """Execute two-phase transactional ingestion returning a full AegisReleaseBundle."""
+        if allow_rollback and not getattr(self.trust, "allow_rollback", False):
+            raise PermissionError(
+                "consumer rollback bypass rejected: operator trust policy explicitly prohibits rollback"
+            )
+
+        dir_path = Path(directory)
+
+        # Phase 1: Verify release without advancing sequence tracker
         res = verify_real_release(
             directory,
             trust=self.trust,
@@ -1560,9 +1786,10 @@ class AegisReleaseConsumer:
             now=now,
             allow_rollback=allow_rollback,
             allow_uninitialized_state=self.allow_uninitialized_state,
+            advance_tracker=False,
         )
 
-        dir_path = Path(directory)
+        # Phase 2: Deserialization of all partitions
         events: list[RealCollectionEvent] = []
         with gzip.open(dir_path / "real_events.jsonl.gz", "rb") as gz:
             for _, line in _iter_bounded_gzip_records(gz, partition_name="real_events.jsonl.gz"):
@@ -1573,4 +1800,31 @@ class AegisReleaseConsumer:
             for _, line in _iter_bounded_gzip_records(gz, partition_name="real_observations.jsonl.gz"):
                 observations.append(RealObservation.from_dict(json.loads(line.decode("utf-8"))))
 
-        return res, observations, events
+        discrepancies: list[RealDiscrepancyReport] = []
+        disc_path = dir_path / "real_discrepancies.jsonl.gz"
+        if disc_path.exists():
+            with gzip.open(disc_path, "rb") as gz:
+                for _, line in _iter_bounded_gzip_records(gz, partition_name="real_discrepancies.jsonl.gz"):
+                    discrepancies.append(RealDiscrepancyReport.from_dict(json.loads(line.decode("utf-8"))))
+
+        # Optional consumer persistence callback
+        if persist_callback is not None:
+            persist_callback(observations, events, discrepancies)
+
+        # Phase 3: Advance sequence tracker ONLY after deserialization and persistence succeed
+        seq = res.get("release_sequence")
+        publisher = res.get("publisher_identity")
+        if self.sequence_tracker is not None and not allow_rollback and seq is not None and publisher is not None:
+            self.sequence_tracker.update_accepted(
+                publisher,
+                seq,
+                manifest_sha256=res.get("manifest_sha256"),
+                allow_uninitialized=self.allow_uninitialized_state,
+            )
+
+        return AegisReleaseBundle(
+            verification_result=res,
+            observations=observations,
+            events=events,
+            discrepancies=discrepancies,
+        )

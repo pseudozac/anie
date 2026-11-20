@@ -71,8 +71,9 @@ from .real_models import (
     RealCollectionEvent,
     RealObservation,
 )
+from .discrepancy_models import RealDiscrepancyReport, DISCREPANCY_REPORT_SCHEMA
 
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 
 
 class RealObservationStore:
@@ -114,6 +115,12 @@ class RealObservationStore:
                 conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
             elif version < CURRENT_SCHEMA_VERSION:
                 self._migrate(conn, version, CURRENT_SCHEMA_VERSION)
+
+    @property
+    def schema_version(self) -> int:
+        """Current schema version of the SQLite database."""
+        with self._connect() as conn:
+            return int(conn.execute("PRAGMA user_version").fetchone()[0])
 
     def _apply_schema_v1(self, conn: sqlite3.Connection) -> None:
         """Initial schema creation."""
@@ -163,8 +170,53 @@ class RealObservationStore:
             ON real_observations(evidence_id)
         """)
 
+        # 3. Multi-Resolver Discrepancy Intelligence Ledger
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS real_discrepancies (
+                analysis_id TEXT PRIMARY KEY,
+                subject TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                analyzed_at TEXT NOT NULL,
+                verdict TEXT NOT NULL,
+                category TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                ruleset_version TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_real_discrepancies_subject_time 
+            ON real_discrepancies(subject, kind, analyzed_at, analysis_id)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_real_discrepancies_verdict 
+            ON real_discrepancies(verdict)
+        """)
+
     def _migrate(self, conn: sqlite3.Connection, from_version: int, to_version: int) -> None:
         """Incremental database schema migration framework."""
+        if from_version < 2:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS real_discrepancies (
+                    analysis_id TEXT PRIMARY KEY,
+                    subject TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    analyzed_at TEXT NOT NULL,
+                    verdict TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    ruleset_version TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_real_discrepancies_subject_time 
+                ON real_discrepancies(subject, kind, analyzed_at, analysis_id)
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_real_discrepancies_verdict 
+                ON real_discrepancies(verdict)
+            """)
         conn.execute(f"PRAGMA user_version = {to_version}")
 
     def insert_record(self, event: RealCollectionEvent, observation: RealObservation) -> bool:
@@ -522,6 +574,10 @@ class RealObservationStore:
             """, (limit,)).fetchall()
             return [RealObservation.from_dict(json.loads(r[0])) for r in rows]
 
+    def all_events(self, limit: int = 10000) -> list[RealCollectionEvent]:
+        """Fetch all real collection events up to limit."""
+        return self.export_events(limit=limit)
+
     # --- Retention & Referential Invariants ---
 
     def prune_observations_older_than(self, cutoff_iso: str) -> int:
@@ -599,3 +655,197 @@ class RealObservationStore:
         with self._connect() as conn:
             res = conn.execute(f"PRAGMA wal_checkpoint({mode})").fetchone()
             return (res[0], res[1], res[2])
+
+    # --- Multi-Resolver Discrepancy & Historical Intelligence ---
+
+    def insert_discrepancy(self, report: RealDiscrepancyReport) -> bool:
+        """Atomically insert a multi-resolver discrepancy analysis report.
+        
+        Strict Idempotency:
+        - If an identical record exists, returns False.
+        - If conflicting data with identical analysis_id exists, raises sqlite3.IntegrityError.
+        """
+        payload_json = canonical_json(report.to_dict())
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT payload FROM real_discrepancies WHERE analysis_id = ?",
+                (report.analysis_id,),
+            ).fetchone()
+            if row is not None:
+                if row[0] == payload_json:
+                    return False
+                raise sqlite3.IntegrityError(
+                    f"conflicting discrepancy record with identical analysis_id '{report.analysis_id}'"
+                )
+
+            conn.execute(
+                """
+                INSERT INTO real_discrepancies (
+                    analysis_id, subject, kind, analyzed_at, verdict, category, confidence, ruleset_version, payload
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    report.analysis_id,
+                    report.subject,
+                    report.kind,
+                    report.analyzed_at,
+                    report.verdict,
+                    report.category,
+                    report.confidence,
+                    report.ruleset_version,
+                    payload_json,
+                ),
+            )
+            return True
+
+    def get_discrepancy(self, analysis_id: str) -> RealDiscrepancyReport | None:
+        """Fetch a specific discrepancy report by analysis_id."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT payload FROM real_discrepancies WHERE analysis_id = ?",
+                (analysis_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return RealDiscrepancyReport.from_dict(json.loads(row[0]))
+
+    def discrepancies_for_subject(self, subject: str, kind: str | None = None, limit: int = 1000) -> list[RealDiscrepancyReport]:
+        """Fetch discrepancy reports for a subject ordered by analyzed_at DESC."""
+        with self._connect() as conn:
+            if kind:
+                rows = conn.execute(
+                    """
+                    SELECT payload FROM real_discrepancies
+                    WHERE subject = ? AND kind = ?
+                    ORDER BY analyzed_at DESC, analysis_id DESC
+                    LIMIT ?
+                    """,
+                    (subject, kind, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT payload FROM real_discrepancies
+                    WHERE subject = ?
+                    ORDER BY analyzed_at DESC, analysis_id DESC
+                    LIMIT ?
+                    """,
+                    (subject, limit),
+                ).fetchall()
+            return [RealDiscrepancyReport.from_dict(json.loads(r[0])) for r in rows]
+
+    def all_discrepancies(self, limit: int = 10000) -> list[RealDiscrepancyReport]:
+        """Fetch all discrepancy reports ordered by analyzed_at ASC, analysis_id ASC."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT payload FROM real_discrepancies
+                ORDER BY analyzed_at ASC, analysis_id ASC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            return [RealDiscrepancyReport.from_dict(json.loads(r[0])) for r in rows]
+
+    def get_historical_summary(
+        self,
+        subject: str,
+        kind: str = "dns_a",
+        *,
+        record_type: str | None = None,
+    ) -> dict[str, Any]:
+        """Compute resource-efficient historical intelligence foundation for a domain.
+        
+        Evaluates repeated observations, first-seen / last-seen timestamps,
+        timeline of observed IP sets, resolver agreement rate, and security filtering incidents.
+        """
+        query_kind = record_type or kind
+        with self._connect() as conn:
+            # 1. Observation bounds
+            bounds = conn.execute(
+                """
+                SELECT MIN(observed_at), MAX(observed_at), COUNT(*)
+                FROM real_observations
+                WHERE subject = ? AND kind = ?
+                """,
+                (subject, query_kind),
+            ).fetchone()
+
+            first_seen = bounds[0] if bounds and bounds[2] > 0 else None
+            last_seen = bounds[1] if bounds and bounds[2] > 0 else None
+            total_obs = bounds[2] if bounds else 0
+
+            # 2. Distinct observations timeline
+            obs_rows = conn.execute(
+                """
+                SELECT observed_at, source_id, status, payload
+                FROM real_observations
+                WHERE subject = ? AND kind = ?
+                ORDER BY observed_at ASC, observation_id ASC
+                """,
+                (subject, query_kind),
+            ).fetchall()
+
+            timeline = []
+            distinct_value_sets = set()
+            all_ips = set()
+            for obs_time, source_id, status, payload_json in obs_rows:
+                obs_data = json.loads(payload_json)
+                vals = tuple(sorted(obs_data.get("values", [])))
+                distinct_value_sets.add(vals)
+                for v in vals:
+                    all_ips.add(v)
+                timeline.append({
+                    "observed_at": obs_time,
+                    "source_id": source_id,
+                    "status": status,
+                    "values": list(vals),
+                    "resolver": obs_data.get("factual_verification", {}).get("resolver_identity", source_id),
+                })
+
+            # 3. Discrepancy reports history
+            disc_rows = conn.execute(
+                """
+                SELECT analyzed_at, verdict, category, confidence, payload
+                FROM real_discrepancies
+                WHERE subject = ? AND kind = ?
+                ORDER BY analyzed_at ASC, analysis_id ASC
+                """,
+                (subject, query_kind),
+            ).fetchall()
+
+            discrepancy_history = []
+            agreement_count = 0
+            filtering_incidents = 0
+            for a_time, verdict, cat, conf, p_json in disc_rows:
+                if verdict == "AGREEMENT":
+                    agreement_count += 1
+                elif verdict == "SECURITY_FILTERING_DETECTED":
+                    filtering_incidents += 1
+                discrepancy_history.append({
+                    "analyzed_at": a_time,
+                    "verdict": verdict,
+                    "category": cat,
+                    "confidence": conf,
+                })
+
+            total_disc = len(disc_rows)
+            agreement_rate = (agreement_count / total_disc) if total_disc > 0 else None
+
+            return {
+                "subject": subject,
+                "kind": query_kind,
+                "record_type": query_kind,
+                "first_seen": first_seen,
+                "last_seen": last_seen,
+                "total_observations": total_obs,
+                "total_discrepancy_reports": total_disc,
+                "total_discrepancy_analyses": total_disc,
+                "unique_ip_sets_observed": len(distinct_value_sets),
+                "unique_ip_addresses": sorted(all_ips),
+                "resolver_agreement_rate": agreement_rate,
+                "agreement_rate": agreement_rate,
+                "security_filtering_incidents": filtering_incidents,
+                "timeline": timeline,
+                "discrepancies": discrepancy_history,
+            }
