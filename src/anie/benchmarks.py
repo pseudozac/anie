@@ -326,6 +326,7 @@ def benchmark_snapshot(report: dict) -> dict:
 
 def profiled_benchmark(seed: int = DEFAULT_SEED) -> tuple[dict, dict]:
     """Resource measurements are diagnostic only; never golden-snapshot inputs."""
+    from .profiling import get_process_rss
     tracemalloc.start()
     began = perf_counter()
     try:
@@ -334,4 +335,11 @@ def profiled_benchmark(seed: int = DEFAULT_SEED) -> tuple[dict, dict]:
         _, peak = tracemalloc.get_traced_memory()
     finally:
         tracemalloc.stop()
-    return report, {"elapsed_ms": elapsed_ms, "peak_allocated_bytes": peak, "note": "local Python allocator only, not total RSS; hardware-dependent"}
+        rss = get_process_rss()
+    return report, {
+        "elapsed_ms": elapsed_ms,
+        "peak_allocated_bytes": peak,
+        "current_rss_bytes": rss["current_rss_bytes"],
+        "peak_rss_bytes": rss["peak_rss_bytes"],
+        "note": "local Python allocator and true OS process RSS; hardware-dependent",
+    }

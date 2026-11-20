@@ -1809,7 +1809,11 @@ class AegisReleaseConsumer:
 
         # Optional consumer persistence callback
         if persist_callback is not None:
-            persist_callback(observations, events, discrepancies)
+            cb_result = persist_callback(observations, events, discrepancies)
+            if cb_result is False:
+                raise RuntimeError(
+                    "consumer persistence callback explicitly returned False; rejecting release ingestion"
+                )
 
         # Phase 3: Advance sequence tracker ONLY after deserialization and persistence succeed
         seq = res.get("release_sequence")
