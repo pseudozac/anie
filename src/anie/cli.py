@@ -36,6 +36,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--commit", default=None, help="source repository commit hash")
     p.add_argument("--published-at", default=None, help="optional fixed publication timestamp for reproducible manifest")
     p.add_argument("--include-discrepancies", action="store_true", help="include discrepancy reports partition in release (v3 manifest)")
+    p.add_argument("--include-claims", action="store_true", help="include intelligence claims partition in release (v4 manifest)")
     p = sub.add_parser("analyze-discrepancy", help="evaluate multi-resolver observations for a subject from database and generate discrepancy report")
     p.add_argument("--db", required=True, help="path to real intelligence SQLite database")
     p.add_argument("--subject", required=True, help="target domain name to analyze")
@@ -109,6 +110,23 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--backup-dir", required=True, help="source backup directory containing SHA256SUMS")
     p.add_argument("--target", required=True, help="isolated destination directory for restored databases")
     p.add_argument("--allow-overwrite", action="store_true", help="permit overwriting existing files in destination")
+    p = sub.add_parser("evaluate-intelligence", help="execute ground-truth benchmark and output intelligence quality report")
+    p.add_argument("--db", default=None, help="optional path to SQLite database; uses in-memory if omitted")
+    p.add_argument("--out", default=None, help="optional output path to write evaluation report JSON")
+    p = sub.add_parser("export-ioc-feed", help="export canonical threat intelligence IOC feed via consumer contract")
+    p.add_argument("--db", required=True, help="path to real intelligence SQLite database")
+    p.add_argument("--out", default=None, help="optional output path to write IOC feed JSON")
+    p.add_argument("--as-of", default=None, help="historical point-in-time cutoff (UTC ISO)")
+    p.add_argument("--min-confidence", type=float, default=0.0, help="minimum confidence threshold (0.0 to 1.0)")
+    p.add_argument("--layer", default=None, help="optional layer filter (e.g. HYPOTHESIS, VALIDATED)")
+    p = sub.add_parser("prune-retention", help="execute evidence-preserving retention pruning and compaction")
+    p.add_argument("--db", required=True, help="path to real intelligence SQLite database")
+    p.add_argument("--obs-ttl", type=int, default=90, help="observation TTL in days (default: 90)")
+    p.add_argument("--evt-ttl", type=int, default=180, help="raw event TTL in days (default: 180)")
+    p.add_argument("--no-vacuum", action="store_true", help="skip incremental vacuum compaction")
+    p = sub.add_parser("project-storage", help="calculate empirical storage, WAL, backup, and release growth projections")
+    p.add_argument("--profile", choices=["pilot", "production", "scale"], default=None, help="filter by workload profile")
+    p.add_argument("--days", type=int, choices=[30, 90, 180, 365], default=None, help="filter by projection horizon days")
     args = parser.parse_args(argv)
     try:
         if args.command == "demo":
@@ -159,6 +177,7 @@ def main(argv: list[str] | None = None) -> int:
                 source_commit=args.commit,
                 published_at=args.published_at,
                 include_discrepancies=args.include_discrepancies,
+                include_claims=getattr(args, "include_claims", False),
             )
             print(json.dumps({"published": True, "manifest": manifest}, indent=2))
             return 0
@@ -332,6 +351,65 @@ def main(argv: list[str] | None = None) -> int:
             store = RealObservationStore(args.db)
             summary = store.get_historical_summary(args.subject, record_type=args.record_type)
             print(json.dumps(summary, indent=2))
+            return 0
+        elif args.command == "evaluate-intelligence":
+            import tempfile
+            from .intelligence_evaluator import IntelligenceEvaluator
+            from .real_store import RealObservationStore
+            if args.db:
+                store = RealObservationStore(args.db)
+                evaluator = IntelligenceEvaluator(store)
+                rep = evaluator.evaluate()
+            else:
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    tmp_db = Path(tmpdir) / "eval.sqlite"
+                    store = RealObservationStore(tmp_db)
+                    evaluator = IntelligenceEvaluator(store)
+                    rep = evaluator.evaluate()
+            out_dict = rep.to_dict()
+            if args.out:
+                Path(args.out).write_text(json.dumps(out_dict, indent=2) + "\n", encoding="utf-8")
+            print(json.dumps(out_dict, indent=2))
+            return 0
+        elif args.command == "export-ioc-feed":
+            from .consumer_contract import AnieIntelligenceClient
+            from .real_store import RealObservationStore
+            store = RealObservationStore(args.db)
+            client = AnieIntelligenceClient(store)
+            feed = client.export_canonical_ioc_feed(
+                as_of=args.as_of,
+                min_confidence=args.min_confidence,
+                layer=args.layer,
+            )
+            out_dict = feed.to_dict()
+            if args.out:
+                Path(args.out).write_text(json.dumps(out_dict, indent=2) + "\n", encoding="utf-8")
+            print(json.dumps(out_dict, indent=2))
+            return 0
+        elif args.command == "prune-retention":
+            from .real_store import RealObservationStore
+            from .retention import RetentionPolicy, safe_prune_retention
+            store = RealObservationStore(args.db)
+            policy = RetentionPolicy(
+                observation_ttl_days=args.obs_ttl,
+                event_ttl_days=args.evt_ttl,
+                compact_vacuum=not args.no_vacuum,
+            )
+            report = safe_prune_retention(store, policy)
+            print(json.dumps(report.to_dict(), indent=2))
+            return 0
+        elif args.command == "project-storage":
+            from .retention import StorageGrowthModel
+            if args.profile and args.days:
+                proj = StorageGrowthModel.project(args.profile, args.days)
+                print(json.dumps(proj.__dict__, indent=2))
+            else:
+                projections = StorageGrowthModel.generate_full_report()
+                if args.profile:
+                    projections = [p for p in projections if p.profile_name == args.profile]
+                if args.days:
+                    projections = [p for p in projections if p.days == args.days]
+                print(json.dumps([p.__dict__ for p in projections], indent=2))
             return 0
         return 0
     except (ValueError, PermissionError, FileNotFoundError, FileExistsError, json.JSONDecodeError) as exc:

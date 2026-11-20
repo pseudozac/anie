@@ -44,6 +44,10 @@ from .discrepancy_models import (
     REAL_DISCREPANCY_SCHEMA,
     RealDiscrepancyReport,
 )
+from .graph_models import (
+    INTELLIGENCE_CLAIM_SCHEMA,
+    IntelligenceClaim,
+)
 from .observations import canonical_json, utc_iso
 from .real_models import (
     REAL_EVENT_SCHEMA,
@@ -57,8 +61,9 @@ from .real_store import RealObservationStore
 REAL_MANIFEST_SCHEMA_V1 = "anie.real-dataset-manifest.v1"
 REAL_MANIFEST_SCHEMA_V2 = "anie.real-dataset-manifest.v2"
 REAL_MANIFEST_SCHEMA_V3 = "anie.real-dataset-manifest.v3"
-REAL_MANIFEST_SCHEMA = REAL_MANIFEST_SCHEMA_V3
-REAL_MANIFEST_SCHEMAS = frozenset({REAL_MANIFEST_SCHEMA_V1, REAL_MANIFEST_SCHEMA_V2, REAL_MANIFEST_SCHEMA_V3})
+REAL_MANIFEST_SCHEMA_V4 = "anie.real-dataset-manifest.v4"
+REAL_MANIFEST_SCHEMA = REAL_MANIFEST_SCHEMA_V4
+REAL_MANIFEST_SCHEMAS = frozenset({REAL_MANIFEST_SCHEMA_V1, REAL_MANIFEST_SCHEMA_V2, REAL_MANIFEST_SCHEMA_V3, REAL_MANIFEST_SCHEMA_V4})
 
 DATASET_TYPE_REAL = "first_party_intelligence"
 
@@ -83,7 +88,7 @@ TRACKER_SCHEMA = TRACKER_SCHEMA_V2
 TRACKER_SCHEMAS = frozenset({TRACKER_SCHEMA_V1, TRACKER_SCHEMA_V2})
 
 REQUIRED_PARTITION_FILES = frozenset({"real_observations.jsonl.gz", "real_events.jsonl.gz"})
-OPTIONAL_PARTITION_FILES = frozenset({"real_discrepancies.jsonl.gz"})
+OPTIONAL_PARTITION_FILES = frozenset({"real_discrepancies.jsonl.gz", "real_claims.jsonl.gz"})
 ALLOWED_PARTITION_FILES = REQUIRED_PARTITION_FILES | OPTIONAL_PARTITION_FILES
 REAL_PARTITION_FILES = REQUIRED_PARTITION_FILES
 
@@ -272,7 +277,8 @@ def export_canonical_dataset(
     limit: int = MAX_RECORDS_PER_PARTITION,
     *,
     include_discrepancies: bool = False,
-) -> tuple[list[RealObservation], list[RealCollectionEvent]] | tuple[list[RealObservation], list[RealCollectionEvent], list[RealDiscrepancyReport]]:
+    include_claims: bool = False,
+) -> tuple[Any, ...]:
     """Export a consistent SQLite snapshot of real observations and referenced events.
     
     Guarantees:
@@ -283,6 +289,7 @@ def export_canonical_dataset(
     - Raw evidence hashes verified for all exported events.
     - When include_discrepancies=True, exports real_discrepancies ordered by (analyzed_at ASC, discrepancy_id ASC).
     - Discrepancy referential integrity: all referenced observation_ids and evidence_ids exist.
+    - When include_claims=True, exports intelligence_claims ordered by (asserted_at ASC, claim_id ASC).
     - Rejects any synthetic record unconditionally.
     - Fail-closed if dataset exceeds limit (no silent truncation).
     """
@@ -366,54 +373,86 @@ def export_canonical_dataset(
                     f"missing collection events (sample: {sorted(missing_evidence)[:3]})"
                 )
 
-            if not include_discrepancies:
+            if not include_discrepancies and not include_claims:
                 conn.commit()
                 return observations, events
 
             # Export discrepancies if requested
-            table_check = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='real_discrepancies'"
-            ).fetchone()
             discrepancies: list[RealDiscrepancyReport] = []
-            if table_check is not None:
-                disc_rows = conn.execute(
-                    """
-                    SELECT payload FROM real_discrepancies
-                    WHERE analyzed_at <= ?
-                    ORDER BY analyzed_at ASC, analysis_id ASC
-                    LIMIT ?
-                    """,
-                    (as_of_iso, limit + 1),
-                ).fetchall()
+            if include_discrepancies:
+                table_check = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='real_discrepancies'"
+                ).fetchone()
+                if table_check is not None:
+                    disc_rows = conn.execute(
+                        """
+                        SELECT payload FROM real_discrepancies
+                        WHERE analyzed_at <= ?
+                        ORDER BY analyzed_at ASC, analysis_id ASC
+                        LIMIT ?
+                        """,
+                        (as_of_iso, limit + 1),
+                    ).fetchall()
 
-                if len(disc_rows) > limit:
-                    raise ValueError(
-                        f"dataset exceeds maximum partition limit of {limit} discrepancies "
-                        f"(found >{limit} records at or before as_of '{as_of_iso}'); "
-                        f"silent truncation rejected"
-                    )
+                    if len(disc_rows) > limit:
+                        raise ValueError(
+                            f"dataset exceeds maximum partition limit of {limit} discrepancies "
+                            f"(found >{limit} records at or before as_of '{as_of_iso}'); "
+                            f"silent truncation rejected"
+                        )
 
-                obs_ids = {o.observation_id for o in observations}
-                for (disc_json,) in disc_rows:
-                    raw_disc = json.loads(disc_json)
-                    report = RealDiscrepancyReport.from_dict(raw_disc)
-                    obs_id_vals = list(report.observation_ids.values()) if isinstance(report.observation_ids, dict) else list(report.observation_ids)
-                    for oid in obs_id_vals:
-                        if oid not in obs_ids:
-                            raise ValueError(
-                                f"discrepancy '{report.discrepancy_id}' references observation '{oid}' "
-                                f"not present in exported observations"
-                            )
-                    ev_id_vals = list(report.evidence_ids.values()) if isinstance(report.evidence_ids, dict) else list(report.evidence_ids)
-                    for eid in ev_id_vals:
-                        if eid not in event_ids:
-                            raise ValueError(
-                                f"discrepancy '{report.discrepancy_id}' references evidence '{eid}' "
-                                f"not present in exported events"
-                            )
-                    discrepancies.append(report)
+                    obs_ids = {o.observation_id for o in observations}
+                    for (disc_json,) in disc_rows:
+                        raw_disc = json.loads(disc_json)
+                        report = RealDiscrepancyReport.from_dict(raw_disc)
+                        obs_id_vals = list(report.observation_ids.values()) if isinstance(report.observation_ids, dict) else list(report.observation_ids)
+                        for oid in obs_id_vals:
+                            if oid not in obs_ids:
+                                raise ValueError(
+                                    f"discrepancy '{report.discrepancy_id}' references observation '{oid}' "
+                                    f"not present in exported observations"
+                                )
+                        ev_id_vals = list(report.evidence_ids.values()) if isinstance(report.evidence_ids, dict) else list(report.evidence_ids)
+                        for eid in ev_id_vals:
+                            if eid not in event_ids:
+                                raise ValueError(
+                                    f"discrepancy '{report.discrepancy_id}' references evidence '{eid}' "
+                                    f"not present in exported events"
+                                )
+                        discrepancies.append(report)
+
+            # Export intelligence claims if requested
+            claims: list[IntelligenceClaim] = []
+            if include_claims:
+                claims_table_check = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='intelligence_claims'"
+                ).fetchone()
+                if claims_table_check is not None:
+                    claim_rows = conn.execute(
+                        """
+                        SELECT payload FROM intelligence_claims
+                        WHERE asserted_at <= ?
+                        ORDER BY asserted_at ASC, claim_id ASC
+                        LIMIT ?
+                        """,
+                        (as_of_iso, limit + 1),
+                    ).fetchall()
+
+                    if len(claim_rows) > limit:
+                        raise ValueError(
+                            f"dataset exceeds maximum partition limit of {limit} claims "
+                            f"(found >{limit} records at or before as_of '{as_of_iso}'); "
+                            f"silent truncation rejected"
+                        )
+
+                    for (c_json,) in claim_rows:
+                        raw_c = json.loads(c_json)
+                        claim_obj = IntelligenceClaim.from_dict(raw_c)
+                        claims.append(claim_obj)
 
             conn.commit()
+            if include_claims:
+                return observations, events, discrepancies, claims
             return observations, events, discrepancies
         except Exception:
             conn.rollback()
@@ -421,7 +460,7 @@ def export_canonical_dataset(
 
 
 def publish_real(
-    store_or_data: RealObservationStore | tuple[list[RealObservation], list[RealCollectionEvent]] | tuple[list[RealObservation], list[RealCollectionEvent], list[RealDiscrepancyReport]],
+    store_or_data: Any,
     output_dir: str | Path,
     as_of: str,
     *,
@@ -432,7 +471,9 @@ def publish_real(
     published_at: str | None = None,
     limit: int = MAX_RECORDS_PER_PARTITION,
     include_discrepancies: bool = False,
+    include_claims: bool = False,
     discrepancies: list[RealDiscrepancyReport] | None = None,
+    claims: list[IntelligenceClaim] | None = None,
 ) -> dict[str, Any]:
     """Publish a deterministic, canonical real-world intelligence dataset.
     
@@ -463,8 +504,20 @@ def publish_real(
     now_iso = utc_iso(published_at) if published_at is not None else datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
     disc_list: list[RealDiscrepancyReport] | None = discrepancies
+    claim_list: list[IntelligenceClaim] | None = claims
     if isinstance(store_or_data, RealObservationStore):
-        if include_discrepancies or discrepancies is not None:
+        want_discs = include_discrepancies or discrepancies is not None
+        want_claims = include_claims or claims is not None
+        if want_claims:
+            exp_res = export_canonical_dataset(
+                store_or_data,
+                as_of_iso,
+                limit=limit,
+                include_discrepancies=want_discs,
+                include_claims=True,
+            )
+            observations, events, disc_list, claim_list = exp_res
+        elif want_discs:
             if disc_list is None:
                 exp_res = export_canonical_dataset(store_or_data, as_of_iso, limit=limit, include_discrepancies=True)
                 assert len(exp_res) == 3
@@ -474,14 +527,16 @@ def publish_real(
         else:
             observations, events = export_canonical_dataset(store_or_data, as_of_iso, limit=limit, include_discrepancies=False)  # type: ignore[misc]
     elif isinstance(store_or_data, tuple):
-        if len(store_or_data) == 3:
+        if len(store_or_data) == 4:
+            observations, events, disc_list, claim_list = store_or_data  # type: ignore[misc]
+        elif len(store_or_data) == 3:
             observations, events, disc_list = store_or_data  # type: ignore[misc]
         elif len(store_or_data) == 2:
             observations, events = store_or_data  # type: ignore[misc]
         else:
-            raise TypeError("store_or_data tuple must have length 2 or 3")
+            raise TypeError("store_or_data tuple must have length 2, 3, or 4")
     else:
-        raise TypeError("store_or_data must be RealObservationStore or (observations, events[, discrepancies]) tuple")
+        raise TypeError("store_or_data must be RealObservationStore or (observations, events[, discrepancies, claims]) tuple")
 
     if not observations:
         raise ValueError("cannot publish empty observation dataset")
@@ -512,7 +567,7 @@ def publish_real(
         obs_ids.add(o.observation_id)
 
     # Validate discrepancies if present
-    if disc_list is not None:
+    if disc_list is not None and len(disc_list) > 0:
         disc_list = sorted(disc_list, key=lambda d: (d.analyzed_at, d.discrepancy_id))
         for d in disc_list:
             obs_id_vals = list(d.observation_ids.values()) if isinstance(d.observation_ids, dict) else list(d.observation_ids)
@@ -523,6 +578,10 @@ def publish_real(
             for eid in ev_id_vals:
                 if eid not in event_ids:
                     raise ValueError(f"discrepancy '{d.discrepancy_id}' references missing evidence '{eid}'")
+
+    # Validate claims if present
+    if claim_list is not None and len(claim_list) > 0:
+        claim_list = sorted(claim_list, key=lambda c: (c.asserted_at, c.claim_id))
 
     # Atomic publication via temporary staging directory
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -537,18 +596,29 @@ def publish_real(
         ev_meta = _write_deterministic_gzip(staging_path / "real_events.jsonl.gz", ev_records)
 
         partition_files = [obs_meta, ev_meta]
-        has_discrepancies = disc_list is not None
+        has_discrepancies = disc_list is not None and len(disc_list) > 0
+        has_claims = claim_list is not None and len(claim_list) > 0
 
         if has_discrepancies:
             disc_records = (d.to_dict() for d in disc_list)
             disc_meta = _write_deterministic_gzip(staging_path / "real_discrepancies.jsonl.gz", disc_records)
             partition_files.append(disc_meta)
 
+        if has_claims:
+            claim_records = (c.to_dict() for c in claim_list)
+            claim_meta = _write_deterministic_gzip(staging_path / "real_claims.jsonl.gz", claim_records)
+            partition_files.append(claim_meta)
+
         commit_val = source_commit or ("0" * 40)
         if not _COMMIT_RE.fullmatch(commit_val):
             raise ValueError(f"invalid source_commit: {commit_val!r} (must be 40-character hex)")
 
-        manifest_schema = REAL_MANIFEST_SCHEMA_V3 if has_discrepancies else REAL_MANIFEST_SCHEMA_V2
+        if has_claims:
+            manifest_schema = REAL_MANIFEST_SCHEMA_V4
+        elif has_discrepancies:
+            manifest_schema = REAL_MANIFEST_SCHEMA_V3
+        else:
+            manifest_schema = REAL_MANIFEST_SCHEMA_V2
 
         manifest = {
             "schema": manifest_schema,
@@ -570,6 +640,8 @@ def publish_real(
         }
         if has_discrepancies:
             manifest["total_discrepancies"] = len(disc_list)
+        if has_claims:
+            manifest["total_claims"] = len(claim_list)
 
         manifest_path = staging_path / "manifest.json"
         manifest_path.write_text(canonical_json(manifest) + "\n", encoding="utf-8")
@@ -607,28 +679,31 @@ def _read_and_validate_manifest(directory: Path) -> tuple[bytes, str, dict[str, 
     if manifest.get("dataset_type") != DATASET_TYPE_REAL:
         raise ValueError(f"unsupported dataset_type: {manifest.get('dataset_type')!r}")
 
-    if manifest.get("schema") in (REAL_MANIFEST_SCHEMA_V2, REAL_MANIFEST_SCHEMA_V3):
+    if manifest.get("schema") in (REAL_MANIFEST_SCHEMA_V2, REAL_MANIFEST_SCHEMA_V3, REAL_MANIFEST_SCHEMA_V4):
         seq = manifest.get("release_sequence")
         prev_sha = manifest.get("prev_manifest_sha256")
         if seq == 1 and prev_sha is not None:
-            raise ValueError("prev_manifest_sha256 must be null for release_sequence 1 in v2/v3 manifest")
+            raise ValueError("prev_manifest_sha256 must be null for release_sequence 1 in v2/v3/v4 manifest")
         if isinstance(seq, int) and seq > 1 and prev_sha is not None:
             if not isinstance(prev_sha, str) or not _SHA256_RE.fullmatch(prev_sha):
-                raise ValueError(f"invalid prev_manifest_sha256 in v2/v3 manifest: {prev_sha!r}")
+                raise ValueError(f"invalid prev_manifest_sha256 in v2/v3/v4 manifest: {prev_sha!r}")
 
     files = manifest.get("files")
-    if not isinstance(files, list) or len(files) not in (2, 3):
-        raise ValueError("manifest must specify 2 or 3 partition files")
+    if not isinstance(files, list) or len(files) not in (2, 3, 4):
+        raise ValueError("manifest must specify 2, 3, or 4 partition files")
     found_files = {f.get("file") for f in files}
     if not REQUIRED_PARTITION_FILES.issubset(found_files) or not found_files.issubset(ALLOWED_PARTITION_FILES):
         raise ValueError(f"unexpected manifest partition files: {found_files}")
-    if len(files) == 3 and "real_discrepancies.jsonl.gz" not in found_files:
-        raise ValueError("3-partition manifest must include real_discrepancies.jsonl.gz")
     if "real_discrepancies.jsonl.gz" in found_files:
-        if manifest.get("schema") != REAL_MANIFEST_SCHEMA_V3:
-            raise ValueError("releases containing real_discrepancies.jsonl.gz must use V3 manifest schema")
+        if manifest.get("schema") not in (REAL_MANIFEST_SCHEMA_V3, REAL_MANIFEST_SCHEMA_V4):
+            raise ValueError("releases containing real_discrepancies.jsonl.gz must use V3 or V4 manifest schema")
         if "total_discrepancies" not in manifest or not isinstance(manifest.get("total_discrepancies"), int) or manifest.get("total_discrepancies") < 0:
             raise ValueError("manifest with real_discrepancies.jsonl.gz must specify valid non-negative integer total_discrepancies")
+    if "real_claims.jsonl.gz" in found_files:
+        if manifest.get("schema") != REAL_MANIFEST_SCHEMA_V4:
+            raise ValueError("releases containing real_claims.jsonl.gz must use V4 manifest schema")
+        if "total_claims" not in manifest or not isinstance(manifest.get("total_claims"), int) or manifest.get("total_claims") < 0:
+            raise ValueError("manifest with real_claims.jsonl.gz must specify valid non-negative integer total_claims")
 
     manifest_sha = sha256(raw_bytes).hexdigest()
     return raw_bytes, manifest_sha, manifest
@@ -1315,6 +1390,40 @@ def verify_real_release(
         if manifest.get("total_discrepancies") != disc_count:
             raise ValueError(f"manifest total_discrepancies ({manifest.get('total_discrepancies')}) does not match actual count ({disc_count})")
 
+    # 4b. Bounded Streaming Decompression & Strict Model Reconstruction for Claims (if present)
+    claim_count = 0
+    if "real_claims.jsonl.gz" in files_map:
+        claim_path = dir_path / "real_claims.jsonl.gz"
+        claim_meta = files_map["real_claims.jsonl.gz"]
+        prev_claim_order: tuple[str, str] | None = None
+
+        with gzip.open(claim_path, "rb") as gz:
+            for line_num, line_bytes in _iter_bounded_gzip_records(
+                gz,
+                max_record_bytes=MAX_SINGLE_RECORD_BYTES,
+                max_total_bytes=MAX_PARTITION_DECOMPRESSED_BYTES,
+                max_records=MAX_RECORDS_PER_PARTITION,
+                partition_name="real_claims.jsonl.gz",
+            ):
+                try:
+                    raw_dict = json.loads(line_bytes.decode("utf-8"))
+                except (ValueError, UnicodeDecodeError) as exc:
+                    raise ValueError(f"malformed JSON in real_claims line #{line_num}: {exc}") from exc
+
+                claim_obj = IntelligenceClaim.from_dict(raw_dict)
+                current_order = (claim_obj.asserted_at, claim_obj.claim_id)
+                if prev_claim_order is not None and current_order <= prev_claim_order:
+                    if current_order == prev_claim_order:
+                        raise ValueError(f"duplicate claim_id '{claim_obj.claim_id}' detected at line #{line_num}")
+                    raise ValueError(f"claims partition out of deterministic order at line #{line_num}: {current_order} <= {prev_claim_order}")
+                prev_claim_order = current_order
+                claim_count += 1
+
+        if claim_count != claim_meta.get("records"):
+            raise ValueError(f"record count mismatch for real_claims: expected {claim_meta.get('records')}, got {claim_count}")
+        if manifest.get("total_claims") != claim_count:
+            raise ValueError(f"manifest total_claims ({manifest.get('total_claims')}) does not match actual count ({claim_count})")
+
     # 5. Integrity-Only Early Exit
     if integrity_only:
         return {
@@ -1332,6 +1441,7 @@ def verify_real_release(
             "total_observations": obs_count,
             "total_events": event_count,
             "total_discrepancies": disc_count,
+            "total_claims": claim_count,
             "manifest_sha256": manifest_sha,
             "publisher_identity": manifest.get("publisher"),
             "key_id": None,
@@ -1555,6 +1665,7 @@ def verify_real_release(
         "total_observations": obs_count,
         "total_events": event_count,
         "total_discrepancies": disc_count,
+        "total_claims": claim_count,
         "manifest_sha256": manifest_sha,
         "publisher_identity": payload["publisher"],
         "key_id": key_id,
@@ -1720,6 +1831,7 @@ class AegisReleaseBundle:
     observations: list[RealObservation]
     events: list[RealCollectionEvent]
     discrepancies: list[RealDiscrepancyReport] = field(default_factory=list)
+    claims: list[IntelligenceClaim] = field(default_factory=list)
 
 
 class AegisReleaseConsumer:
@@ -1830,11 +1942,18 @@ class AegisReleaseConsumer:
                 for _, line in _iter_bounded_gzip_records(gz, partition_name="real_discrepancies.jsonl.gz"):
                     discrepancies.append(RealDiscrepancyReport.from_dict(json.loads(line.decode("utf-8"))))
 
+        claims: list[IntelligenceClaim] = []
+        claims_path = dir_path / "real_claims.jsonl.gz"
+        if claims_path.exists():
+            with gzip.open(claims_path, "rb") as gz:
+                for _, line in _iter_bounded_gzip_records(gz, partition_name="real_claims.jsonl.gz"):
+                    claims.append(IntelligenceClaim.from_dict(json.loads(line.decode("utf-8"))))
+
         seq = res.get("release_sequence")
         pub_id = res.get("publisher_identity") or publisher_id
         manifest_hash = res.get("manifest_sha256")
 
-        # Atomic consumer store persistence (M3.3.2)
+        # Atomic consumer store persistence (M3.3.2 & M3.5)
         if self.store is not None and seq is not None and pub_id is not None:
             self.store.ingest_release_bundle(
                 observations=observations,
@@ -1845,10 +1964,15 @@ class AegisReleaseConsumer:
                 manifest_sha256=manifest_hash or "",
                 is_historical=allow_rollback,
             )
+            for c in claims:
+                self.store.insert_claim(c)
 
         # Optional consumer persistence callback
         if persist_callback is not None:
-            cb_result = persist_callback(observations, events, discrepancies)
+            try:
+                cb_result = persist_callback(observations, events, discrepancies, claims)
+            except TypeError:
+                cb_result = persist_callback(observations, events, discrepancies)
             if cb_result is False:
                 raise RuntimeError(
                     "consumer persistence callback explicitly returned False; rejecting release ingestion"
@@ -1868,4 +1992,5 @@ class AegisReleaseConsumer:
             observations=observations,
             events=events,
             discrepancies=discrepancies,
+            claims=claims,
         )
