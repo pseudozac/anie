@@ -62,12 +62,16 @@ DEFAULT_TRUSTED_COLLECTORS: frozenset[str] = frozenset({
 
 
 @dataclass(frozen=True)
-class TrustedCollectorPolicy:
-    """Explicit policy defining authenticated first-party collectors and verification requirements.
+class CollectorIdentityPolicy:
+    """Local identity allowlist policy defining recognized first-party collector names.
 
-    Strict Epistemic Invariant:
-    A source ID is an identifier, not authentication. Open prefix matching is rejected.
-    Only explicit, policy-trusted collector identities are accepted.
+    Epistemic Distinction & Security Boundaries:
+    Exact collector-name allowlisting is an identity filter for recognized collector names,
+    NOT cryptographic collector authentication. A source ID is treated as an identifier.
+    In the local single-node architecture, collector names filter recognized collection sources
+    and prevent unauthorized prefixes (e.g. synthetic or unknown sources).
+    Cryptographic collector authentication requires verifiable signed collector receipts
+    (introduced in Milestone M3.11 Federation Architecture).
     """
     trusted_collector_ids: frozenset[str] = DEFAULT_TRUSTED_COLLECTORS
     custom_allowed_collectors: frozenset[str] = frozenset()
@@ -75,13 +79,17 @@ class TrustedCollectorPolicy:
     allow_legacy_unauthenticated: bool = False
 
     def is_trusted_collector(self, source_id: str | None) -> bool:
-        """Validate that a source_id represents an authentic, policy-trusted collector."""
+        """Validate that a source_id represents a policy-allowlisted collector identity."""
         if not source_id or not isinstance(source_id, str):
             return False
         clean_id = source_id.strip()
         if clean_id.startswith("synthetic:"):
             return False
         return (clean_id in self.trusted_collector_ids) or (clean_id in self.custom_allowed_collectors)
+
+
+# Backward-compatible alias for existing callers
+TrustedCollectorPolicy = CollectorIdentityPolicy
 
 
 def is_authorized_collector_source(

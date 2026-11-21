@@ -1340,6 +1340,7 @@ def verify_real_release(
     event_hashes: set[str] = set()
     event_kinds_by_id: dict[str, str] = {}
     event_kinds_by_hash: dict[str, str] = {}
+    event_hashes_by_id: dict[str, str] = {}
     prev_event_order: tuple[str, str] | None = None
     event_count = 0
 
@@ -1376,6 +1377,7 @@ def verify_real_release(
             event_hashes.add(event.raw_sha256)
             event_kinds_by_id[event.event_id] = ev_k
             event_kinds_by_hash[event.raw_sha256] = ev_k
+            event_hashes_by_id[event.event_id] = event.raw_sha256
             event_count += 1
 
     if event_count != event_meta.get("records"):
@@ -1539,18 +1541,39 @@ def verify_real_release(
                     raise ValueError(f"findings partition out of deterministic order at line #{line_num}: {current_order} <= {prev_finding_order}")
                 prev_finding_order = current_order
 
-                # Multi-Vector Evidence Binding: check vector-to-source relationships and kinds
+                if not finding_obj.vectors:
+                    raise ValueError(f"Finding '{finding_obj.finding_id}' at line #{line_num} contains no vectors")
+
+                # Mandatory Vector Evidence Resolution:
+                # Missing event IDs/hashes, mismatched event kinds, and conflicting ID/hash pairs MUST fail verification.
                 for v_name, v_summary in finding_obj.vectors.items():
-                    ev_ref = v_summary.evidence_hash or v_summary.evidence_id
-                    if ev_ref:
-                        ev_kind = event_kinds_by_hash.get(ev_ref) or event_kinds_by_id.get(ev_ref)
-                        if ev_kind:
-                            if v_name == "dns" and not (ev_kind.startswith("dns_") or ev_kind == "dns"):
-                                raise ValueError(f"Finding '{finding_obj.finding_id}' vector '{v_name}' references mismatched evidence '{ev_ref}' of kind '{ev_kind}'")
-                            elif v_name == "http" and not (ev_kind.startswith("http_") or ev_kind == "http"):
-                                raise ValueError(f"Finding '{finding_obj.finding_id}' vector '{v_name}' references mismatched evidence '{ev_ref}' of kind '{ev_kind}'")
-                            elif v_name == "tls" and not (ev_kind.startswith("tls_") or ev_kind == "tls"):
-                                raise ValueError(f"Finding '{finding_obj.finding_id}' vector '{v_name}' references mismatched evidence '{ev_ref}' of kind '{ev_kind}'")
+                    if not v_summary.evidence_id or not isinstance(v_summary.evidence_id, str) or not v_summary.evidence_id.strip():
+                        raise ValueError(f"Finding '{finding_obj.finding_id}' vector '{v_name}' missing mandatory evidence_id")
+                    if not v_summary.evidence_hash or not isinstance(v_summary.evidence_hash, str) or not v_summary.evidence_hash.strip():
+                        raise ValueError(f"Finding '{finding_obj.finding_id}' vector '{v_name}' missing mandatory evidence_hash")
+
+                    ev_id = v_summary.evidence_id.strip()
+                    ev_hash = v_summary.evidence_hash.strip()
+
+                    if ev_id not in event_ids:
+                        raise ValueError(f"broken referential integrity: finding '{finding_obj.finding_id}' vector '{v_name}' references unknown event_id '{ev_id}'")
+                    if ev_hash not in event_hashes:
+                        raise ValueError(f"broken referential integrity: finding '{finding_obj.finding_id}' vector '{v_name}' references unknown evidence_hash '{ev_hash}'")
+
+                    expected_hash = event_hashes_by_id.get(ev_id)
+                    if expected_hash != ev_hash:
+                        raise ValueError(
+                            f"Conflicting evidence ID/hash pair in finding '{finding_obj.finding_id}' vector '{v_name}': "
+                            f"event_id '{ev_id}' maps to hash '{expected_hash}', but vector specified '{ev_hash}'"
+                        )
+
+                    ev_kind = event_kinds_by_id.get(ev_id, "")
+                    if v_name == "dns" and not (ev_kind.startswith("dns_") or ev_kind == "dns"):
+                        raise ValueError(f"Finding '{finding_obj.finding_id}' vector '{v_name}' references mismatched evidence '{ev_id}' of kind '{ev_kind}'")
+                    elif v_name == "http" and not (ev_kind.startswith("http_") or ev_kind == "http"):
+                        raise ValueError(f"Finding '{finding_obj.finding_id}' vector '{v_name}' references mismatched evidence '{ev_id}' of kind '{ev_kind}'")
+                    elif v_name == "tls" and not (ev_kind.startswith("tls_") or ev_kind == "tls"):
+                        raise ValueError(f"Finding '{finding_obj.finding_id}' vector '{v_name}' references mismatched evidence '{ev_id}' of kind '{ev_kind}'")
 
                 # Referential integrity: check supporting and contradicting evidence hashes exist in events
                 for hyp in finding_obj.competing_hypotheses:

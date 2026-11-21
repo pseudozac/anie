@@ -1910,10 +1910,12 @@ class RealObservationStore:
         Strict Epistemic Invariants (Milestone M3.9/M3.10 Security Audit):
         1. A user-supplied hash alone NEVER authenticates an observation.
         2. Retained raw payload bytes MUST match expected SHA-256 (cryptographic preimage check).
-        3. Collector source_id is an identifier, not authentication; it MUST be explicitly authenticated under TrustedCollectorPolicy.
+        3. Collector source_id is an identifier, not authentication; it MUST be recognized under CollectorIdentityPolicy.
+           Exact allowlisting is an identity policy, NOT cryptographic collector authentication (which requires
+           signed collector receipts introduced in Milestone M3.11 Federation Architecture).
         4. Permissive fallbacks to 'first_party' for missing collector identities are strictly prohibited.
         5. Raw evidence status MUST be 'captured'.
-        6. Differentiates hash-verified raw evidence, authenticated collector metadata, and records whose raw bytes are unavailable.
+        6. Differentiates hash-verified raw evidence, recognized collector metadata, and records whose raw bytes are unavailable.
         """
         if not evidence_id_or_hash or not isinstance(evidence_id_or_hash, str):
             return {
