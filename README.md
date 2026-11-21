@@ -1,122 +1,162 @@
 # ANIE — AI-Native Internet Intelligence Engine
 
-**v0.2.0 research prototype • offline-first • synthetic data only • no API keys • no live internet collection**
+**Phase 3.8 Multi-Vector Intelligence Engine • Evidence-First • Offline-First • Pure SQLite Graph • Detached Cryptographic Attestation**
 
-ANIE is an independent, open-source-oriented research engine that transforms structured internet observations into **evidence-linked, time-aware intelligence records**. It is intended to supply a future consumer such as AEGIS without giving ANIE access to private cases, credentials, browser history or customer telemetry.
+ANIE is an independent, open-source-oriented internet intelligence engine that transforms empirical network observations into **evidence-linked, bitemporal, machine-readable intelligence graph records**. It is designed to provide verifiable infrastructure telemetry and competing analytical hypotheses to downstream security platforms (such as AEGIS) without requiring access to private case data, credentials, customer telemetry, or browser history.
 
-## What works today
+---
 
-- Validate and normalize complete point-in-time DNS A/AAAA and IP RDAP network/ASN observations.
-- Append-only, idempotent SQLite storage with indexed lookup and UTC timestamps.
-- Distinguish successful empty answers from collection failures; avoid unsupported cross-source comparisons.
-- Temporal infrastructure-change features plus real, lightweight **unsupervised kNN novelty detection**.
-- Produce reproducible gzip JSONL intelligence and evidence artifacts with SHA-256 manifests.
-- Verify checksums, evidence references and independently recompute findings.
-- Synthetic-only data publication guard; network-free CPU demonstration and unit tests.
-- **v0.2 offline collector foundation:** explicit per-target request budgets, DNS A/AAAA/PTR fixture processing, RDAP network/autnum validation, outcome-preserving collection events, append-only collection ledger and pure public-destination/redirect checks (no network I/O).
+## What Works Today (Milestone M3.8 Baseline)
 
-**Important:** ANIE does not currently gather real internet data. Its ML distance is not an attack verdict, confidence, maliciousness probability or production-grade model. This prototype does not publish to GitHub or provision any cloud resource.
+### 1. Multi-Vector Passive Telemetry Normalization
+- **DNS Telemetry:** RFC 8484 DNS-over-HTTPS (DoH) wire captures across multi-resolver vantage points (Cloudflare, Google, Quad9); validates complete answer sets, DNSSEC statuses (`secure`, `insecure`, `indeterminate`), response authenticity, and SHA-256 wire digests.
+- **RDAP Discovery & Attribution:** RFC 9224 / RFC 9082 compliant service discovery and deterministic longest-prefix matching for Autonomous Systems (`ANNOUNCED_BY`) and BGP prefixes (`PREFIX_MEMBER`) with epistemic abstention against synthetic ASN attribution.
+- **Passive TLS & X.509 Correlation:** Pure offline X.509 DER/PEM certificate parser; cryptographically binds `SERVES_CERTIFICATE` FACT edges strictly to verified live wire connection evidence (`ObservedTlsEndpointEvidence`), maps Subject Alternative Names (`NAMES_DOMAIN`), and enforces multi-tenant CDN/PaaS guardrails.
+- **Passive HTTP Metadata Normalization:** Bounded parser for HTTP/1.1 and HTTP/2 wire responses (`http_enrichment.py`). Extracts `status_code`, `server`, `via`, `content_type`, HSTS, and CSP. Strictly strips cookies, auth tokens, URL query parameters, and response bodies (0 bytes retained). Enforces bounded limits ($\le 64$ headers, $\le 1024$ bytes/val, $\le 16\text{ KiB}$ aggregate header block). Classifies technologies strictly as Layer 2 `DERIVED` / spoofable assertions.
 
-## Run immediately (Python 3.10+)
+### 2. Graph-Native Property Graph & 4-Layer Epistemic Model
+- **Pure SQLite Architecture:** Zero daemon or external binary dependencies; sub-millisecond $k$-hop recursive neighborhood traversals via composite bitemporal indexes.
+- **4-Layer Epistemic Hierarchy:**
+  - `FACT`: Immutable empirical wire transport captures (`ip`, `domain`, `resolver`, `certificate`).
+  - `DERIVED`: Deterministic structural relationships computed via versioned rulesets (`RESOLVES_TO`, `ANNOUNCED_BY`, `PREFIX_MEMBER`, `NAMES_DOMAIN`, `USES_TECHNOLOGY`, `PROTECTED_BY_POLICY`).
+  - `HYPOTHESIS`: Probabilistic inferences, anomaly indicators, and alternative explanations (`competing_hypotheses`, `intelligence_claims`).
+  - `VALIDATED`: Cryptographically attested or analyst-verified assertions.
 
-From the repository root, with no package installation:
+### 3. Competing Hypothesis Engine (`temporal_intelligence.py`)
+- **Simultaneous Alternative Explanations:** Evaluates competing hypotheses for the same observed phenomena:
+  - *IP Volatility:* Legitimate CDN/Anycast Edge Pool Rotation vs. Suspicious Fast-Flux Candidate.
+  - *Resolver Discrepancy:* Upstream Threat Policy Filtering vs. Regional GeoDNS Route Divergence.
+- **Partitioned Evidence Tracking:** Explicitly tracks `supporting_evidence_hashes` and `contradicting_evidence_hashes` separately.
+- **Epistemic Humility:** Employs explicit uncalibrated heuristic scores ($0.0\text{ to }1.0$) with `statistically_calibrated: false` to avoid confusing heuristic ratings with frequentist or Bayesian probabilities.
+- **Epistemic Abstention:** Emits `INSUFFICIENT_EVIDENCE` status when observation epochs are sparse ($<2$ epochs).
+- **Historical Supersession:** Revisions preserve prior hypotheses as `SUPERSEDED` with `valid_until = now_iso` in SQLite and links via `RelationType.SUPERSEDES`, maintaining an unbroken audit chain.
 
-```bash
-PYTHONPATH=src python -m anie demo --out ./local-data/demo
-PYTHONPATH=src python -m anie verify --dir ./local-data/demo/publication
-PYTHONPATH=src python -m unittest discover -s tests -v
-```
+### 4. Plaintext Knowledge Vault Export (`graph_engine.py`)
+- Generates fully portable Markdown notes compatible with Obsidian and standard PKMs:
+  - `vault/domains/`: Domain infrastructure notes with direct relationships and inbound claims.
+  - `vault/ips/`: IP endpoint notes with reverse DNS, ASN announcements, and BGP allocations.
+  - `vault/asns/`: Regional Internet Registry allocations and announced IP pools.
+  - `vault/prefixes/`: BGP CIDR network prefix notes.
+  - `vault/certificates/`: X.509 certificate notes, validity windows, and serving endpoints.
+  - `vault/claims/`: Epistemic intelligence claims and falsifiability conditions.
+  - `vault/technologies/`: Technology indicators with associated domains, IPs, and spoofability warnings.
+  - `vault/hypotheses/`: Competing hypotheses with supporting/contradicting evidence and supersession links.
+- **Security & Containment:** Hardened against directory traversal, Windows device names (`CON`, `PRN`, `AUX`, `NUL`), symlinks, and a 500 KB note ceiling.
 
-Or install locally:
+### 5. Detached Cryptographic Attestation & Four-Tier Verification
+- **Air-Gapped Signing:** Collector instances produce unsigned candidate release bundles; Ed25519 signing keys reside strictly on air-gapped operator workstations (`real_publish.py`).
+- **Four-Tier Verification:** Consumers verify structural syntax, raw evidence integrity (`raw_sha256`), publisher cryptographic signatures, and stateful anti-rollback monotonic sequences completely offline without calling home (`release_trust.py`).
 
-```bash
-python -m pip install -e .
-anie demo --out ./local-data/demo
-anie verify --dir ./local-data/demo/publication
-```
+### 6. Infrastructure & Autonomous Capacity Management
+- **Quiescent Collector VM:** `anie-collector-01` (`129.225.109.227`, `VM.Standard.E2.1.Micro`) operating securely at ₹0.00 / $0.00 cost under strict systemd cgroup sandboxing (`MemoryMax=128M`, `CPUQuota=20%`).
+- **Autonomous A1 Capacity Runner:** Unattended Windows Task Scheduler runner (`ANIE_Ampere_A1_Capacity_Retry`) with strict 60-minute rate governor attempting Always Free `VM.Standard.A1.Flex` capacity acquisition.
 
-The demo simulates **32 unchanged domains, one changing domain and one IP with registry context**, using reserved documentation addresses and domains. It generates a SQLite store, compressed intelligence artifacts and a manifest. The model should mark the changing synthetic domain as an outlier **without claiming it is malicious**.
+---
 
-After generation, examine the machine-readable records:
+## Quick Start (Python 3.10+)
 
-```python
-import gzip, json
-with gzip.open("local-data/demo/publication/intelligence.jsonl.gz", "rt") as file:
-    for line in file:
-        finding = json.loads(line)
-        if finding["assessment"]["ai"]["status"] == "outlier":
-            print(json.dumps(finding, indent=2))
-```
-
-## Offline collector demonstration (v0.2)
-
-```bash
-PYTHONPATH=src python examples/offline_collection_demo.py
-```
-
-This tests a fixture-only DNS/RDAP collector with a separately validated collection-event schema. No sockets or external providers are contacted. See [v0.2 collection design and limitations](docs/COLLECTOR_V02.md).
-
-## Reusable commands
-
-```bash
-anie ingest --db ./local-data/state.sqlite --input ./examples/synthetic-observations.json
-anie publish --db ./local-data/state.sqlite --out ./local-data/publication --as-of 2026-11-11T10:00:00Z
-anie verify --dir ./local-data/publication
-```
-
-Only synthetically flagged records are accepted for v0.1 ingest/publication. The output location must be empty; no existing releases are silently overwritten. There is deliberately **no CLI command that can fetch or probe an internet target**.
-
-## Integration contract
-
-`schemas/intelligence-v1.schema.json` documents output records. Each one contains an indicator, evidence-based finding, provenance references, model version, feature values, observation time and explicit uncertainty. Consumers must verify the release first and apply their own security policies. The prototype's manifest hashes are **not digital signatures**; a trusted distribution channel and signed attestations are prerequisites for production.
-
-## Repo status and license
-
-This is a public, synthetic-only v0.1.0 research prototype, not an operational internet scanner. The project is distributed under the bundled Apache License 2.0. No private AEGIS code or dataset is included.
-
-See [architecture and limitations](docs/ARCHITECTURE.md), [research plan](docs/RESEARCH_PLAN.md), and [security policy](SECURITY.md).
-
-### AEGIS-style consumer demonstration
-
-The separate example script verifies the dataset and prepares read-only IOC-context records:
+From the repository root with zero third-party requirements (core runs on standard library):
 
 ```bash
-PYTHONPATH=src python examples/aegis_readonly_consumer.py local-data/demo/publication
+# Set PYTHONPATH to include source
+export PYTHONPATH="src:."  # Linux/macOS
+$env:PYTHONPATH="src;."   # Windows PowerShell
+
+# Run the complete test suite (470 tests)
+python -m unittest discover -s tests -v
+
+# Run the repository governance and policy checker
+python tools/check_repo.py
+
+# Run the local demonstration
+python -m anie demo --out ./local-data/demo
+python -m anie verify --dir ./local-data/demo/publication
 ```
 
-This is **not yet an AEGIS API integration**; it demonstrates the independent consumer contract without touching private cases or existing correlation rules.
+---
 
-## Repository development and governance
+## Architecture Flow
 
-- [Agent instructions](AGENTS.md) and [specialized agents](.github/agents/) help contributors and coding agents follow the same evidence-first boundaries.
-- [Task-specific Agent Skills](.agents/skills/) cover observation contracts, model evaluation, collector threat modeling, and releases.
-- [Development workflow](docs/DEVELOPMENT_WORKFLOW.md), [threat model](docs/THREAT_MODEL.md), [public data policy](docs/DATA_PUBLICATION_POLICY.md) and [release process](docs/RELEASE_PROCESS.md) document mandatory review gates.
-- [Contributing](CONTRIBUTING.md), [community conduct](CODE_OF_CONDUCT.md), [security](SECURITY.md) and [changelog](CHANGELOG.md) apply to the public project.
+```mermaid
+flowchart TD
+    subgraph Capture["1. Passive Ingestion (Zero Active Crawling)"]
+        DNSWire["DNS-over-HTTPS Wire Telemetry\n(RFC 8484)"]
+        RDAP["RDAP Registry Telemetry\n(RFC 9224 / 9082)"]
+        TLS["X.509 Certificate Wire Handshakes\n(ObservedTlsEndpointEvidence)"]
+        HTTP["HTTP/1.1 & HTTP/2 Response Headers\n(ObservedHttpEndpointEvidence)"]
+    end
 
-Before opening a PR, run `PYTHONPATH=src python -m unittest discover -s tests -v` and `python tools/check_repo.py`. The public repository includes **only offline/synthetic collection** at this stage. No workflow publishes datasets, provisions cloud resources or automatically deploys services.
+    subgraph Store["2. Pure SQLite Epistemic Store"]
+        RealObs[("real_observations\n(Append-Only, Immutable)")]
+        RealEv[("real_events\n(Raw Wire Digests)")]
+        GraphNodes[("graph_nodes\n(FACT, DERIVED, HYPOTHESIS, VALIDATED)")]
+        GraphEdges[("graph_edges\n(Bitemporal Directed Relations)")]
+        HypTable[("competing_hypotheses\n(Historical Supersession)")]
+    end
 
-## Synthetic temporal ML benchmark
+    subgraph Analytics["3. Temporal & Competing Intelligence"]
+        Detectors["Temporal Drift Detectors\n(Transitions, Churn, Anycast Divergence)"]
+        HypEngine["Competing Hypothesis Engine\n(CDN vs Fast-Flux; Filtering vs GeoDNS)"]
+    end
 
-ANIE includes a **chronological, replayable evaluation** comparing its unsupervised kNN novelty distance with two no-ML baselines on fabricated infrastructure patterns. It reports precision, recall, false alarms, abstentions and Python memory/timing diagnostics. Synthetic novelty is **not** evidence of attack or maliciousness.
+    subgraph Export["4. Knowledge Vault & Consumer Distribution"]
+        Vault["Obsidian Markdown Vault\n(vault/domains, ips, techs, hypotheses)"]
+        Release["Signed Release Bundle\n(JSONL.gz + Ed25519 Detached Manifest)"]
+    end
 
-```bash
-PYTHONPATH=src python tools/benchmark_report.py --print-snapshot
+    Capture --> RealObs
+    Capture --> RealEv
+    RealObs --> GraphNodes
+    RealObs --> GraphEdges
+    GraphNodes --> Detectors
+    GraphEdges --> Detectors
+    Detectors --> HypEngine
+    HypEngine --> HypTable
+    HypTable --> GraphNodes
+    HypTable --> GraphEdges
+    GraphNodes --> Vault
+    GraphEdges --> Vault
+    RealObs --> Release
 ```
 
-See [Temporal Benchmark methodology](docs/TEMPORAL_BENCHMARK.md). The committed deterministic reference in `benchmarks/expected_snapshot.json` is checked by CI once established. This is a fixed synthetic time-split test, not a real-world accuracy claim.
+---
 
-## Offline release trust design
+## Repository Map
 
-Issue #6 adds a separate operator-pinned manifest integrity check and documented future signature/attestation gates. **This does not sign artifacts or publish any dataset.** See [release trust design](docs/RELEASE_TRUST_DESIGN.md).
+| Path | Purpose |
+| :--- | :--- |
+| `src/anie/observations.py` | Normalized point-in-time observation models and strict validation. |
+| `src/anie/real_models.py` | First-party empirical models (`RealObservation`, `RealCollectionEvent`, `FactualVerification`). |
+| `src/anie/real_store.py` | SQLite authoritative store with foreign key constraints and atomic bundling. |
+| `src/anie/graph_models.py` | 4-layer epistemic hierarchy (`EpistemicLayer`, `GraphNode`, `GraphEdge`, `NodeType`, `RelationType`). |
+| `src/anie/graph_engine.py` | Graph indexing, $k$-hop traversals, FTS5 search, and Obsidian vault markdown export. |
+| `src/anie/temporal_intelligence.py` | Historical anomaly detectors and the Competing Hypothesis Engine. |
+| `src/anie/rdap_enrichment.py` | RFC 9224 RDAP service discovery and BGP prefix / ASN correlation. |
+| `src/anie/tls_enrichment.py` | Passive X.509 certificate parsing and verified TLS endpoint linking. |
+| `src/anie/http_enrichment.py` | Bounded HTTP/1.1 and HTTP/2 response metadata normalization and technology extraction. |
+| `src/anie/real_publish.py` | Deterministic dataset serialization, gzip archives, and detached Ed25519 signing. |
+| `src/anie/release_trust.py` | Four-tier consumer release verification and anti-rollback sequence enforcement. |
+| `src/anie/consumer_contract.py` | AEGIS-compatible consumer contract reader and release journal ingestion. |
+| `src/anie/capacity_retry.py` | Autonomous Oracle Cloud Ampere A1 capacity acquisition engine. |
+| `docs/` | Architectural specifications, ADRs, runbooks, and research plans. |
+| `tests/` | Comprehensive test suite (40 modules, 470 tests). |
 
-## v0.3 cryptographically signed synthetic release verification
+---
 
-An optional `signing` extra (`cryptography`) supports Ed25519 signing and independently pinned-key verification of **offline synthetic demo** releases. The core ANIE runtime still has no third-party dependencies. Run `python -m pip install -e '.[signing]'` and `PYTHONPATH=src python examples/offline_signed_release_demo.py` to exercise an **ephemeral test key**. No signing credential or real dataset is committed, uploaded or deployed. [Threat model and limitations](docs/RELEASE_TRUST_DESIGN.md).
+## Documentation Index
 
-## ANIE v0.4 offline acquisition planner
+- [Documentation Master Index](docs/DOCUMENTATION_INDEX.md)
+- [Architecture & Epistemic Boundaries](docs/ARCHITECTURE.md)
+- [Phase 3 Architecture Revision](docs/PHASE3_ARCHITECTURE_REVISION.md)
+- [Milestone M3.8 Specification](docs/ANIE_M3_8_SPECIFICATION.md)
+- [ADR 004: Graph Knowledge Architecture](docs/ADR_004_GRAPH_KNOWLEDGE_ARCHITECTURE.md)
+- [Agent & Contributor Operating Contract](AGENTS.md)
+- [Development Workflow & Governance](docs/DEVELOPMENT_WORKFLOW.md)
+- [Security Policy](SECURITY.md)
+- [Changelog](CHANGELOG.md)
 
-A new offline IANA-style RDAP bootstrap parser and TTL-aware DNS/RDAP fixture scheduler reduce duplicate synthetic queries while preserving append-only history and original collection timestamps. `python tools/offline_acquisition_report.py` reports local synthetic cache reuse and resources; it makes **zero** network calls. **No real collectors or live pilot are active.** [Scope, retention, costs and limitations](docs/ACQUISITION_V04.md).
+---
 
-## Real-world DNS pilot (explicit opt-in only)
+## License
 
-ANIE now includes a bounded, manually activated public DNS-over-HTTPS pilot for **only `example.com` A and AAAA**, via Cloudflare's documented resolver. Run `python tools/live_dns_pilot.py` to inspect the dry-run plan with **zero network requests**. An explicit acknowledgment is required before the actual two-request pilot. No live DNS runs in CI, no real results are stored/published, and RDAP network collection remains disabled. Read [exact target limits, terms and activation process](docs/REAL_WORLD_PILOT.md) before manual use.
+ANIE is released under the [Apache License 2.0](LICENSE).

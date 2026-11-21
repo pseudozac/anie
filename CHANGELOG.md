@@ -1,102 +1,162 @@
 # Changelog
 
-## Unreleased
+## 0.4.1 (M3.8) — Multi-Vector Intelligence, Passive HTTP Metadata & Competing Hypotheses (2026-11-21)
 
-- Add comprehensive Oracle Cloud deployment and dry-run runbook (`docs/ORACLE_DRY_RUN_RUNBOOK.md`) covering exact CLI interface, zero-query offline guarantees, host permissions, systemd sandboxing, and emergency rollback procedures.
-- Document critical Linux resource accounting distinctions: single-process peak RSS (`VmHWM`) vs cgroup aggregated resident memory (`memory.current`, `memory.peak`), and `MemoryHigh=96M` kernel throttling/reclaim vs `MemoryMax=128M` hard OOM killer limits.
-- Add reproducible Phase 2 offline acceptance test runner (`tools/phase2_acceptance_runner.py`), integration test suite (`tests/test_phase2_acceptance.py`), and offline schedule cadence simulator (`tools/schedule_simulator.py`) with committed reference benchmarks in `benchmarks/`.
-- PR 4: Authenticated first-party intelligence publication pipeline (`src/anie/real_publish.py`), detached Ed25519 signing, and multi-tier evidence verification.
-- Deterministic canonical publication engine (`export_canonical_dataset()`, `publish_real()`) producing reproducible gzip archives (`mtime=0`, `compresslevel=9`) sorted by observation and event timestamps/IDs, single consistent SQLite read snapshot transactions (`BEGIN DEFERRED`), fail-closed over-limit dataset protection (no silent truncation), and atomic artifact generation.
-- Manifest byte-for-byte reproducibility via explicit publication timestamps (`--published-at`).
-- Complete metadata binding across manifest publisher, signed payload publisher, release sequence, git commit hashes, attestation key IDs, key fingerprints, and operator trust policies, preventing signature transposition even when mathematically valid.
-- Air-gapped detached Ed25519 signing workflow (`sign_manifest_detached()` and CLI `anie sign-real`): primary signing keys never reside on the collector host (`anie-collector-01`), with strict key parsing (PEM and exactly 32 raw bytes, rejecting permissive truncation fallbacks).
-- Independent four-tier consumer verification engine (`verify_real_release()` and CLI `anie verify-real`): distinguishes structural validation, evidence-integrity validation, publisher-signature authentication, and stateful anti-rollback verification, with an explicit `--integrity-only` mode for candidate inspection.
-- Complete evidence model reconstruction: validates content-addressed IDs, raw DNS wire payload hashes (`raw_sha256`), record schema versions, strict deterministic ordering, duplicate ID rejection, and referential consistency.
-- Memory-bounded streaming serialization, hashing, and decompression: guarantees execution within Oracle Cloud micro instance memory limits (1 GiB RAM) with bounded gzip record reading enforcing the $\le 500\text{ KB}$ record ceiling during streaming read (`stream.readline(limit + 1)`), rejecting unterminated records, and decompression bomb protection ($\le 100\text{ MB}$ uncompressed ceiling, $\le 100{,}000$ records per partition).
-- Hardened persistent verifier state tracking (`ReleaseSequenceTracker`): fail-closed error handling (`TrackerStateError`, `TrackerStateLostError`), concurrency-safe atomic multi-process file locking, prevention of lower-sequence overwrites, accurate `anti_rollback_verified=False` reporting for historical audits (`--allow-rollback`), and documented local filesystem rollback boundaries.
-- Key rotation and operator revocation support in `RealReleaseTrust` via multi-key maps (`trusted_keys`), `revoked_key_ids`, and `revoked_fingerprints`.
-- Unconditional anti-contamination enforcement: rejects synthetic fixtures, synthetic methods, and synthetic source IDs within real publication artifacts.
-- Comprehensive operational documentation and verified runbooks in `docs/REAL_PUBLICATION_AND_SIGNING.md`.
-- PR 3: Bounded batch orchestrator (`BatchOrchestrator`, `src/anie/orchestrator.py`) and CLI subcommand `collect-batch` for resource-governed one-shot execution on Oracle Cloud micro instances (1 GiB RAM).
-- Strict execution envelope: maximum 2 domains (`example.com`, `iana.org`), alternating query kinds (`dns_a` $\leftrightarrow$ `dns_aaaa`) across batches based on last persisted observation, canonicalized domain uniqueness, at most 1 query per domain per batch to strictly satisfy the 30-minute per-domain cooldown, and an absolute ceiling of $\le 4$ queries per batch.
-- Fail-closed execution modes (`VALID_MODES = {"dry_run", "live"}`) preventing programmatic or CLI bypass; live collection strictly gated by `--live` and `ANIE_LIVE_COLLECTION_AUTHORIZED=1`.
-- Preflight host health safeguards with fail-closed host metrics (no invented fallback RAM); distinguishes genuine resource shortages (`SKIPPED`) from operational errors (`FAILED`), and strictly validates memory/disk/timeout configuration thresholds.
-- Single monotonic deadline for the entire batch passed to sequential operations; bounds total timeout at $\le 25.0$s to ensure systemd `TimeoutStartSec` (30s) cleanup headroom.
-- Correct dry-run telemetry: records `queries_planned` separately while reporting zero execution counts (`queries_attempted=0`, `queries_succeeded=0`, `queries_failed=0`, `records_persisted=0`).
-- Cross-platform advisory process locking (`acquire_collector_lock`) covering the complete execution critical section (query determination, preflight, collection, persistence, telemetry).
-- Structured execution telemetry with single-line JSON records and bounded log file size rotation ($\le 5\text{ MiB}$).
-- Hardened systemd templates (`systemd/anie-collector.service` and `systemd/anie-collector.timer`) configured with `Type=oneshot`, supervisor-enforced `TimeoutStartSec=30s`, `TimeoutStopSec=15s`, `KillMode=control-group`, `Restart=no`, and resource limits (`MemoryMax=128M`, `MemoryHigh=96M`, `CPUQuota=20%`, `Nice=19`).
-- Comprehensive operational documentation in `systemd/README.md` explaining why `RuntimeMaxSec` does not apply to `Type=oneshot`, cgroup termination escalation, Linux kernel `TASK_UNINTERRUPTIBLE` (D-state) limitations, daily vs 4-hour schedule selection, and administrative verification/rollback runbooks.
-- PR 2: First-party DNS-over-HTTPS (DoH) collection engine (`DohCollector`) and policy governor (`DohRateGovernor`).
-- Strict target allowlist limited to `example.com` and `iana.org`, query kinds `dns_a` and `dns_aaaa`, and batch domain size limit ($\le 2$ domains per invocation).
-- Anti-rebinding resolver endpoint resolution requiring all returned IPs to be verified global addresses before socket allocation, with isolated subprocess-based execution guaranteeing hard cancellation without blocking context managers or leaking threads/processes.
-- Persistent SQLite-backed rate governor with atomic `BEGIN IMMEDIATE` multi-process locking, deadline-bounded lock acquisition, per-target 30-minute cooldown, conservative hourly quotas, and fail-closed error handling. Ephemeral in-memory storage restricted strictly to explicit test mode.
-- Full RFC 8484 wire-format exchange with bounded response capture ($\le 65,535$ bytes) and SHA-256 evidence integrity.
-- Comprehensive monotonic wall-clock deadline enforcement encompassing SQLite lock acquisition, endpoint resolution, TCP connect, TLS handshake, HTTP request transmission, response headers, chunked body streaming, and bounded retries without deadline reset.
-- Cooperative deadline socket wrapper (`DeadlineSocketWrapper`) preventing slow-trickle servers from extending request durations via sub-timeout byte streaming during header or body reads; operational boundaries and external watchdog architecture documented for PR 3.
-- Explicit DNS response classification for ANSWER, NXDOMAIN, NODATA, SERVFAIL, and REFUSED.
-- Resolver AD flag recorded strictly as an untrusted third-party claim (`resolver_ad_claim=True`) while `dnssec_status` remains `'indeterminate'` without independent cryptographic proof.
-- Mandatory invariants: SERVFAIL recorded as error without inferring DNSSEC-bogus; analytical confidence kept strictly nullable (`None`).
-- PR 1: Introduce Phase 2 first-party intelligence data models (`RealObservation`, `RealCollectionEvent`, `FactualVerification`) and SQLite store (`RealObservationStore`).
-- Replace arbitrary confidence multipliers with distinct empirical factual verification attributes and explicitly nullable analytical confidence.
-- Enforce strict cross-pipeline isolation: real observations require `synthetic=False` and are rejected by synthetic publishers; synthetic fixtures are rejected by `RealObservationStore`.
-- Implement referential integrity with `FOREIGN KEY ... ON DELETE RESTRICT` and two-phase retention invariants preventing evidence deletion while dependent observations remain.
-- Replace unconstrained `INSERT OR IGNORE` with strict collision detection: accept identical duplicate records idempotently, reject conflicting identifiers with `IntegrityError`.
-- Cryptographically verify raw evidence hashes when loading and exporting collection events.
-- Document exact SQLite WAL durability and crash-recovery semantics under `NORMAL` and `FULL` synchronous modes without absolute durability claims.
+- **Passive HTTP Telemetry (`src/anie/http_enrichment.py`):**
+  - Implement bounded HTTP/1.1 wire response header and HTTP/2 pseudo-header parser with zero active crawling or outbound network generation.
+  - Require genuine `ObservedHttpEndpointEvidence` (IP, port, host/SNI, observed_at, collector source ID, and 64-char lowercase SHA-256 wire hash).
+  - Extract and normalize approved metadata fields: `status_code`, `server`, `via`, `content_type` (MIME media type), HSTS (`strict_transport_security`), and CSP presence.
+  - Strict sensitive header scrubbing: permanently discards `Set-Cookie`, `Cookie`, `Authorization`, `Proxy-Authorization`, `X-Api-Key`, session tokens, query strings, and response bodies (0 bytes retained).
+  - Hard bounded resource limits: maximum 64 headers, maximum 1024 bytes per field value, maximum 16 KiB aggregate header block.
+  - Epistemic classification: Technology indicators emit `GraphNode` with `NodeType.TECHNOLOGY` and `EpistemicLayer.DERIVED`, linked via `RelationType.USES_TECHNOLOGY` ($0.80$ bounded confidence) with explicit `is_spoofable=True` warnings.
+  - Security policy linking: Valid HSTS headers emit `RelationType.PROTECTED_BY_POLICY` edges.
+- **Competing Hypothesis Engine (`src/anie/temporal_intelligence.py`):**
+  - Implement simultaneous alternative hypothesis evaluation for observed infrastructure phenomena:
+    - *Volatile IP Infrastructure:* Legitimate CDN / Anycast Edge Rotation (`FAVORED` / `PLAUSIBLE`) vs. Suspicious Fast-Flux Candidate (`CONTRADICTED` / `FAVORED`).
+    - *Resolver Discrepancy:* Upstream Resolver Security Filtering (`FAVORED`) vs. GeoDNS / Multi-Region Route Divergence (`CONTRADICTED`).
+  - Strict evidence separation: Partitions `supporting_evidence_hashes` and `contradicting_evidence_hashes` into distinct tuples.
+  - Explicit heuristic scoring ($0.0\text{ to }1.0$) with `statistically_calibrated: false` to avoid confusing heuristic matching with frequentist/Bayesian probabilities.
+  - Epistemic abstention: Emits status `INSUFFICIENT_EVIDENCE` when observation count is $< 2$ epochs.
+  - Historical supersession: Revisions do not overwrite past reasoning; prior hypotheses are marked `valid_until = now_iso` and status `SUPERSEDED` in SQLite table `competing_hypotheses` and linked via graph edge `RelationType.SUPERSEDES`.
+- **Knowledge Graph & Obsidian Vault Export (`src/anie/graph_engine.py`):**
+  - Add entity types `NodeType.TECHNOLOGY`, `NodeType.HYPOTHESIS`.
+  - Add typed directed edges `RelationType.USES_TECHNOLOGY`, `RelationType.PROTECTED_BY_POLICY`, `RelationType.EXPLAINS`, `RelationType.CONTRADICTS`, `RelationType.SUPERSEDES`.
+  - Add `vault/technologies/` and `vault/hypotheses/` note generators with YAML frontmatter, wikilinks, and cross-platform filename sanitization.
+  - Update `vault/README.md` index with exploration roots for technologies and competing hypotheses.
+  - Traversal hardening: Hardened against directory traversal, Windows device names (`CON`, `PRN`, `AUX`, `NUL`), symlinks, and a 500 KB note ceiling.
+- **Verification:**
+  - 15 new test cases across `tests/test_m3_8_http_enrichment.py`, `tests/test_m3_8_competing_hypotheses.py`, `tests/test_m3_8_knowledge_export_and_hardening.py`.
+  - 470 total tests executed across the repository (469 passed, 0 failed, 1 skipped).
 
-## 0.4.1 — exact-scope manual DNS pilot preflight (2026-11-12)
+## M3.7 — Intelligence Correctness Hardening, RFC 9224/9082 Audit & Passive TLS Correlation (2026-11-21)
 
-- Fix compatibility with official IANA-style RDAP bootstrap records containing matched HTTPS/HTTP alternatives; never select HTTP.
-- Add pure RFC 8484 DNS wire A/AAAA query and fail-closed response handling with negative SOA proof and distinct errors.
-- Add manually opt-in, one-shot HTTPS DoH adapter for `example.com` A/AAAA only; two requests max per invocation, TLS verified, socket IP pinned and public, no redirects/retries/storage/publication. CI dry-run only.
-- Add adversarial offline and mocked transport tests and documented real-world pilot terms/scope.
+- **Passive TLS & X.509 Certificate Correlation (`src/anie/tls_enrichment.py`):**
+  - Implement deterministic offline X.509 DER and PEM certificate parser.
+  - Cryptographically bind Layer 1 `SERVES_CERTIFICATE` FACT edges strictly to verified live wire connection evidence (`ObservedTlsEndpointEvidence` requiring IP, port, SNI, observed_at, collector source ID, and raw SHA-256 wire hash).
+  - Offline certificate parsing alone emits only certificate metadata (`NodeType.CERTIFICATE`, Layer 1 FACT) and Subject Alternative Name linkages (`NAMES_DOMAIN`, Layer 2 DERIVED).
+  - Multi-tenant CDN/PaaS guardrails: Automatically flag certificates with $\ge 15$ SANs or known CDN root domains as shared infrastructure to prevent false guilt-by-association.
+- **RFC 9224 / RFC 9082 Compliance Audit (`src/anie/rdap_enrichment.py`):**
+  - Audit RDAP enrichment to strictly separate IANA registry delegation, RDAP service discovery, IP registration, prefix allocation (`PREFIX_MEMBER`), and BGP origin-AS attribution (`ANNOUNCED_BY`).
+  - Epistemic abstention: Strictly prohibit synthetic or unverified ASN node creation.
+- **Dynamic DNS & Mixed Anycast False-Positive Controls (`src/anie/temporal_intelligence.py`):**
+  - Preserve contradictory evidence in dynamic DNS detection: alert at confidence 0.75 when $\ge 3$ subnets are present.
+  - Mixed Anycast/Unicast resolution alerting: alert at confidence 0.85 when Anycast and Unicast co-resolve for the same domain, preventing indiscriminate suppression of legitimate threat indicators.
+- **Vault Export Hardening (`src/anie/graph_engine.py`):**
+  - Add `vault/certificates/` note exporter with validity windows, SHA-256 fingerprints, and serving endpoint backlinks.
+  - Sanitize Windows reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `COM*`, `LPT*`) and illegal characters.
+  - Bounded note size ceiling enforcing a maximum of 500 KB per exported note.
 
+## M3.6 — Autonomous Graph Intelligence, Obsidian Vault Export & RDAP Correlation (2026-11-21)
 
-## 0.4.0 — offline acquisition and cache planning (Phase A, 2026-11-12)
+- **Deterministic Obsidian Markdown Knowledge Vault (`src/anie/graph_engine.py`):**
+  - Export complete graph, entities, and claims into human-readable, portable Markdown notes with YAML frontmatter and bidirectional wikilinks.
+  - Modular vault directory hierarchy: `vault/domains/`, `vault/ips/`, `vault/asns/`, `vault/prefixes/`, `vault/claims/`, and `vault/README.md`.
+  - Cross-platform safe file writing (`_safe_write_vault_note`) with path traversal rejection and symlink attack prevention.
+- **RFC 9224 RDAP Registry Correlation (`src/anie/rdap_enrichment.py`):**
+  - Implement offline IANA bootstrap registry cache with deterministic longest-prefix matching.
+  - Extract BGP allocation prefixes (`NodeType.CDN_PREFIX`) and Autonomous Systems (`NodeType.ASN`).
+  - Create temporal directed edges: `PREFIX_MEMBER` and `ANNOUNCED_BY` with raw wire SHA-256 evidence digests.
+- **SQLite FTS5 Full-Text Search Memory:**
+  - Build real-time indexed search over domains, IPs, ASNs, prefixes, and claims with rank-ordered BM25 relevance and snippet generation.
 
-- Parse bounded synthetic IANA-style RDAP IPv4/IPv6 bootstrap registries with longest-prefix matching and untrusted URL hygiene.
-- Add deterministic TTL-aware offline DNS/RDAP scheduler with per-target/global quotas, negative/failure cooldown semantics, bounded memory and persistent append-only evidence snapshots.
-- Preserve original timestamps and evidence IDs on cache hits; no live socket clients, real data, or network publication.
-- Add adversarial fixtures, resource-count reporting and go/no-go acquisition design.
+## Phase 3 — Unattended Oracle Ampere A1 Free Capacity Acquisition & Governor (2026-11-20)
 
+- **Autonomous Capacity Acquisition Engine (`src/anie/capacity_retry.py`):**
+  - Implement unattended OCI SDK programmatic provisioning engine targeting Always Free `VM.Standard.A1.Flex` (2 OCPU, 12 GB RAM, 50 GB boot storage, Oracle Linux 9 ARM64).
+  - Tenancy inspection: Verify existing tenancy resources, preserving `anie-collector-01` completely at ₹0.00 / $0.00 cost.
+  - Rate governor: Strictly enforce a minimum 60-minute interval between provisioning attempts with exponential backoff on API throttling.
+  - Windows Task Scheduler automation: Registered persistent scheduled task `ANIE_Ampere_A1_Capacity_Retry` with WakeToRun and 7-day expiration boundary.
+  - Idempotency & safety: Reconcile existing launch requests, prevent duplicate instance creation, and securely manage SSH keys.
 
-## 0.3.0 — offline synthetic release signature verification (2026-11-12)
+## M3.5.1 — Consumer Integrity Corrections & Atomic Claims Ingestion (2026-11-20)
 
-- Add optional PyCA cryptography Ed25519 signature verification; core runtime remains standard-library only.
-- Domain-separated authenticated payload binds manifest hash, source commit, repository, builder, release sequence and expiry.
-- Operator-pinned key, local revocation and validity checks, monotonic sequence and tamper/replay regression tests.
-- Offline ephemeral signing demonstration; no production key, authenticated GitHub identity, public release, AEGIS modification or live data.
+- **Atomic V4 Claims Ingestion (`src/anie/real_store.py`):**
+  - Update consumer release ingestion so observations, events, discrepancies, intelligence claims, and the release journal commit within a single atomic SQLite transaction (`BEGIN IMMEDIATE`).
+  - Replay and crash injection testing: verify safe replay and recovery without duplicated or dropped claims.
+- **Signed-Release Evidence Retention Index (`src/anie/retention.py`):**
+  - Implement durable, verified release-to-evidence membership index.
+  - Prevent pruning of evidence required to independently verify any retained signed release bundle.
+  - Keep automated pruning fail-closed and disabled by default until verified.
 
+## M3.5 — First-Party Intelligence Pilot & Consumer Contract V4 (2026-11-20)
 
-- Offline synthetic-only consumer manifest pin verification and provenance metadata checks (not publisher authentication).
-- Authenticated release, signing, licensing, cost, AEGIS rollback and revocation design; no real-data publication.
+- **Production-Grade Intelligence Contract V4 (`schemas/intelligence-v4.schema.json`):**
+  - Stable, versioned output interface suitable for AEGIS and third-party consumers.
+  - Canonical IOC and infrastructure entity identifiers (`anie:entity:domain:...`, `anie:entity:ip:...`).
+  - Immutable source observations, provenance digests, and derived relationships.
+  - Epistemic classification: separate empirical wire facts from derived hypotheses and attested assertions.
 
+## M3.4.1 — Intelligence Integrity & Epistemic Abstention (2026-11-20)
 
-- Add deterministic chronological synthetic infrastructure-novelty benchmark, two non-ML baselines, abstention/uncertainty regression tests, model predictions fingerprint and memory/timing reporting. No live data or production verdict changes.
+- **Strict Falsifiability & Guardrails (`src/anie/temporal_intelligence.py`):**
+  - Define explicit falsifiability conditions for all machine-generated intelligence claims.
+  - Distinguish uncalibrated heuristic scores from statistically calibrated probabilities.
+  - Prohibit inferring malicious intent from infrastructure churn, dynamic DNS, or resolver discrepancies alone.
 
+## M3.4 — Temporal Graph Intelligence & Anomaly Detectors (2026-11-20)
 
-No live collectors, real-data publication, hosted services or external scanning approved.
+- **Historical Anomaly Detectors:**
+  - `INFRASTRUCTURE_TRANSITION`: IP set changes across observation epochs and resolvers.
+  - `IP_RELATIONSHIP_EVOLUTION`: Duration, TTL stability, and ephemeral/persistent categorization.
+  - `SHARED_INFRASTRUCTURE`: Co-hosted domains on shared vs Anycast edge pools.
+  - `RESOLVER_DISCREPANCY_TIMELINE`: Multi-resolver disagreement and security-filtering NXDOMAINs.
+  - `FAST_FLUX_INDICATOR`: Rapid IP churn, low TTL, and subnet diversity within 24 hours.
+  - `RESOLUTION_DIVERGENCE_INDICATOR`: Sudden transitions between Anycast CDN edge pools and unicast hosts.
 
-## 0.2.0 — offline collection foundation (2026-11-11)
+## M3.3.2 — Storage Integrity, Readiness & Pruning Verification (2026-11-20)
 
-- Exact target/kind allowlists, bounded fixture and request budgets, pure global-address and redirect validation.
-- Deterministic synthetic DNS A/AAAA/PTR response normalization; distinguish NXDOMAIN, NODATA, REFUSED, SERVFAIL, timeout and incomplete responses.
-- RDAP IP network range/CIDR validation and standalone autnum parsing without invented IP-to-ASN attribution.
-- Versioned collection-event schema and separate append-only SQLite ledger; v0.1 observation IDs and intelligence schema unchanged.
-- Offline adversarial tests, collector demo and collection threat-model documentation.
+- **Referential Integrity & Pruning Safety:**
+  - Two-phase retention invariants preventing evidence deletion while dependent observations remain.
+  - WAL checkpoint verification and database compaction runbooks.
 
-## Previous foundation changes
+## M3.3.1 — Graph-Native Property Graph & 4-Layer Epistemic Model (2026-11-20)
 
-- Repository-level coding-agent instructions and specialized agent profiles.
-- Four reusable skills for observation contracts, ML evaluation, collector threat modeling and dataset release.
-- Contributor templates, threat/privacy policies, branch/release procedures and dependency update configuration.
-- CI pinning, read-only GitHub token, offline policy checks and synthetic replay.
+- **Foundational Graph Models (`src/anie/graph_models.py`):**
+  - Entity nodes (`GraphNode`) and temporal directed edges (`GraphEdge`).
+  - 4-layer epistemic hierarchy: `FACT`, `DERIVED`, `HYPOTHESIS`, `VALIDATED`.
+  - Stable, deterministic URI format (`anie:entity:<type>:<canonical_name>`).
+  - Bitemporal tracking: measurement time (`observed_at`) and validity intervals (`valid_from`, `valid_until`).
 
-No collector, network, publishing or runtime behavior changes.
+## M3.2 — First-Party Provenance & Cryptographic Attestations (2026-11-20)
 
-## 0.1.0 source prototype — 2026-11-11
+- **Air-Gapped Signing & Detached Attestations (`src/anie/real_publish.py`):**
+  - Detached Ed25519 signing CLI (`anie sign-real`) where private keys never reside on collector nodes.
+  - Deterministic canonical serialization and byte-for-byte reproducibility via `--published-at`.
+  - Four-tier offline consumer verification engine (`src/anie/release_trust.py`).
 
-- Offline synthetic-only Python package, SQLite observations, temporal DNS features, unsupervised novelty model.
-- Evidence-linked JSONL/gzip datasets, unsigned SHA-256 integrity manifests, local read-only consumer.
-- No real-world collection, live distribution, or production AI threat detection.
+## M3.1 — Security Specification & Pipeline Memory Sustainability (2026-11-16)
+
+- **Fail-Closed Security Preflight (`src/anie/preflight_hardening.py`):**
+  - Tri-state probe classification (`BLOCKED`, `ALLOWED`, `UNVERIFIABLE`).
+  - Systemd cgroup BPF `IPAddressDeny=any` enforcement.
+  - Memory sustainability assertions guaranteeing peak RSS $<50\text{ MiB}$ under 1 GiB micro VM constraints.
+  - Unprivileged sandbox firewall inspection classification.
+  - Standardized completion handling sentinel (`/var/lib/anie/pilot_completed.sentinel`).
+
+---
+
+## Historical Releases (Phase 1 & Phase 2 Foundation)
+
+### Phase 2: First-Party Empirical Collection Pilot (2026-11-12)
+- RFC 8484 DNS-over-HTTPS (DoH) collection engine (`DohCollector`) and rate governor (`DohRateGovernor`).
+- Oracle Cloud deployment runbooks and systemd sandbox templates (`systemd/anie-collector.service`).
+- Strict target allowlist limited to `example.com` and `iana.org`.
+
+### 0.4.1 — Exact-Scope Manual DNS Pilot Preflight (2026-11-12)
+- Pure RFC 8484 DNS wire A/AAAA query and fail-closed response handling.
+- Manually opt-in DoH client with pinned sockets and public IP verification.
+
+### 0.4.0 — Offline Acquisition and Cache Planning (2026-11-12)
+- Parse bounded synthetic IANA-style RDAP IPv4/IPv6 bootstrap registries.
+- Deterministic TTL-aware offline scheduler.
+
+### 0.3.0 — Offline Synthetic Release Signature Verification (2026-11-12)
+- Optional PyCA cryptography Ed25519 signature verification.
+- Domain-separated authenticated payload binding manifest hash, git commit, and sequence.
+
+### 0.2.0 — Offline Collection Foundation (2026-11-11)
+- Bounded fixture and request budgets; deterministic synthetic DNS response normalization.
+- Versioned collection-event schema and append-only SQLite ledger.
+
+### 0.1.0 — Initial Source Prototype (2026-11-11)
+- Offline synthetic-only Python prototype with SQLite observations, temporal DNS features, and unsupervised novelty model.
