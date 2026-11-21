@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.5.0 (M3.9) — Cross-Vector Intelligence Correlation & AEGIS Consumer Integration (2026-11-21)
+
+- **Cross-Vector Intelligence Correlation (`src/anie/cross_vector_correlation.py`):**
+  - Implement bounded cross-vector correlation engine synthesizing observations across DNS, TLS, HTTP, and BGP/RDAP telemetry vectors.
+  - Epistemic discipline: Strictly distinguishes temporal correlation from causation (`causation_inferred=False`). Co-occurrence in a shared observation window is explicitly flagged as non-causal.
+  - Multi-hypothesis evaluation: Evaluates competing infrastructure explanations for observed transitions:
+    - *Legitimate CDN Migration:* DNS mapping to Anycast/CDN prefix space, edge TLS termination, and matching proxy headers (`FAVORED` at bounded heuristic score $\ge 0.85$).
+    - *Routine Certificate Renewal:* Stable underlying IP infrastructure with consistent Subject Alternative Name coverage (`FAVORED` at $\ge 0.80$).
+    - *Shared Hosting / Multi-Tenant Rebalancing:* Dynamic endpoint transitions under high-density multi-tenant environments.
+    - *Multi-Vector Divergence:* Mismatched TLS SAN coverage, unaligned routing, or HTTP error status codes (`FAVORED` at $\ge 0.80$).
+  - Epistemic abstention: Emits status `INSUFFICIENT_MULTI_VECTOR_COVERAGE` and abstains from cross-vector inference whenever $< 2$ distinct vectors are present.
+  - Heuristic score semantics: Scores ($0.0\text{ to }1.0$) are explicitly uncalibrated matching heuristics, accompanied by mandatory disclaimer that novelty/divergence $\neq$ maliciousness.
+- **Authoritative Evidence Resolution & Retention Lifecycle (`src/anie/real_store.py`, `src/anie/retention.py`):**
+  - Authoritative Evidence Verification Invariant: Every evidence reference must resolve to a verifiable record in `real_events` or `real_observations`. A user-supplied hash alone never authenticates an observation (`UNVERIFIED_EVIDENCE_REFERENCE` emitted for orphaned hashes).
+  - Non-destructive retention policy: `allow_destructive_pruning=False` protects all authoritative evidence, collection events, cryptographic attestations, and audit history.
+  - Audit tombstone ledger: Pruning actions record cryptographically anchored audit entries in `retention_tombstone_ledger` tracking deleted record IDs, types, and operator authorization tokens.
+  - Deterministic index rebuild: `rebuild_derived_indexes(store)` allows derived graph nodes and edges to be completely dropped and reconstructed deterministically from authoritative raw records without evidence degradation.
+- **AEGIS Consumer Contract V2 (`src/anie/consumer_contract.py`):**
+  - Publish `anie.consumer-contract.v2` and findings feed schema `anie.cross-vector-finding-feed.v2`.
+  - 100% backward compatibility: Preserves all V1 methods, schemas, and return formats (`fetch_manifest`, `stream_observations`, `stream_events`, `stream_discrepancy_reports`, `stream_intelligence_claims`).
+  - Added client methods: `query_cross_vector_findings(...)`, `get_cross_vector_finding(...)`, `export_normalized_findings_feed(...)`, and `verify_evidence_authoritativeness(...)`.
+  - Export feed includes typed epistemic layers (`FACT`, `DERIVED`, `HYPOTHESIS`, `VALIDATED`), supporting/contradicting evidence digests, and historical supersession links.
+- **Verification:**
+  - 14 new test cases across `tests/test_m3_9_cross_vector_correlation.py`, `tests/test_m3_9_authoritative_evidence_and_retention.py`, `tests/test_m3_9_consumer_contract_v2.py`.
+  - 484 total tests executed across the repository (483 passed, 0 failed, 1 skipped; 100% pass rate).
+  - Repository structural guardrails (`tools/check_repo.py`): 100% PASS.
+
 ## 0.4.1 (M3.8) — Multi-Vector Intelligence, Passive HTTP Metadata & Competing Hypotheses (2026-11-21)
 
 - **Passive HTTP Telemetry (`src/anie/http_enrichment.py`):**

@@ -30,9 +30,15 @@ from .canonical_entities import (
 from .graph_models import ClaimVerificationState, IntelligenceClaim
 from .real_store import RealObservationStore
 
-CONSUMER_CONTRACT_VERSION = "anie.consumer-contract.v1"
+CONSUMER_CONTRACT_VERSION_V1 = "anie.consumer-contract.v1"
+CONSUMER_CONTRACT_VERSION_V2 = "anie.consumer-contract.v2"
+CONSUMER_CONTRACT_VERSION = CONSUMER_CONTRACT_VERSION_V1
+
 IOC_FEED_SCHEMA = "anie.canonical-ioc-feed.v1"
+IOC_FEED_SCHEMA_V2 = "anie.canonical-ioc-feed.v2"
 PROVENANCE_BUNDLE_SCHEMA = "anie.entity-provenance-bundle.v1"
+CROSS_VECTOR_FINDING_SCHEMA = "anie.cross-vector-finding.v2"
+FINDINGS_FEED_SCHEMA_V2 = "anie.cross-vector-finding-feed.v2"
 
 DEFAULT_PAGE_SIZE = 50
 MAX_PAGE_SIZE = 500
@@ -151,6 +157,40 @@ class CanonicalIocFeed:
             "Empirical detector accuracy is tested against controlled ground-truth datasets. "
             "Heuristic confidence scores are rule-based indicators and not Bayesian probabilities."
         )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    def __getitem__(self, item: str) -> Any:
+        try:
+            return getattr(self, item)
+        except AttributeError:
+            raise KeyError(item)
+
+    def __contains__(self, item: str) -> bool:
+        return hasattr(self, item)
+
+
+@dataclass(frozen=True)
+class NormalizedFindingsFeed:
+    """Standardized AEGIS Consumer Contract V2 feed for cross-vector intelligence findings."""
+    schema: str
+    generated_at: str
+    as_of: str
+    total_findings: int
+    findings: list[dict[str, Any]]
+    contract_version: str = CONSUMER_CONTRACT_VERSION_V2
+    publisher: str = "anie-first-party"
+    license: str = "Apache-2.0"
+    next_cursor: str | None = None
+    has_more: bool = False
+    limit: int | None = None
+    notice: str = (
+        "First-party empirical cross-vector intelligence findings and competing hypotheses. "
+        "Heuristic confidence scores are uncalibrated rule-based metrics, NOT calibrated "
+        "Bayesian probabilities. Empirical novelty and infrastructure drift do not constitute "
+        "proof of maliciousness or compromise."
+    )
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -744,6 +784,145 @@ class AnieIntelligenceClient:
             as_of=feed_as_of,
             total_indicators=len(all_indicators),
             indicators=all_indicators,
+            next_cursor=next_cursor_feed,
+            has_more=has_more_feed,
+            limit=bounded_limit if not fetch_all else None,
+        )
+
+    def query_cross_vector_findings(
+        self,
+        *,
+        subject_uri: str | None = None,
+        finding_type: str | None = None,
+        state: str | None = None,
+        limit: int = DEFAULT_PAGE_SIZE,
+        cursor: str | None = None,
+    ) -> PaginatedResult:
+        """Query normalized cross-vector findings with cursor pagination (Contract V2)."""
+        bounded_limit = max(1, min(limit, MAX_PAGE_SIZE))
+        cursor_time = None
+        cursor_id = None
+        if cursor is not None:
+            cursor_time, cursor_id = decode_cursor(cursor)
+
+        query_sql = [
+            "SELECT finding_id, subject_uri, finding_type, epistemic_layer, asserted_at, valid_from, valid_until, state, supersedes_finding_id, payload FROM cross_vector_findings WHERE 1=1"
+        ]
+        params: list[Any] = []
+
+        if subject_uri is not None:
+            etype, cval = parse_entity_uri(subject_uri)
+            cand_uris = [subject_uri, f"{etype}:{cval}", f"anie:entity:{etype}:{cval}", cval]
+            # Deduplicate preserving order
+            seen_cand = set()
+            cand_list = [c for c in cand_uris if not (c in seen_cand or seen_cand.add(c))]
+            placeholders = ",".join("?" for _ in cand_list)
+            query_sql.append(f"AND subject_uri IN ({placeholders})")
+            params.extend(cand_list)
+
+        if finding_type is not None:
+            query_sql.append("AND finding_type = ?")
+            params.append(finding_type)
+
+        if state is not None:
+            query_sql.append("AND state = ?")
+            params.append(state)
+
+        if cursor_time is not None and cursor_id is not None:
+            query_sql.append("AND (asserted_at, finding_id) < (?, ?)")
+            params.extend([cursor_time, cursor_id])
+
+        query_sql.append("ORDER BY asserted_at DESC, finding_id DESC LIMIT ?")
+        params.append(bounded_limit + 1)
+
+        with self.store._connect() as conn:
+            rows = conn.execute(" ".join(query_sql), params).fetchall()
+
+        has_more = len(rows) > bounded_limit
+        result_rows = rows[:bounded_limit]
+
+        items = []
+        for r in result_rows:
+            p_data = json.loads(r[9]) if r[9] else {}
+            items.append(p_data)
+
+        next_cursor = None
+        if has_more and result_rows:
+            last = result_rows[-1]
+            next_cursor = encode_cursor(last[4], last[0])
+
+        return PaginatedResult(
+            items=items,
+            next_cursor=next_cursor,
+            has_more=has_more,
+            limit=bounded_limit,
+            contract_version=CONSUMER_CONTRACT_VERSION_V2,
+        )
+
+    def get_cross_vector_finding(self, finding_id: str) -> dict[str, Any] | None:
+        """Fetch single cross-vector finding by ID."""
+        if hasattr(self.store, "get_cross_vector_finding"):
+            return self.store.get_cross_vector_finding(finding_id)
+        return None
+
+    def verify_evidence_authoritativeness(self, evidence_reference: str) -> dict[str, Any]:
+        """Verify whether an evidence reference or hash resolves to an authoritative record."""
+        if hasattr(self.store, "verify_evidence_authoritativeness"):
+            return self.store.verify_evidence_authoritativeness(evidence_reference)
+        return {
+            "is_authoritative": False,
+            "status": "UNVERIFIED_EVIDENCE_REFERENCE",
+            "reason": "store does not support authoritative evidence verification",
+        }
+
+    def export_normalized_findings_feed(
+        self,
+        *,
+        as_of: str | None = None,
+        subject_uri: str | None = None,
+        finding_type: str | None = None,
+        state: str | None = None,
+        limit: int = DEFAULT_PAGE_SIZE,
+        cursor: str | None = None,
+        fetch_all: bool = False,
+    ) -> NormalizedFindingsFeed:
+        """Export standardized Normalized Findings Feed conforming to Consumer Contract V2."""
+        bounded_limit = max(1, min(limit, MAX_PAGE_SIZE))
+        all_findings: list[dict[str, Any]] = []
+        curr_cursor = cursor
+        has_more_feed = False
+        next_cursor_feed = None
+
+        while True:
+            fetch_limit = MAX_PAGE_SIZE if fetch_all else bounded_limit
+            res = self.query_cross_vector_findings(
+                subject_uri=subject_uri,
+                finding_type=finding_type,
+                state=state,
+                cursor=curr_cursor,
+                limit=fetch_limit,
+            )
+
+            all_findings.extend(res.items)
+
+            if not fetch_all:
+                has_more_feed = res.has_more
+                next_cursor_feed = res.next_cursor
+                break
+            else:
+                if not res.has_more or not res.next_cursor:
+                    break
+                curr_cursor = res.next_cursor
+
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        feed_as_of = as_of or now_iso
+
+        return NormalizedFindingsFeed(
+            schema=FINDINGS_FEED_SCHEMA_V2,
+            generated_at=now_iso,
+            as_of=feed_as_of,
+            total_findings=len(all_findings),
+            findings=all_findings,
             next_cursor=next_cursor_feed,
             has_more=has_more_feed,
             limit=bounded_limit if not fetch_all else None,
