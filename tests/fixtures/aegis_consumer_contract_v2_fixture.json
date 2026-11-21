@@ -1,0 +1,181 @@
+{
+  "schema": "anie.cross-vector-finding-feed.v2",
+  "contract_version": "anie.consumer-contract.v2",
+  "feed_id": "feed_frozen_fixture_v2_001",
+  "generated_at": "2026-11-21T12:00:00Z",
+  "publisher": "anie-first-party",
+  "total_findings": 2,
+  "disclaimer": "Empirical network observation findings and competing hypotheses. Uncalibrated heuristic scores reflect pattern-matching corroboration, NOT calibrated threat probabilities or maliciousness verdicts.",
+  "findings": [
+    {
+      "schema": "anie.cross-vector-finding.v2",
+      "finding_id": "finding_f001_cdn_migration",
+      "subject_uri": "anie:entity:domain:api.example-service.com",
+      "finding_type": "CDN_PROVIDER_MIGRATION",
+      "epistemic_layer": "HYPOTHESIS",
+      "asserted_at": "2026-11-21T10:00:00Z",
+      "valid_from": "2026-11-21T10:00:00Z",
+      "valid_until": null,
+      "state": "ACTIVE",
+      "ruleset_version": "anie.cross-vector-correlation.v1",
+      "temporal_correlation_vs_causation": {
+        "coincident_change_detected": true,
+        "causation_inferred": false,
+        "analysis": "Observations across vectors (dns, http, tls) occurred within a shared observation window. Temporal co-occurrence is treated as correlation and analyzed via competing hypotheses; causal dependency is not assumed."
+      },
+      "abstention_state": {
+        "abstained": false,
+        "reason": null,
+        "participating_vectors": ["dns", "http", "tls"]
+      },
+      "vectors": {
+        "dns": {
+          "vector": "dns",
+          "observed_at": "2026-11-21T10:00:00Z",
+          "evidence_id": "event_a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90",
+          "evidence_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "values": ["104.21.48.12", "172.67.182.201"],
+          "metadata": {
+            "total_dns_records": 2,
+            "resolver_agreement_rate": 1.0
+          }
+        },
+        "tls": {
+          "vector": "tls",
+          "observed_at": "2026-11-21T10:01:00Z",
+          "evidence_id": "event_b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90a1",
+          "evidence_hash": "4ffd1e091d02e6a62fd48ddd52e129db50f631991a51895e0410a11dd68c9c23",
+          "values": ["cert_sha256_cloudflare_ecc_2026"],
+          "metadata": {
+            "issuer": "Cloudflare Inc ECC CA-3",
+            "san_names": ["api.example-service.com", "*.example-service.com"]
+          }
+        },
+        "http": {
+          "vector": "http",
+          "observed_at": "2026-11-21T10:02:00Z",
+          "evidence_id": "event_c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2",
+          "evidence_hash": "8acc5bc3974b78596904634a7657af8bfb3f15ad5c43cda79f5099753126ff4f",
+          "values": ["cloudflare"],
+          "metadata": {
+            "server": "cloudflare",
+            "status_code": 200,
+            "hsts_present": true
+          }
+        }
+      },
+      "competing_hypotheses": [
+        {
+          "subject_uri": "anie:entity:domain:api.example-service.com",
+          "phenomenon": "CROSS_VECTOR_INFRASTRUCTURE_SHIFT",
+          "hypothesis_label": "Legitimate CDN / Cloud Provider Migration",
+          "status": "FAVORED",
+          "heuristic_score": 0.92,
+          "explanation": "Multi-vector observations show consistent Cloudflare Anycast IP routing, edge TLS termination, and proxy response headers.",
+          "supporting_evidence_hashes": [
+            "4ffd1e091d02e6a62fd48ddd52e129db50f631991a51895e0410a11dd68c9c23",
+            "8acc5bc3974b78596904634a7657af8bfb3f15ad5c43cda79f5099753126ff4f",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          ],
+          "contradicting_evidence_hashes": [],
+          "falsifiability_condition": "Falsified if authoritative nameservers delegate to private origin or edge TLS termination fails.",
+          "ruleset_version": "anie.cross-vector-correlation.v1",
+          "asserted_at": "2026-11-21T10:02:00Z",
+          "valid_from": "2026-11-21T10:02:00Z"
+        },
+        {
+          "subject_uri": "anie:entity:domain:api.example-service.com",
+          "phenomenon": "CROSS_VECTOR_INFRASTRUCTURE_SHIFT",
+          "hypothesis_label": "Multi-Vector Divergence / Inconsistency",
+          "status": "CONTRADICTED",
+          "heuristic_score": 0.08,
+          "explanation": "Multi-vector divergence contradicted: DNS, TLS, and HTTP vectors demonstrate consistent edge routing and valid host termination.",
+          "supporting_evidence_hashes": [],
+          "contradicting_evidence_hashes": [
+            "4ffd1e091d02e6a62fd48ddd52e129db50f631991a51895e0410a11dd68c9c23",
+            "8acc5bc3974b78596904634a7657af8bfb3f15ad5c43cda79f5099753126ff4f",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          ],
+          "falsifiability_condition": "Falsified if subsequent TLS handshakes and HTTP requests yield 200 OK.",
+          "ruleset_version": "anie.cross-vector-correlation.v1",
+          "asserted_at": "2026-11-21T10:02:00Z",
+          "valid_from": "2026-11-21T10:02:00Z"
+        }
+      ],
+      "supersedes_finding_id": null,
+      "superseded_by_finding_id": null,
+      "unverified_evidence_references": [],
+      "disclaimer": "Empirical network observation findings and competing hypotheses. Uncalibrated heuristic scores reflect pattern-matching corroboration, NOT calibrated threat probabilities or maliciousness verdicts.",
+      "properties": {}
+    },
+    {
+      "schema": "anie.cross-vector-finding.v2",
+      "finding_id": "finding_f002_cert_renewal",
+      "subject_uri": "anie:entity:domain:secure.internal-corp.net",
+      "finding_type": "ROUTINE_CERTIFICATE_ROTATION",
+      "epistemic_layer": "HYPOTHESIS",
+      "asserted_at": "2026-11-21T11:00:00Z",
+      "valid_from": "2026-11-21T11:00:00Z",
+      "valid_until": null,
+      "state": "ACTIVE",
+      "ruleset_version": "anie.cross-vector-correlation.v1",
+      "temporal_correlation_vs_causation": {
+        "coincident_change_detected": true,
+        "causation_inferred": false,
+        "analysis": "Observations across vectors (dns, tls) occurred within a shared observation window. Temporal co-occurrence is treated as correlation and analyzed via competing hypotheses; causal dependency is not assumed."
+      },
+      "abstention_state": {
+        "abstained": false,
+        "reason": null,
+        "participating_vectors": ["dns", "tls"]
+      },
+      "vectors": {
+        "dns": {
+          "vector": "dns",
+          "observed_at": "2026-11-21T11:00:00Z",
+          "evidence_id": "event_d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3",
+          "evidence_hash": "ec54827765cee58e40261bf116442da947b1fbb6c5543f800a01cda39721a5a8",
+          "values": ["198.51.100.22"],
+          "metadata": {
+            "total_dns_records": 1
+          }
+        },
+        "tls": {
+          "vector": "tls",
+          "observed_at": "2026-11-21T11:01:00Z",
+          "evidence_id": "event_e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4",
+          "evidence_hash": "217a008feee7839127971777d6bd45b30a8d5c1baceb0ff41d7e38ca4ef0f5f6",
+          "values": ["cert_sha256_letsencrypt_rsa_2026"],
+          "metadata": {
+            "issuer": "Let's Encrypt Authority X3",
+            "san_names": ["secure.internal-corp.net"]
+          }
+        }
+      },
+      "competing_hypotheses": [
+        {
+          "subject_uri": "anie:entity:domain:secure.internal-corp.net",
+          "phenomenon": "CROSS_VECTOR_INFRASTRUCTURE_SHIFT",
+          "hypothesis_label": "Routine Certificate Renewal",
+          "status": "FAVORED",
+          "heuristic_score": 0.88,
+          "explanation": "TLS certificate renewal observed with consistent SAN coverage while underlying IP infrastructure remained stable.",
+          "supporting_evidence_hashes": [
+            "217a008feee7839127971777d6bd45b30a8d5c1baceb0ff41d7e38ca4ef0f5f6",
+            "ec54827765cee58e40261bf116442da947b1fbb6c5543f800a01cda39721a5a8"
+          ],
+          "contradicting_evidence_hashes": [],
+          "falsifiability_condition": "Falsified if previous certificate was revoked prematurely or subject alternative names changed.",
+          "ruleset_version": "anie.cross-vector-correlation.v1",
+          "asserted_at": "2026-11-21T11:01:00Z",
+          "valid_from": "2026-11-21T11:01:00Z"
+        }
+      ],
+      "supersedes_finding_id": "finding_f000_prior_renewal",
+      "superseded_by_finding_id": null,
+      "unverified_evidence_references": [],
+      "disclaimer": "Empirical network observation findings and competing hypotheses. Uncalibrated heuristic scores reflect pattern-matching corroboration, NOT calibrated threat probabilities or maliciousness verdicts.",
+      "properties": {}
+    }
+  ]
+}

@@ -136,6 +136,7 @@ class CanonicalIocFeed:
     total_indicators: int
     indicators: list[dict[str, Any]]
     feed_schema: str = IOC_FEED_SCHEMA
+    contract_version: str = CONSUMER_CONTRACT_VERSION_V1
     publisher: str = "anie-first-party"
     license: str = "Apache-2.0"
     next_cursor: str | None = None
@@ -719,9 +720,11 @@ class AnieIntelligenceClient:
         cursor: str | None = None,
         limit: int = DEFAULT_PAGE_SIZE,
         fetch_all: bool = False,
+        publisher_id: str | None = None,
     ) -> CanonicalIocFeed:
         """Export standardized Canonical Threat Intelligence IOC Feed with bounded pagination."""
         bounded_limit = max(1, min(limit, MAX_PAGE_SIZE))
+        pub = publisher_id or "anie-first-party"
         all_indicators: list[dict[str, Any]] = []
         curr_cursor = cursor
         has_more_feed = False
@@ -784,6 +787,7 @@ class AnieIntelligenceClient:
             as_of=feed_as_of,
             total_indicators=len(all_indicators),
             indicators=all_indicators,
+            publisher=pub,
             next_cursor=next_cursor_feed,
             has_more=has_more_feed,
             limit=bounded_limit if not fetch_all else None,
@@ -877,6 +881,7 @@ class AnieIntelligenceClient:
 
     def export_normalized_findings_feed(
         self,
+        findings: list[dict[str, Any]] | None = None,
         *,
         as_of: str | None = None,
         subject_uri: str | None = None,
@@ -885,9 +890,25 @@ class AnieIntelligenceClient:
         limit: int = DEFAULT_PAGE_SIZE,
         cursor: str | None = None,
         fetch_all: bool = False,
+        publisher_id: str | None = None,
     ) -> NormalizedFindingsFeed:
         """Export standardized Normalized Findings Feed conforming to Consumer Contract V2."""
         bounded_limit = max(1, min(limit, MAX_PAGE_SIZE))
+        pub = publisher_id or "anie-first-party"
+
+        if findings is not None:
+            now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            return NormalizedFindingsFeed(
+                schema=FINDINGS_FEED_SCHEMA_V2,
+                generated_at=now_iso,
+                as_of=as_of or now_iso,
+                total_findings=len(findings),
+                findings=findings,
+                publisher=pub,
+                has_more=False,
+                limit=len(findings),
+            )
+
         all_findings: list[dict[str, Any]] = []
         curr_cursor = cursor
         has_more_feed = False
@@ -923,6 +944,7 @@ class AnieIntelligenceClient:
             as_of=feed_as_of,
             total_findings=len(all_findings),
             findings=all_findings,
+            publisher=pub,
             next_cursor=next_cursor_feed,
             has_more=has_more_feed,
             limit=bounded_limit if not fetch_all else None,

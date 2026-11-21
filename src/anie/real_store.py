@@ -1898,12 +1898,19 @@ class RealObservationStore:
                 "status": row[8],
             }
 
-    def verify_evidence_authoritativeness(self, evidence_id_or_hash: str) -> dict[str, Any]:
-        """Verify whether an evidence identifier or wire hash resolves to an authoritative record.
+    def verify_evidence_authoritativeness(
+        self,
+        evidence_id_or_hash: str,
+        *,
+        custom_allowed_sources: set[str] | None = None,
+    ) -> dict[str, Any]:
+        """Verify whether an evidence identifier or wire hash resolves to an authentic authoritative record.
 
-        Strict Epistemic Invariant (Milestone M3.9 Priority 5):
-        A user-supplied hash alone NEVER authenticates an observation.
-        Every evidence reference must resolve to a verifiable authoritative first-party record.
+        Strict Epistemic Invariants (Milestone M3.9/M3.10):
+        1. A user-supplied hash alone NEVER authenticates an observation.
+        2. Retained raw payload bytes MUST match expected SHA-256 (cryptographic preimage check).
+        3. Collector source_id MUST be an authorized first-party collector (not an unvetted arbitrary string).
+        4. Raw evidence status MUST be 'captured'.
         """
         if not evidence_id_or_hash or not isinstance(evidence_id_or_hash, str):
             return {
@@ -1918,7 +1925,7 @@ class RealObservationStore:
             ev_row = conn.execute(
                 """
                 SELECT event_id, subject, kind, observed_at, response_code, raw_sha256,
-                       raw_evidence_status, payload
+                       raw_evidence_status, payload, raw_payload
                 FROM real_events
                 WHERE event_id = ? OR raw_sha256 = ?
                 LIMIT 1
@@ -1927,7 +1934,43 @@ class RealObservationStore:
             ).fetchone()
 
             if ev_row is not None:
-                ev_id = ev_row[0]
+                ev_id, subj, kind, obs_at, rcode, expected_hash, raw_status, payload_json, raw_blob = ev_row
+                ev_payload = json.loads(payload_json) if payload_json else {}
+                source_id = ev_payload.get("source_id", "first_party")
+
+                # Invariant 2: Cryptographic preimage verification
+                if raw_blob is not None:
+                    actual_hash = sha256(raw_blob).hexdigest()
+                    if actual_hash != expected_hash:
+                        return {
+                            "is_authoritative": False,
+                            "status": "CORRUPT_PAYLOAD_DIGEST_MISMATCH",
+                            "reason": f"retained payload hash {actual_hash} does not match expected {expected_hash}",
+                            "event_id": ev_id,
+                            "raw_sha256": expected_hash,
+                        }
+
+                # Invariant 3: Collector provenance & source authorization
+                from .real_models import is_authorized_collector_source
+                if not is_authorized_collector_source(source_id, custom_allowed_sources=custom_allowed_sources):
+                    return {
+                        "is_authoritative": False,
+                        "status": "UNAUTHORIZED_COLLECTOR_SOURCE",
+                        "reason": f"Source ID '{source_id}' is not an authorized first-party collector.",
+                        "event_id": ev_id,
+                        "raw_sha256": expected_hash,
+                    }
+
+                # Invariant 4: Status validation
+                if raw_status != "captured":
+                    return {
+                        "is_authoritative": False,
+                        "status": f"EVIDENCE_STATUS_{raw_status.upper()}",
+                        "reason": f"raw evidence status is {raw_status!r}, not 'captured'",
+                        "event_id": ev_id,
+                        "raw_sha256": expected_hash,
+                    }
+
                 obs_row = conn.execute(
                     """
                     SELECT observation_id, subject, kind, observed_at, status, source_id
@@ -1938,16 +1981,15 @@ class RealObservationStore:
                     (ev_id,),
                 ).fetchone()
 
-                ev_payload = json.loads(ev_row[7]) if ev_row[7] else {}
                 return {
                     "is_authoritative": True,
                     "status": "AUTHORITATIVE_VERIFIED",
                     "event_id": ev_id,
-                    "raw_sha256": ev_row[5],
-                    "subject": ev_row[1],
-                    "kind": ev_row[2],
-                    "observed_at": ev_row[3],
-                    "source_id": ev_payload.get("source_id", "first_party"),
+                    "raw_sha256": expected_hash,
+                    "subject": subj,
+                    "kind": kind,
+                    "observed_at": obs_at,
+                    "source_id": source_id,
                     "observation_id": obs_row[0] if obs_row else None,
                 }
 
@@ -1963,27 +2005,59 @@ class RealObservationStore:
             ).fetchone()
 
             if obs_row is not None:
+                o_id, e_id, o_subj, o_kind, o_at, o_status, o_source = obs_row
                 ev_row = conn.execute(
                     """
-                    SELECT event_id, raw_sha256, response_code, raw_evidence_status
+                    SELECT event_id, raw_sha256, response_code, raw_evidence_status, raw_payload
                     FROM real_events
                     WHERE event_id = ?
                     LIMIT 1
                     """,
-                    (obs_row[1],),
+                    (e_id,),
                 ).fetchone()
 
                 if ev_row is not None:
+                    ev_id, expected_hash, rcode, raw_status, raw_blob = ev_row
+                    if raw_blob is not None:
+                        actual_hash = sha256(raw_blob).hexdigest()
+                        if actual_hash != expected_hash:
+                            return {
+                                "is_authoritative": False,
+                                "status": "CORRUPT_PAYLOAD_DIGEST_MISMATCH",
+                                "reason": f"retained payload hash {actual_hash} does not match expected {expected_hash}",
+                                "event_id": ev_id,
+                                "raw_sha256": expected_hash,
+                            }
+
+                    from .real_models import is_authorized_collector_source
+                    if not is_authorized_collector_source(o_source, custom_allowed_sources=custom_allowed_sources):
+                        return {
+                            "is_authoritative": False,
+                            "status": "UNAUTHORIZED_COLLECTOR_SOURCE",
+                            "reason": f"Source ID '{o_source}' is not an authorized first-party collector.",
+                            "event_id": ev_id,
+                            "raw_sha256": expected_hash,
+                        }
+
+                    if raw_status != "captured":
+                        return {
+                            "is_authoritative": False,
+                            "status": f"EVIDENCE_STATUS_{raw_status.upper()}",
+                            "reason": f"raw evidence status is {raw_status!r}, not 'captured'",
+                            "event_id": ev_id,
+                            "raw_sha256": expected_hash,
+                        }
+
                     return {
                         "is_authoritative": True,
                         "status": "AUTHORITATIVE_VERIFIED",
-                        "event_id": ev_row[0],
-                        "raw_sha256": ev_row[1],
-                        "subject": obs_row[2],
-                        "kind": obs_row[3],
-                        "observed_at": obs_row[4],
-                        "source_id": obs_row[6],
-                        "observation_id": obs_row[0],
+                        "event_id": ev_id,
+                        "raw_sha256": expected_hash,
+                        "subject": o_subj,
+                        "kind": o_kind,
+                        "observed_at": o_at,
+                        "source_id": o_source,
+                        "observation_id": o_id,
                     }
 
         return {

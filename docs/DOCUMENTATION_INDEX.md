@@ -1,7 +1,7 @@
 # ANIE Master Documentation Index & Knowledge Map
 
 **Project:** Autonomous Network Intelligence Engine (ANIE)  
-**Accepted Baseline:** Milestone M3.8 (`6352bc65e6a81a535fa1d1de60ef0de4f0074d59`)  
+**Accepted Baseline:** Milestone M3.10 (Feature Branch `feat/m3.10-verification-and-consumer-readiness`)  
 **Operating Standard:** Spec-Driven Development (SDD)  
 **Licensing:** Apache 2.0 Open Source Core  
 
@@ -39,12 +39,13 @@ flowchart LR
     M35 --> M36["M3.6: RDAP & BGP<br/>(PR #35)"]
     M36 --> M37["M3.7: TLS Graph<br/>(PR #36)"]
     M37 --> M38["M3.8: Passive HTTP<br/>(PR #36)"]
-    M38 --> M39["M3.9: Cross-Vector & AEGIS<br/>(M3.9)"]
+    M38 --> M39["M3.9: Cross-Vector & AEGIS<br/>(PR #39)"]
+    M39 --> M310["M3.10: End-to-End Verification<br/>(M3.10)"]
 ```
 
 | Document | Milestone | Focus Areas | PR & Status |
 | :--- | :---: | :--- | :---: |
-| [docs/PHASE3_ARCHITECTURE_REVISION.md](file:///c:/Users/aniza/Downloads/anie/docs/PHASE3_ARCHITECTURE_REVISION.md) | M3.1–M3.9 | Phase 3 foundational revision, core tenets, roadmap table, and verification sign-off. | Master Spec |
+| [docs/PHASE3_ARCHITECTURE_REVISION.md](file:///c:/Users/aniza/Downloads/anie/docs/PHASE3_ARCHITECTURE_REVISION.md) | M3.1–M3.10 | Phase 3 foundational revision, core tenets, roadmap table, and verification sign-off. | Master Spec |
 | [docs/PHASE3_1_SECURITY_SPECIFICATION.md](file:///c:/Users/aniza/Downloads/anie/docs/PHASE3_1_SECURITY_SPECIFICATION.md) | M3.1 | Preflight egress hardening, tri-state socket probes (`BLOCKED`, `ALLOWED`, `UNVERIFIABLE`), and sentinel barriers. | PR #31 (Merged) |
 | [docs/PHASE3_2_PROVENANCE_ATTESTATION_SPECIFICATION.md](file:///c:/Users/aniza/Downloads/anie/docs/PHASE3_2_PROVENANCE_ATTESTATION_SPECIFICATION.md) | M3.2 | Detached Ed25519 signing CLI, dual-key rotation policies, anti-rollback monotonic sequence counter. | PR #32 (Merged) |
 | [docs/PHASE3_3_MULTI_RESOLVER_SPECIFICATION.md](file:///c:/Users/aniza/Downloads/anie/docs/PHASE3_3_MULTI_RESOLVER_SPECIFICATION.md) | M3.3 | Multi-resolver normalized ingestion (Cloudflare, Google, Quad9), raw wire digests, discrepancy evaluation. | PR #33 (Merged) |
@@ -55,7 +56,8 @@ flowchart LR
 | [docs/PHASE3_6_GRAPH_INTELLIGENCE_AND_OBSIDIAN_SPECIFICATION.md](file:///c:/Users/aniza/Downloads/anie/docs/PHASE3_6_GRAPH_INTELLIGENCE_AND_OBSIDIAN_SPECIFICATION.md) | M3.6 | RFC 9224/9082 RDAP bootstrap parsing, BGP origin-AS attribution, and CDN/Anycast false-positive controls. | PR #35 (Merged) |
 | [docs/PHASE3_7_TLS_AND_MULTI_VECTOR_SPECIFICATION.md](file:///c:/Users/aniza/Downloads/anie/docs/PHASE3_7_TLS_AND_MULTI_VECTOR_SPECIFICATION.md) | M3.7 | TLS x509 SAN parsing, live `SERVES_CERTIFICATE` fact edges requiring handshake evidence, vault sanitization. | PR #36 (Merged) |
 | [docs/ANIE_M3_8_SPECIFICATION.md](file:///c:/Users/aniza/Downloads/anie/docs/ANIE_M3_8_SPECIFICATION.md) | M3.8 | Bounded passive HTTP/1.1 and HTTP/2 metadata normalization, Competing Hypothesis Engine, and Obsidian export. | PR #36 (Merged) |
-| [docs/ANIE_M3_9_SPECIFICATION.md](file:///c:/Users/aniza/Downloads/anie/docs/ANIE_M3_9_SPECIFICATION.md) | M3.9 | DNS + TLS + HTTP cross-vector correlation, non-destructive retention, and AEGIS consumer contract v2. | M3.9 (Feature Complete) |
+| [docs/ANIE_M3_9_SPECIFICATION.md](file:///c:/Users/aniza/Downloads/anie/docs/ANIE_M3_9_SPECIFICATION.md) | M3.9 | DNS + TLS + HTTP cross-vector correlation, non-destructive retention, and AEGIS consumer contract v2. | PR #39 (Merged) |
+| [docs/ANIE_M3_10_SPECIFICATION.md](file:///c:/Users/aniza/Downloads/anie/docs/ANIE_M3_10_SPECIFICATION.md) | M3.10 | End-to-end intelligence verification, preimage check, signed release with findings, and consumer readiness. | M3.10 (Feature Complete) |
 
 ---
 

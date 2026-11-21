@@ -321,37 +321,42 @@ def safe_prune_retention(
         else:
             # Phase 1: Identify and prune expired observations NOT in protected set
             expired_obs = conn.execute(
-                "SELECT observation_id, evidence_id FROM real_observations WHERE observed_at < ?",
+                "SELECT observation_id, evidence_id, payload FROM real_observations WHERE observed_at < ?",
                 (obs_cutoff_iso,),
             ).fetchall()
 
-            prunable_obs_ids = []
-            for o_id, _ in expired_obs:
+            prunable_obs: list[tuple[str, str]] = []
+            for o_id, _, o_payload in expired_obs:
                 if o_id in protected_obs_ids:
                     obs_protected_count += 1
                 else:
-                    prunable_obs_ids.append(o_id)
+                    o_hash = sha256(o_payload.encode("utf-8")).hexdigest() if o_payload else sha256(o_id.encode("utf-8")).hexdigest()
+                    prunable_obs.append((o_id, o_hash))
 
-            if prunable_obs_ids:
+            if prunable_obs:
                 now_str = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                raw_auth = policy.operator_authorization or "policy_authorized"
+                auth_digest = f"auth_sha256_{sha256(raw_auth.encode('utf-8')).hexdigest()[:16]}"
+
                 # Chunk deletions in batches of 500 to bound SQLite query parameters
-                for i in range(0, len(prunable_obs_ids), 500):
-                    chunk = prunable_obs_ids[i : i + 500]
-                    for oid in chunk:
+                for i in range(0, len(prunable_obs), 500):
+                    chunk = prunable_obs[i : i + 500]
+                    chunk_ids = [c[0] for c in chunk]
+                    for oid, o_hash in chunk:
                         tomb_id = f"tomb_obs_{sha256(f'{oid}:{now_str}'.encode('utf-8')).hexdigest()[:24]}"
                         conn.execute(
                             """
                             INSERT OR IGNORE INTO retention_tombstone_ledger (
                                 tombstone_id, record_type, original_id, original_sha256,
                                 pruned_at, operator_authorization, policy_reason
-                            ) VALUES (?, 'observation', ?, '', ?, ?, 'policy_ttl')
+                            ) VALUES (?, 'observation', ?, ?, ?, ?, 'policy_ttl')
                             """,
-                            (tomb_id, oid, now_str, policy.operator_authorization or "policy_authorized"),
+                            (tomb_id, oid, o_hash, now_str, auth_digest),
                         )
-                    placeholders = ",".join("?" for _ in chunk)
+                    placeholders = ",".join("?" for _ in chunk_ids)
                     cur = conn.execute(
                         f"DELETE FROM real_observations WHERE observation_id IN ({placeholders})",
-                        chunk,
+                        chunk_ids,
                     )
                     obs_pruned += cur.rowcount
 
@@ -365,32 +370,36 @@ def safe_prune_retention(
                 row[0] for row in conn.execute("SELECT DISTINCT evidence_id FROM real_observations").fetchall()
             )
 
-            prunable_ev_ids = []
+            prunable_evs: list[tuple[str, str]] = []
             for ev_id, ev_hash in expired_events:
                 if ev_id in active_ev_ids or ev_hash in protected_evidence_hashes:
                     evt_protected_count += 1
                 else:
-                    prunable_ev_ids.append(ev_id)
+                    prunable_evs.append((ev_id, ev_hash))
 
-            if prunable_ev_ids:
+            if prunable_evs:
                 now_str = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-                for i in range(0, len(prunable_ev_ids), 500):
-                    chunk = prunable_ev_ids[i : i + 500]
-                    for eid in chunk:
+                raw_auth = policy.operator_authorization or "policy_authorized"
+                auth_digest = f"auth_sha256_{sha256(raw_auth.encode('utf-8')).hexdigest()[:16]}"
+
+                for i in range(0, len(prunable_evs), 500):
+                    chunk = prunable_evs[i : i + 500]
+                    chunk_ids = [c[0] for c in chunk]
+                    for eid, e_hash in chunk:
                         tomb_id = f"tomb_evt_{sha256(f'{eid}:{now_str}'.encode('utf-8')).hexdigest()[:24]}"
                         conn.execute(
                             """
                             INSERT OR IGNORE INTO retention_tombstone_ledger (
                                 tombstone_id, record_type, original_id, original_sha256,
                                 pruned_at, operator_authorization, policy_reason
-                            ) VALUES (?, 'event', ?, '', ?, ?, 'policy_ttl')
+                            ) VALUES (?, 'event', ?, ?, ?, ?, 'policy_ttl')
                             """,
-                            (tomb_id, eid, now_str, policy.operator_authorization or "policy_authorized"),
+                            (tomb_id, eid, e_hash, now_str, auth_digest),
                         )
-                    placeholders = ",".join("?" for _ in chunk)
+                    placeholders = ",".join("?" for _ in chunk_ids)
                     cur = conn.execute(
                         f"DELETE FROM real_events WHERE event_id IN ({placeholders})",
-                        chunk,
+                        chunk_ids,
                     )
                     evt_pruned += cur.rowcount
 
@@ -526,9 +535,11 @@ def rebuild_derived_indexes(store: RealObservationStore) -> dict[str, int]:
         # 2. Iterate through authoritative real_observations
         obs_rows = conn.execute(
             """
-            SELECT observation_id, evidence_id, subject, kind, observed_at, status, source_id, payload
-            FROM real_observations
-            ORDER BY observed_at ASC, observation_id ASC
+            SELECT o.observation_id, o.evidence_id, o.subject, o.kind, o.observed_at,
+                   o.status, o.source_id, o.payload, e.raw_sha256
+            FROM real_observations o
+            LEFT JOIN real_events e ON o.evidence_id = e.event_id
+            ORDER BY o.observed_at ASC, o.observation_id ASC
             """
         ).fetchall()
 
@@ -541,9 +552,10 @@ def rebuild_derived_indexes(store: RealObservationStore) -> dict[str, int]:
         from .graph_models import EpistemicLayer, NodeType, RelationType, format_node_id
 
         for r in obs_rows:
-            obs_id, ev_id, subj, kind, obs_at, status, src_id, payload_str = r
+            obs_id, ev_id, subj, kind, obs_at, status, src_id, payload_str, ev_sha = r
             p_data = json.loads(payload_str) if payload_str else {}
             vals = p_data.get("values", [])
+            ev_hashes_json = json.dumps([ev_sha]) if ev_sha else "[]"
 
             # Domain node
             if "." in subj and not subj.replace(".", "").isdigit():
@@ -556,6 +568,7 @@ def rebuild_derived_indexes(store: RealObservationStore) -> dict[str, int]:
                         last_observed_at, properties_json, payload
                     ) VALUES (?, ?, ?, ?, ?, ?, '{}', '{}')
                     ON CONFLICT(node_id) DO UPDATE SET
+                        first_observed_at = min(first_observed_at, excluded.first_observed_at),
                         last_observed_at = max(last_observed_at, excluded.last_observed_at)
                     """,
                     (d_uri, NodeType.DOMAIN.value, c_domain, EpistemicLayer.FACT.value, obs_at, obs_at),
@@ -574,6 +587,7 @@ def rebuild_derived_indexes(store: RealObservationStore) -> dict[str, int]:
                                 last_observed_at, properties_json, payload
                             ) VALUES (?, ?, ?, ?, ?, ?, '{}', '{}')
                             ON CONFLICT(node_id) DO UPDATE SET
+                                first_observed_at = min(first_observed_at, excluded.first_observed_at),
                                 last_observed_at = max(last_observed_at, excluded.last_observed_at)
                             """,
                             (ip_uri, NodeType.IP.value, v_clean, EpistemicLayer.FACT.value, obs_at, obs_at),
@@ -588,12 +602,62 @@ def rebuild_derived_indexes(store: RealObservationStore) -> dict[str, int]:
                                 edge_id, source_id, target_id, relation_type, layer,
                                 observed_at, valid_from, valid_until, confidence,
                                 ruleset_version, evidence_hashes_json, properties_json, payload
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 1.0, 'anie.rebuild.v1', '[]', '{}', '{}')
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 1.0, 'anie.rebuild.v1', ?, '{}', '{}')
                             ON CONFLICT(edge_id) DO UPDATE SET
-                                observed_at = max(observed_at, excluded.observed_at)
+                                observed_at = max(observed_at, excluded.observed_at),
+                                valid_from = min(valid_from, excluded.valid_from)
                             """,
-                            (edge_id, d_uri, ip_uri, RelationType.RESOLVES_TO.value, EpistemicLayer.FACT.value, obs_at, obs_at),
+                            (edge_id, d_uri, ip_uri, RelationType.RESOLVES_TO.value, EpistemicLayer.FACT.value, obs_at, obs_at, ev_hashes_json),
                         )
                         rebuilt_edges += 1
+
+        # Check if intelligence_claims exists and rebuild claim nodes
+        has_claims = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='intelligence_claims'"
+        ).fetchone()
+        if has_claims:
+            claim_rows = conn.execute(
+                """
+                SELECT claim_id, subject_uri, claim_type, layer, asserted_at, payload
+                FROM intelligence_claims
+                ORDER BY asserted_at ASC, claim_id ASC
+                """
+            ).fetchall()
+            for cr in claim_rows:
+                cid, csubj, ctype, clayer, casserted, cpayload = cr
+                claim_data = json.loads(cpayload) if cpayload else {}
+                csupersedes = claim_data.get("supersedes_claim_id")
+                claim_node_id = f"anie:entity:claim:{cid}"
+                conn.execute(
+                    """
+                    INSERT INTO graph_nodes (
+                        node_id, node_type, canonical_name, layer, first_observed_at,
+                        last_observed_at, properties_json, payload
+                    ) VALUES (?, ?, ?, ?, ?, ?, '{}', ?)
+                    ON CONFLICT(node_id) DO UPDATE SET
+                        first_observed_at = min(first_observed_at, excluded.first_observed_at),
+                        last_observed_at = max(last_observed_at, excluded.last_observed_at)
+                    """,
+                    (claim_node_id, NodeType.INTELLIGENCE_CLAIM.value, cid, clayer or EpistemicLayer.HYPOTHESIS.value, casserted, casserted, cpayload or '{}'),
+                )
+                rebuilt_nodes += 1
+
+                # If supersedes, create SUPERSEDES edge
+                if csupersedes:
+                    old_claim_id = f"anie:entity:claim:{csupersedes}"
+                    sup_edge_id = f"edge_sup_{sha256(f'{claim_node_id}:{old_claim_id}'.encode('utf-8')).hexdigest()[:24]}"
+                    conn.execute(
+                        """
+                        INSERT INTO graph_edges (
+                            edge_id, source_id, target_id, relation_type, layer,
+                            observed_at, valid_from, valid_until, confidence,
+                            ruleset_version, evidence_hashes_json, properties_json, payload
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 1.0, 'anie.rebuild.v1', '[]', '{}', '{}')
+                        ON CONFLICT(edge_id) DO UPDATE SET
+                            observed_at = max(observed_at, excluded.observed_at)
+                        """,
+                        (sup_edge_id, claim_node_id, old_claim_id, RelationType.SUPERSEDES.value, EpistemicLayer.HYPOTHESIS.value, casserted, casserted),
+                    )
+                    rebuilt_edges += 1
 
     return {"rebuilt_nodes": rebuilt_nodes, "rebuilt_edges": rebuilt_edges}

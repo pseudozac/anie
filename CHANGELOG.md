@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.6.0 (M3.10) — End-to-End Intelligence Verification & Consumer Integration Readiness (2026-11-21)
+
+- **Phase A — Authoritative Evidence Audit & Retention Hardening (`src/anie/real_store.py`, `src/anie/retention.py`, `src/anie/real_models.py`):**
+  - Cryptographic preimage verification: Hardened `verify_evidence_authoritativeness` to verify that retained wire payload bytes match the expected SHA-256 digest (`CORRUPT_PAYLOAD_DIGEST_MISMATCH` emitted on corruption).
+  - Collector provenance & authorization: Enforced collector vetting via `is_authorized_collector_source(source_id)` against authorized prefixes (`first_party:`, `oracle-collector-01`, `anie-collector-01`, `operator_`, etc.), failing closed on unauthorized sources (`UNAUTHORIZED_COLLECTOR_SOURCE`).
+  - Zero credential leakage in tombstones: Tombstone audit ledger stores salted hashes of operator authorization tokens (`auth_sha256_...`), completely eliminating plaintext credential leakage.
+  - Crash-consistent tombstone recording and verifiable record SHA-256 digests (`orig_sha256`).
+  - Deterministic derived index rebuild: `rebuild_derived_indexes(store)` deterministically handles out-of-order, corrected, and superseded records by updating `first_observed_at = min(...)` and `last_observed_at = max(...)`, preserving evidence hashes, and reconstructing intelligence claim nodes and `SUPERSEDES` edges.
+  - Deterministic temporal intelligence: Anchored observation windows to the latest observed timestamp during offline replay when `as_of` is omitted, eliminating wall-clock rollover test sensitivity.
+- **Phase B — Signed Release Pipeline & Adversarial Fault Injection (`src/anie/real_publish.py`):**
+  - Standardized release partition `real_findings.jsonl.gz` in candidate datasets and manifest v2 metadata (`total_findings`).
+  - Deterministic detached Ed25519 manifest attestation signing (`sign_manifest_detached`).
+  - Independent offline verification engine (`verify_real_release`) enforcing cryptographic signature verification, partition hash integrity, referential evidence linkage against `real_events`, trust policy pinning (`RealReleaseTrust`), and monotonic anti-rollback sequence tracking (`ReleaseSequenceTracker`).
+  - Adversarial verification suite: Demonstrated fail-closed rejection on tampered partitions, bit-flipped wire archives, corrupted signature payloads, replay/rollback attempts, and ungrounded evidence references.
+- **Phase C — AEGIS Consumer Integration Readiness (`src/anie/consumer_contract.py`):**
+  - Frozen `anie.consumer-contract.v2` and `anie.cross-vector-finding-feed.v2` schemas.
+  - Frozen deterministic consumer fixture (`tests/fixtures/aegis_consumer_contract_v2_fixture.json`).
+  - Standalone reference consumer client demo (`examples/aegis_consumer_v2_example.py`) demonstrating zero-dependency consumption: cursor pagination, competing hypotheses inspection, and authoritative evidence grounding.
+  - Verified 100% backward compatibility: Consumer Contract V1 endpoints (`export_canonical_ioc_feed`) operate seamlessly alongside V2 feeds.
+  - Epistemic humility enforcement: Findings strictly adhere to epistemic layers (`FACT`, `DERIVED`, `HYPOTHESIS`, `VALIDATED`) with explicit disclaimers that heuristic scores are uncalibrated pattern-corroboration metrics, NOT threat probabilities or maliciousness verdicts.
+- **Verification & Operational Envelope:**
+  - 11 new integration tests across `tests/test_m3_10_authoritative_audit.py`, `tests/test_m3_10_signed_release_pipeline.py`, and `tests/test_m3_10_aegis_consumer_readiness.py`.
+  - 495 total repository tests executed: 494 passed, 0 failed, 1 skipped (`test_schema.py:15` when `jsonschema` library is absent).
+  - Repository structural guardrails (`tools/check_repo.py`): PASS.
+  - Resource consumption verified within 1 GiB Oracle micro VM budget ($<200\text{ MiB}$ RAM, $<500\text{ MiB}$ disk).
+  - Invariants preserved: `anie-collector-01` remains quiescent at ₹0.00 spend; Task Scheduler acquisition runner `ANIE_Ampere_A1_Capacity_Retry` untouched.
+
 ## 0.5.0 (M3.9) — Cross-Vector Intelligence Correlation & AEGIS Consumer Integration (2026-11-21)
 
 - **Cross-Vector Intelligence Correlation (`src/anie/cross_vector_correlation.py`):**
