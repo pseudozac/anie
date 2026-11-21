@@ -208,6 +208,67 @@ class TestAnomalyDetectionGuardrails(unittest.TestCase):
                 ff_claims = [c for c in claims if c.claim_type == TemporalClaimType.FAST_FLUX_INDICATOR.value]
                 self.assertEqual(len(ff_claims), 0, "Known Anycast CDN pool should not trigger fast-flux indicator")
 
+    def test_dynamic_dns_anomalous_subnet_dispersion_contradictory_evidence(self):
+        """Dynamic DNS with anomalous dispersion (>= 3 subnets) preserves contradictory threat indicator."""
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "test_store.sqlite"
+            store = RealObservationStore(db_path)
+
+            # Ingest dynamic DNS domain with IPs across 3 distinct subnets
+            domain = "c2-indicator.duckdns.org"
+            ips = [
+                "198.51.100.1", "198.51.100.2",
+                "198.51.101.3", "198.51.101.4",
+                "203.0.113.5", "203.0.113.6",
+            ]
+            for i, ip in enumerate(ips):
+                t_str = f"2026-11-20T10:{i:02d}:00Z"
+                ev, obs = _make_test_event_and_obs(domain, [ip], t_str, ttl=60)
+                store.insert_record(ev, obs)
+
+            with store._connect() as conn:
+                det = EvidenceGraphDetector(conn)
+                claims = det.analyze_all()
+
+                ff_claims = [c for c in claims if c.claim_type == TemporalClaimType.FAST_FLUX_INDICATOR.value]
+                self.assertEqual(len(ff_claims), 1)
+                claim = ff_claims[0]
+                # High confidence (0.75) due to multi-subnet dispersion exceeding normal subscriber churn
+                self.assertAlmostEqual(claim.confidence, 0.75, places=2)
+                self.assertIsNotNone(claim.properties.get("contradictory_evidence"))
+                self.assertEqual(claim.properties["contradictory_evidence"]["dispersion_level"], "ANOMALOUS_MULTI_SUBNET")
+                self.assertIn("Broad subnet dispersion contradicts expected", claim.explanation)
+
+    def test_mixed_anycast_unicast_contradictory_evidence_preservation(self):
+        """Mixed Anycast/Unicast resolution preserves contradictory evidence and does not suppress."""
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "test_store.sqlite"
+            store = RealObservationStore(db_path)
+
+            # Ingest 2 Cloudflare Anycast IPs + 4 unicast IPs across 2 subnets
+            domain = "mixed-cdn-evasion.net"
+            ips = [
+                "104.16.1.1", "104.16.1.2",  # Cloudflare Anycast
+                "198.51.100.10", "198.51.100.11",  # Unicast Subnet A
+                "198.51.101.20", "198.51.101.21",  # Unicast Subnet B
+            ]
+            for i, ip in enumerate(ips):
+                t_str = f"2026-11-20T10:{i:02d}:00Z"
+                ev, obs = _make_test_event_and_obs(domain, [ip], t_str, ttl=60)
+                store.insert_record(ev, obs)
+
+            with store._connect() as conn:
+                det = EvidenceGraphDetector(conn)
+                claims = det.analyze_all()
+
+                ff_claims = [c for c in claims if c.claim_type == TemporalClaimType.FAST_FLUX_INDICATOR.value]
+                self.assertEqual(len(ff_claims), 1, "Mixed Anycast/Unicast resolution must preserve threat indicator")
+                claim = ff_claims[0]
+                self.assertAlmostEqual(claim.confidence, 0.85, places=2)
+                self.assertIsNotNone(claim.properties.get("contradictory_evidence"))
+                self.assertEqual(claim.properties["contradictory_evidence"]["pattern"], "MIXED_ANYCAST_UNICAST")
+                self.assertIn("Anomalous mixed CDN Anycast/Unicast resolution detected", claim.explanation)
+
     def test_shared_hosting_density_and_no_malicious_inference(self):
         """Shared hosting density categorization and explicit anti-guilt-by-association guardrails."""
         with TemporaryDirectory() as tmp:

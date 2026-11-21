@@ -189,6 +189,10 @@ class TestTlsEnrichmentAndGraphIntegration(unittest.TestCase):
         self.assertEqual(serves_edge.layer, EpistemicLayer.FACT.value)
         self.assertIn(dummy_evidence_hash, serves_edge.evidence_hashes)
         self.assertEqual(serves_edge.properties["port"], 443)
+        self.assertEqual(serves_edge.properties["endpoint"], "198.51.100.25:443")
+        self.assertEqual(serves_edge.properties["sni"], "portal.acme.org")
+        self.assertEqual(serves_edge.properties["collection_time"], "2026-11-21T10:00:00Z")
+        self.assertEqual(serves_edge.properties["source_id"], "oracle-collector-01:tls")
 
         names_edges = [e for e in edges if e.relation_type == RelationType.NAMES_DOMAIN.value]
         self.assertEqual(len(names_edges), 3)
@@ -196,6 +200,38 @@ class TestTlsEnrichmentAndGraphIntegration(unittest.TestCase):
             self.assertEqual(ne.source_id, cert_node.node_id)
             self.assertEqual(ne.layer, EpistemicLayer.DERIVED.value)
             self.assertIn(dummy_evidence_hash, ne.evidence_hashes)
+
+    def test_offline_certificate_parsing_alone_does_not_imply_serving(self):
+        """Offline certificate parsing extracts identity and SANs but NEVER asserts live serving."""
+        der_bytes, _ = _generate_test_certificate(
+            subject_cn="offline.example.com",
+            san_list=["offline.example.com", "alt.example.com"],
+            issuer_org="Test Offline CA",
+        )
+        rec = parse_der_certificate(der_bytes)
+        cert_node, names_edges = self.enricher.enrich_certificate_metadata(rec, "2026-11-21T10:00:00Z")
+
+        self.assertEqual(cert_node.node_type, NodeType.CERTIFICATE.value)
+        self.assertEqual(len(names_edges), 2)
+        # Verify no SERVES_CERTIFICATE edge was created
+        self.assertFalse(any(e.relation_type == RelationType.SERVES_CERTIFICATE.value for e in names_edges))
+
+    def test_enrich_endpoint_requires_valid_evidence_hashes(self):
+        """Attempting to assert a SERVES_CERTIFICATE FACT edge without live evidence fails closed."""
+        der_bytes, _ = _generate_test_certificate(
+            subject_cn="wire.example.com",
+            san_list=["wire.example.com"],
+        )
+        rec = parse_der_certificate(der_bytes)
+
+        with self.assertRaises(ValueError) as ctx:
+            self.enricher.enrich_endpoint(
+                ip="198.51.100.99",
+                cert_record=rec,
+                observed_at="2026-11-21T10:00:00Z",
+                evidence_hashes=[],  # Empty evidence hashes!
+            )
+        self.assertIn("SERVES_CERTIFICATE FACT edge requires verified live endpoint observation", str(ctx.exception))
 
     def test_graph_neighborhood_query_and_obsidian_export(self):
         der_bytes, _ = _generate_test_certificate(

@@ -57,6 +57,45 @@ _KNOWN_CDN_PAAS_DOMAINS = frozenset({
 
 
 @dataclass(frozen=True)
+class ObservedTlsEndpointEvidence:
+    """Genuinely observed live TLS endpoint connection evidence.
+    
+    Guarantees that a Layer 1 SERVES_CERTIFICATE FACT edge is grounded in
+    authentic wire telemetry rather than speculative offline parsing.
+    
+    Mandatory Invariants:
+    - ip: verified IPv4 or IPv6 string
+    - port: port integer (1..65535, default 443)
+    - sni: Server Name Indication hostname requested/negotiated
+    - observed_at: UTC ISO 8601 observation timestamp
+    - source_id: provenance identifier of the collector node
+    - evidence_hash: cryptographic SHA-256 wire hash of raw handshake/certificate
+    - tls_version: negotiated TLS protocol version (e.g. 'TLSv1.3', 'TLSv1.2')
+    """
+    ip: str
+    port: int
+    sni: str
+    observed_at: str
+    source_id: str
+    evidence_hash: str
+    tls_version: str = "TLSv1.3"
+
+    def __post_init__(self):
+        if not self.ip or not isinstance(self.ip, str):
+            raise ValueError("ip must be a non-empty string")
+        if not (1 <= self.port <= 65535):
+            raise ValueError(f"port out of valid range [1, 65535]: {self.port}")
+        if not self.sni or not isinstance(self.sni, str):
+            raise ValueError("sni must be a non-empty string")
+        utc_iso(self.observed_at)
+        if not self.source_id or not isinstance(self.source_id, str):
+            raise ValueError("source_id must be a non-empty string")
+        clean_hash = self.evidence_hash.strip().lower()
+        if len(clean_hash) != 64 or not re.match(r"^[0-9a-f]{64}$", clean_hash):
+            raise ValueError(f"evidence_hash must be a 64-char lowercase hex digest: {self.evidence_hash!r}")
+
+
+@dataclass(frozen=True)
 class TlsCertificateRecord:
     """Immutable parsed X.509 certificate observation."""
     sha256_fingerprint: str
@@ -194,25 +233,20 @@ class TlsEnricher:
     def __init__(self, ruleset_version: str = TLS_RULESET_VERSION):
         self.ruleset_version = ruleset_version
 
-    def enrich_endpoint(
+    def enrich_certificate_metadata(
         self,
-        ip: str,
         cert_record: TlsCertificateRecord,
         observed_at: str,
-        evidence_hashes: list[str],
-        port: int = 443,
-    ) -> tuple[list[GraphNode], list[GraphEdge]]:
-        """Extract graph nodes and edges for an IP serving a TLS certificate.
+        evidence_hashes: list[str] | tuple[str, ...] = (),
+    ) -> tuple[GraphNode, list[GraphEdge]]:
+        """Extract certificate node and derived domain nodes from offline certificate parsing.
         
-        Outputs:
-        - 1 Certificate node (Layer 1 FACT)
-        - 1 SERVES_CERTIFICATE edge (Layer 1 FACT) from IP -> Certificate
-        - N NAMES_DOMAIN edges (Layer 2 DERIVED) from Certificate -> Domains
+        Strict Epistemic Invariant:
+        Offline certificate parsing extracts certificate identity (FACT) and SAN domain linkages (DERIVED).
+        It strictly does NOT assert live endpoint serving (SERVES_CERTIFICATE), as offline parsing alone
+        does not imply live certificate serving.
         """
         obs_iso = utc_iso(observed_at)
-        nodes: list[GraphNode] = []
-        edges: list[GraphEdge] = []
-
         cert_fp = cert_record.sha256_fingerprint
         cert_node_id = f"anie:entity:cert:{cert_fp}"
 
@@ -243,38 +277,10 @@ class TlsEnricher:
             properties=cert_props,
             tx_time=obs_iso,
         )
-        nodes.append(cert_node)
-
-        # IP Node URI
-        ip_uri = format_node_id(NodeType.IP, ip)
-
-        # SERVES_CERTIFICATE edge (Layer 1 FACT)
-        serves_props: dict[str, Any] = {
-            "port": port,
-            "tls_version_inferred": "TLSv1.2/TLSv1.3",
-        }
-        if cert_record.is_multi_tenant:
-            serves_props["guardrail_notice"] = (
-                "Serving endpoint associated with multi-tenant certificate. "
-                "Does NOT infer exclusive domain ownership."
-            )
-
-        serves_edge = GraphEdge.create(
-            source_id=ip_uri,
-            target_id=cert_node_id,
-            relation_type=RelationType.SERVES_CERTIFICATE,
-            layer=EpistemicLayer.FACT,
-            observed_at=obs_iso,
-            confidence=1.0,
-            ruleset_version=self.ruleset_version,
-            evidence_hashes=evidence_hashes,
-            properties=serves_props,
-        )
-        edges.append(serves_edge)
 
         # NAMES_DOMAIN edges (Layer 2 DERIVED) for each SAN domain
+        names_edges: list[GraphEdge] = []
         for san in cert_record.subject_alt_names:
-            # Skip wildcards for direct canonical domain normalization, but link base
             clean_san = san.lower().strip()
             if not clean_san:
                 continue
@@ -300,9 +306,90 @@ class TlsEnricher:
                 observed_at=obs_iso,
                 confidence=1.0,
                 ruleset_version=self.ruleset_version,
-                evidence_hashes=evidence_hashes,
+                evidence_hashes=list(evidence_hashes),
                 properties=names_props,
             )
-            edges.append(names_edge)
+            names_edges.append(names_edge)
+
+        return cert_node, names_edges
+
+    def enrich_endpoint(
+        self,
+        ip: str,
+        cert_record: TlsCertificateRecord,
+        observed_at: str,
+        evidence_hashes: list[str],
+        port: int = 443,
+        sni: str | None = None,
+        source_id: str = "oracle-collector-01:tls",
+        tls_version: str = "TLSv1.3",
+    ) -> tuple[list[GraphNode], list[GraphEdge]]:
+        """Extract graph nodes and edges for an IP genuinely observed serving a TLS certificate.
+        
+        Strict Epistemic Invariant:
+        SERVES_CERTIFICATE FACT edges originate ONLY from genuine observed TLS endpoint evidence,
+        including endpoint IP, SNI, port, collection time, and provenance source_id.
+        Offline certificate parsing alone must not imply live certificate serving.
+        """
+        if not evidence_hashes or not any(h.strip() for h in evidence_hashes):
+            raise ValueError(
+                "SERVES_CERTIFICATE FACT edge requires verified live endpoint observation evidence hashes; "
+                "offline certificate parsing alone must not imply live certificate serving."
+            )
+        if not ip or not isinstance(ip, str):
+            raise ValueError("endpoint IP must be a non-empty string")
+        if not (1 <= port <= 65535):
+            raise ValueError(f"port out of valid range [1, 65535]: {port}")
+
+        effective_sni = (sni or cert_record.subject_cn or ip).strip().lower()
+
+        # Build verified endpoint evidence anchor
+        evidence = ObservedTlsEndpointEvidence(
+            ip=ip,
+            port=port,
+            sni=effective_sni,
+            observed_at=observed_at,
+            source_id=source_id,
+            evidence_hash=evidence_hashes[0],
+            tls_version=tls_version,
+        )
+
+        obs_iso = utc_iso(observed_at)
+        cert_node, names_edges = self.enrich_certificate_metadata(cert_record, obs_iso, evidence_hashes)
+        nodes = [cert_node]
+        edges = list(names_edges)
+
+        # IP Node URI
+        ip_uri = format_node_id(NodeType.IP, ip)
+
+        # SERVES_CERTIFICATE edge (Layer 1 FACT)
+        serves_props: dict[str, Any] = {
+            "endpoint": f"{ip}:{port}",
+            "ip": ip,
+            "port": port,
+            "sni": effective_sni,
+            "collection_time": obs_iso,
+            "source_id": source_id,
+            "provenance": source_id,
+            "tls_version": tls_version,
+        }
+        if cert_record.is_multi_tenant:
+            serves_props["guardrail_notice"] = (
+                "Serving endpoint associated with multi-tenant certificate. "
+                "Does NOT infer exclusive domain ownership."
+            )
+
+        serves_edge = GraphEdge.create(
+            source_id=ip_uri,
+            target_id=cert_node.node_id,
+            relation_type=RelationType.SERVES_CERTIFICATE,
+            layer=EpistemicLayer.FACT,
+            observed_at=obs_iso,
+            confidence=1.0,
+            ruleset_version=self.ruleset_version,
+            evidence_hashes=evidence_hashes,
+            properties=serves_props,
+        )
+        edges.insert(0, serves_edge)
 
         return nodes, edges

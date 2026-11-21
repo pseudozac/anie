@@ -602,11 +602,12 @@ class TemporalIntelligenceEngine:
 
         # Collect unique IPs, subnets, and TTLs strictly across past 24 hours
         observed_ips: set[str] = set()
+        anycast_ips: set[str] = set()
+        unicast_ips: set[str] = set()
         subnets_v4: set[str] = set()
         subnets_v6: set[str] = set()
         ttls: list[int] = []
         evidence_hashes: set[str] = set()
-        anycast_present = False
 
         window_obs = [
             ob for ob in observations
@@ -619,7 +620,9 @@ class TemporalIntelligenceEngine:
                     observed_ips.add(ip)
                     is_anycast, _ = is_known_anycast_ip(ip)
                     if is_anycast:
-                        anycast_present = True
+                        anycast_ips.add(ip)
+                    else:
+                        unicast_ips.add(ip)
                     try:
                         ip_obj = ipaddress.ip_address(ip)
                         if isinstance(ip_obj, ipaddress.IPv4Address):
@@ -637,21 +640,58 @@ class TemporalIntelligenceEngine:
         total_subnets = len(subnets_v4) + len(subnets_v6)
         median_ttl = sorted(ttls)[len(ttls) // 2] if ttls else 300
         is_dynamic_dns = any(domain == sfx or domain.endswith("." + sfx) for sfx in _KNOWN_DYNAMIC_DNS_SUFFIXES)
+        is_pure_anycast = (len(anycast_ips) > 0 and len(unicast_ips) == 0)
+        is_mixed_anycast = (len(anycast_ips) > 0 and len(unicast_ips) > 0)
 
         # Fast-Flux Heuristic Condition:
         # 1. >= 5 unique IPs observed within 24h
         # 2. Short median TTL <= 300s
         # 3. >= 2 distinct /24 (IPv4) or /48 (IPv6) subnets
-        # 4. Not in known CDN Anycast pool
-        if len(observed_ips) >= 5 and median_ttl <= 300 and total_subnets >= 2 and not anycast_present:
-            if is_dynamic_dns:
-                confidence = 0.35
+        # 4. Exclude pure CDN Anycast pools (preserve contradictory evidence if mixed Anycast/Unicast)
+        if len(observed_ips) >= 5 and median_ttl <= 300 and total_subnets >= 2 and not is_pure_anycast:
+            contradictory_evidence = None
+
+            if is_mixed_anycast:
+                # Contradictory evidence: co-resolution across CDN edge pools and unicast infrastructure
+                confidence = 0.85
                 explanation = (
-                    f"Dynamic IP rotation evaluated for {domain}: Observed {len(observed_ips)} unique IPs "
-                    f"across {total_subnets} subnets with low median TTL ({median_ttl}s). Domain is hosted on "
-                    f"a recognized public dynamic DNS provider; rapid residential IP churn is typical of consumer "
-                    f"dynamic allocations rather than adversary fast-flux infrastructure."
+                    f"Anomalous mixed CDN Anycast/Unicast resolution detected for {domain}: Observed {len(unicast_ips)} "
+                    f"standard unicast IP(s) co-resolved with {len(anycast_ips)} CDN Anycast edge IP(s) across {total_subnets} "
+                    f"distinct subnets with low median TTL ({median_ttl}s). Contradictory evidence preserved against pure CDN classification."
                 )
+                contradictory_evidence = {
+                    "pattern": "MIXED_ANYCAST_UNICAST",
+                    "anycast_ips": sorted(anycast_ips),
+                    "unicast_ips": sorted(unicast_ips),
+                }
+            elif is_dynamic_dns:
+                if total_subnets <= 2:
+                    # Normal residential churn within expected subscriber boundaries
+                    confidence = 0.35
+                    explanation = (
+                        f"Dynamic IP rotation evaluated for {domain}: Observed {len(observed_ips)} unique IPs "
+                        f"across {total_subnets} subnets with low median TTL ({median_ttl}s). Domain is hosted on "
+                        f"a recognized public dynamic DNS provider; rapid residential IP churn is typical of consumer "
+                        f"dynamic allocations rather than adversary fast-flux infrastructure."
+                    )
+                    contradictory_evidence = {
+                        "is_dynamic_dns": True,
+                        "dispersion_level": "NORMAL_RESIDENTIAL",
+                        "subnet_count": total_subnets,
+                    }
+                else:
+                    # Contradictory evidence: dynamic DNS with anomalous multi-subnet dispersion (>= 3 subnets)
+                    confidence = 0.75
+                    explanation = (
+                        f"High-volatility multi-subnet dispersion detected for {domain} on dynamic DNS: "
+                        f"Observed {len(observed_ips)} unique IPs across {total_subnets} distinct subnets ({len(subnets_v4)} IPv4 /24, {len(subnets_v6)} IPv6 /48) "
+                        f"with low median TTL ({median_ttl}s). Broad subnet dispersion contradicts expected single-subscriber residential dynamic DNS churn."
+                    )
+                    contradictory_evidence = {
+                        "is_dynamic_dns": True,
+                        "dispersion_level": "ANOMALOUS_MULTI_SUBNET",
+                        "subnet_count": total_subnets,
+                    }
             else:
                 confidence = 0.70
                 explanation = (
@@ -684,6 +724,8 @@ class TemporalIntelligenceEngine:
                     "ipv6_subnet_count": len(subnets_v6),
                     "median_ttl": median_ttl,
                     "is_dynamic_dns": is_dynamic_dns,
+                    "is_mixed_anycast": is_mixed_anycast,
+                    "contradictory_evidence": contradictory_evidence,
                     "window_start": t_window_start_iso,
                     "window_end": now_iso,
                     "guardrail_status": "PASS_NO_MALICIOUS_INFERENCE",
