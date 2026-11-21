@@ -41,6 +41,10 @@ def main() -> int:
     parser.add_argument("--public-ip", help="Public IP if successfully acquired")
     parser.add_argument("--private-ip", help="Private IP if successfully acquired")
     parser.add_argument("--simulate-schedule", type=int, metavar="DAYS", help="Simulate retry schedule over N days")
+    parser.add_argument("--run-cycle", action="store_true", help="Execute one unattended capacity acquisition cycle")
+    parser.add_argument("--ssh-key-pub", help="Path to SSH public key for instance launch")
+    parser.add_argument("--force", action="store_true", help="Bypass rate limit cooldown (operator manual override)")
+    parser.add_argument("--log-file", help="Append cycle execution logs to this file")
 
     args = parser.parse_args()
     mgr = CapacityAcquisitionManager(args.state_dir)
@@ -89,6 +93,23 @@ def main() -> int:
             curr += timedelta(hours=1)
         print(f"Total simulated 60-min attempts before expiration: {attempts} (Max: {days * 24})")
         return 0
+
+    if args.run_cycle:
+        result = mgr.run_cycle(
+            ssh_public_key_path=args.ssh_key_pub,
+            force=args.force,
+        )
+        output_line = (
+            f"[{result['timestamp']}] Executed={result['cycle_executed']} "
+            f"Outcome={result.get('outcome')} Message={result.get('message')}"
+        )
+        print(output_line)
+        if args.log_file:
+            log_p = Path(args.log_file)
+            log_p.parent.mkdir(parents=True, exist_ok=True)
+            with log_p.open("a", encoding="utf-8") as f:
+                f.write(output_line + "\n")
+        return 0 if (result.get("outcome") in (OUTCOME_SUCCESS, OUTCOME_OUT_OF_CAPACITY) or not result.get("cycle_executed")) else 1
 
     parser.print_help()
     return 0
