@@ -179,6 +179,37 @@ class RealObservationStore:
             elif version < CURRENT_SCHEMA_VERSION:
                 self._migrate(conn, version, CURRENT_SCHEMA_VERSION)
 
+            # Ensure M3.9 cross-vector findings and retention tombstone ledger tables exist
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS cross_vector_findings (
+                    finding_id TEXT PRIMARY KEY,
+                    subject_uri TEXT NOT NULL,
+                    finding_type TEXT NOT NULL,
+                    epistemic_layer TEXT NOT NULL,
+                    asserted_at TEXT NOT NULL,
+                    valid_from TEXT NOT NULL,
+                    valid_until TEXT,
+                    state TEXT NOT NULL DEFAULT 'ACTIVE',
+                    supersedes_finding_id TEXT,
+                    payload TEXT NOT NULL
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_cross_vector_subject ON cross_vector_findings(subject_uri, asserted_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_cross_vector_state ON cross_vector_findings(state)")
+
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS retention_tombstone_ledger (
+                    tombstone_id TEXT PRIMARY KEY,
+                    record_type TEXT NOT NULL,
+                    original_id TEXT NOT NULL,
+                    original_sha256 TEXT NOT NULL,
+                    pruned_at TEXT NOT NULL,
+                    operator_authorization TEXT NOT NULL,
+                    policy_reason TEXT NOT NULL
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_tombstone_record ON retention_tombstone_ledger(record_type, original_id)")
+
     @property
     def schema_version(self) -> int:
         """Current schema version of the SQLite database."""
@@ -386,6 +417,38 @@ class RealObservationStore:
                 tokenize='unicode61 remove_diacritics 2'
             )
         """)
+
+        # 7. Cross-Vector Intelligence Findings (Milestone M3.9)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS cross_vector_findings (
+                finding_id TEXT PRIMARY KEY,
+                subject_uri TEXT NOT NULL,
+                finding_type TEXT NOT NULL,
+                epistemic_layer TEXT NOT NULL,
+                asserted_at TEXT NOT NULL,
+                valid_from TEXT NOT NULL,
+                valid_until TEXT,
+                state TEXT NOT NULL DEFAULT 'ACTIVE',
+                supersedes_finding_id TEXT,
+                payload TEXT NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_cross_vector_subject ON cross_vector_findings(subject_uri, asserted_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_cross_vector_state ON cross_vector_findings(state)")
+
+        # 8. Cryptographic Retention Tombstone Ledger (Milestone M3.9)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS retention_tombstone_ledger (
+                tombstone_id TEXT PRIMARY KEY,
+                record_type TEXT NOT NULL,
+                original_id TEXT NOT NULL,
+                original_sha256 TEXT NOT NULL,
+                pruned_at TEXT NOT NULL,
+                operator_authorization TEXT NOT NULL,
+                policy_reason TEXT NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_tombstone_record ON retention_tombstone_ledger(record_type, original_id)")
 
     def _migrate(self, conn: sqlite3.Connection, from_version: int, to_version: int) -> None:
         """Incremental database schema migration framework."""
@@ -1834,3 +1897,168 @@ class RealObservationStore:
                 "total_claims": row[7],
                 "status": row[8],
             }
+
+    def verify_evidence_authoritativeness(self, evidence_id_or_hash: str) -> dict[str, Any]:
+        """Verify whether an evidence identifier or wire hash resolves to an authoritative record.
+
+        Strict Epistemic Invariant (Milestone M3.9 Priority 5):
+        A user-supplied hash alone NEVER authenticates an observation.
+        Every evidence reference must resolve to a verifiable authoritative first-party record.
+        """
+        if not evidence_id_or_hash or not isinstance(evidence_id_or_hash, str):
+            return {
+                "is_authoritative": False,
+                "status": "UNVERIFIED_EVIDENCE_REFERENCE",
+                "reason": "invalid or empty evidence reference",
+            }
+
+        ref = evidence_id_or_hash.strip()
+        with self._connect() as conn:
+            # 1. Search in real_events by event_id or raw_sha256
+            ev_row = conn.execute(
+                """
+                SELECT event_id, subject, kind, observed_at, response_code, raw_sha256,
+                       raw_evidence_status, payload
+                FROM real_events
+                WHERE event_id = ? OR raw_sha256 = ?
+                LIMIT 1
+                """,
+                (ref, ref),
+            ).fetchone()
+
+            if ev_row is not None:
+                ev_id = ev_row[0]
+                obs_row = conn.execute(
+                    """
+                    SELECT observation_id, subject, kind, observed_at, status, source_id
+                    FROM real_observations
+                    WHERE evidence_id = ?
+                    LIMIT 1
+                    """,
+                    (ev_id,),
+                ).fetchone()
+
+                ev_payload = json.loads(ev_row[7]) if ev_row[7] else {}
+                return {
+                    "is_authoritative": True,
+                    "status": "AUTHORITATIVE_VERIFIED",
+                    "event_id": ev_id,
+                    "raw_sha256": ev_row[5],
+                    "subject": ev_row[1],
+                    "kind": ev_row[2],
+                    "observed_at": ev_row[3],
+                    "source_id": ev_payload.get("source_id", "first_party"),
+                    "observation_id": obs_row[0] if obs_row else None,
+                }
+
+            # 2. Search in real_observations by observation_id
+            obs_row = conn.execute(
+                """
+                SELECT observation_id, evidence_id, subject, kind, observed_at, status, source_id
+                FROM real_observations
+                WHERE observation_id = ?
+                LIMIT 1
+                """,
+                (ref,),
+            ).fetchone()
+
+            if obs_row is not None:
+                ev_row = conn.execute(
+                    """
+                    SELECT event_id, raw_sha256, response_code, raw_evidence_status
+                    FROM real_events
+                    WHERE event_id = ?
+                    LIMIT 1
+                    """,
+                    (obs_row[1],),
+                ).fetchone()
+
+                if ev_row is not None:
+                    return {
+                        "is_authoritative": True,
+                        "status": "AUTHORITATIVE_VERIFIED",
+                        "event_id": ev_row[0],
+                        "raw_sha256": ev_row[1],
+                        "subject": obs_row[2],
+                        "kind": obs_row[3],
+                        "observed_at": obs_row[4],
+                        "source_id": obs_row[6],
+                        "observation_id": obs_row[0],
+                    }
+
+        return {
+            "is_authoritative": False,
+            "status": "UNVERIFIED_EVIDENCE_REFERENCE",
+            "reason": f"No authoritative first-party record found matching identifier/hash {ref!r}. A user-supplied hash alone cannot authenticate an observation.",
+        }
+
+    def insert_cross_vector_finding(self, finding: Any) -> bool:
+        """Insert or replace a cross-vector intelligence finding."""
+        f_dict = finding.to_dict() if hasattr(finding, "to_dict") else dict(finding)
+        fid = f_dict["finding_id"]
+        subj = f_dict["subject_uri"]
+        ftype = f_dict["finding_type"]
+        layer = f_dict["epistemic_layer"]
+        asserted = f_dict["asserted_at"]
+        valid_from = f_dict["valid_from"]
+        valid_until = f_dict.get("valid_until")
+        state = f_dict.get("state", "ACTIVE")
+        supersedes = f_dict.get("supersedes_finding_id")
+        payload = json.dumps(f_dict, separators=(",", ":"))
+
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO cross_vector_findings (
+                    finding_id, subject_uri, finding_type, epistemic_layer,
+                    asserted_at, valid_from, valid_until, state,
+                    supersedes_finding_id, payload
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (fid, subj, ftype, layer, asserted, valid_from, valid_until, state, supersedes, payload),
+            )
+            return True
+
+    def query_cross_vector_findings(
+        self,
+        *,
+        subject_uri: str | None = None,
+        finding_type: str | None = None,
+        state: str | None = None,
+        limit: int = 50,
+        cursor: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Query cross-vector findings with bounded pagination."""
+        bounded_limit = max(1, min(limit, 500))
+        query_sql = ["SELECT payload FROM cross_vector_findings WHERE 1=1"]
+        params: list[Any] = []
+
+        if subject_uri is not None:
+            query_sql.append("AND subject_uri = ?")
+            params.append(subject_uri)
+
+        if finding_type is not None:
+            query_sql.append("AND finding_type = ?")
+            params.append(finding_type)
+
+        if state is not None:
+            query_sql.append("AND state = ?")
+            params.append(state)
+
+        query_sql.append("ORDER BY asserted_at DESC, finding_id DESC LIMIT ?")
+        params.append(bounded_limit)
+
+        with self._connect() as conn:
+            rows = conn.execute(" ".join(query_sql), params).fetchall()
+            return [json.loads(r[0]) for r in rows if r[0]]
+
+    def get_cross_vector_finding(self, finding_id: str) -> dict[str, Any] | None:
+        """Fetch single cross-vector finding by ID."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT payload FROM cross_vector_findings WHERE finding_id = ?",
+                (finding_id,),
+            ).fetchone()
+            if row and row[0]:
+                return json.loads(row[0])
+            return None

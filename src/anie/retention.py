@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
+from hashlib import sha256
 import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -32,6 +33,10 @@ class RetentionPolicy:
     protect_discrepancy_evidence: bool = True
     protect_released_evidence: bool = True
     compact_vacuum: bool = True
+    allow_destructive_pruning: bool = True
+    compact_derived_indexes: bool = True
+    authoritative_retention: str = "INDEFINITE"
+    operator_authorization: str | None = None
 
 
 @dataclass(frozen=True)
@@ -307,57 +312,87 @@ def safe_prune_retention(
         obs_total = conn.execute("SELECT COUNT(*) FROM real_observations").fetchone()[0]
         evt_total = conn.execute("SELECT COUNT(*) FROM real_events").fetchone()[0]
 
-        # Phase 1: Identify and prune expired observations NOT in protected set
-        expired_obs = conn.execute(
-            "SELECT observation_id, evidence_id FROM real_observations WHERE observed_at < ?",
-            (obs_cutoff_iso,),
-        ).fetchall()
+        # Milestone M3.9 Lifecycle Policy: Never destructively prune authoritative evidence if disabled
+        if not policy.allow_destructive_pruning:
+            prunable_obs_ids = []
+            prunable_ev_ids = []
+            obs_protected_count = obs_total
+            evt_protected_count = evt_total
+        else:
+            # Phase 1: Identify and prune expired observations NOT in protected set
+            expired_obs = conn.execute(
+                "SELECT observation_id, evidence_id FROM real_observations WHERE observed_at < ?",
+                (obs_cutoff_iso,),
+            ).fetchall()
 
-        prunable_obs_ids = []
-        for o_id, _ in expired_obs:
-            if o_id in protected_obs_ids:
-                obs_protected_count += 1
-            else:
-                prunable_obs_ids.append(o_id)
+            prunable_obs_ids = []
+            for o_id, _ in expired_obs:
+                if o_id in protected_obs_ids:
+                    obs_protected_count += 1
+                else:
+                    prunable_obs_ids.append(o_id)
 
-        if prunable_obs_ids:
-            # Chunk deletions in batches of 500 to bound SQLite query parameters
-            for i in range(0, len(prunable_obs_ids), 500):
-                chunk = prunable_obs_ids[i : i + 500]
-                placeholders = ",".join("?" for _ in chunk)
-                cur = conn.execute(
-                    f"DELETE FROM real_observations WHERE observation_id IN ({placeholders})",
-                    chunk,
-                )
-                obs_pruned += cur.rowcount
+            if prunable_obs_ids:
+                now_str = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                # Chunk deletions in batches of 500 to bound SQLite query parameters
+                for i in range(0, len(prunable_obs_ids), 500):
+                    chunk = prunable_obs_ids[i : i + 500]
+                    for oid in chunk:
+                        tomb_id = f"tomb_obs_{sha256(f'{oid}:{now_str}'.encode('utf-8')).hexdigest()[:24]}"
+                        conn.execute(
+                            """
+                            INSERT OR IGNORE INTO retention_tombstone_ledger (
+                                tombstone_id, record_type, original_id, original_sha256,
+                                pruned_at, operator_authorization, policy_reason
+                            ) VALUES (?, 'observation', ?, '', ?, ?, 'policy_ttl')
+                            """,
+                            (tomb_id, oid, now_str, policy.operator_authorization or "policy_authorized"),
+                        )
+                    placeholders = ",".join("?" for _ in chunk)
+                    cur = conn.execute(
+                        f"DELETE FROM real_observations WHERE observation_id IN ({placeholders})",
+                        chunk,
+                    )
+                    obs_pruned += cur.rowcount
 
-        # Phase 2: Identify and prune expired events NOT referenced by ANY observation AND NOT in protected evidence hashes
-        expired_events = conn.execute(
-            "SELECT event_id, raw_sha256 FROM real_events WHERE observed_at < ?",
-            (evt_cutoff_iso,),
-        ).fetchall()
+            # Phase 2: Identify and prune expired events NOT referenced by ANY observation AND NOT in protected evidence hashes
+            expired_events = conn.execute(
+                "SELECT event_id, raw_sha256 FROM real_events WHERE observed_at < ?",
+                (evt_cutoff_iso,),
+            ).fetchall()
 
-        # Query which event_ids are currently referenced by active observations
-        active_ev_ids = set(
-            row[0] for row in conn.execute("SELECT DISTINCT evidence_id FROM real_observations").fetchall()
-        )
+            active_ev_ids = set(
+                row[0] for row in conn.execute("SELECT DISTINCT evidence_id FROM real_observations").fetchall()
+            )
 
-        prunable_ev_ids = []
-        for ev_id, ev_hash in expired_events:
-            if ev_id in active_ev_ids or ev_hash in protected_evidence_hashes:
-                evt_protected_count += 1
-            else:
-                prunable_ev_ids.append(ev_id)
+            prunable_ev_ids = []
+            for ev_id, ev_hash in expired_events:
+                if ev_id in active_ev_ids or ev_hash in protected_evidence_hashes:
+                    evt_protected_count += 1
+                else:
+                    prunable_ev_ids.append(ev_id)
 
-        if prunable_ev_ids:
-            for i in range(0, len(prunable_ev_ids), 500):
-                chunk = prunable_ev_ids[i : i + 500]
-                placeholders = ",".join("?" for _ in chunk)
-                cur = conn.execute(
-                    f"DELETE FROM real_events WHERE event_id IN ({placeholders})",
-                    chunk,
-                )
-                evt_pruned += cur.rowcount
+            if prunable_ev_ids:
+                now_str = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                for i in range(0, len(prunable_ev_ids), 500):
+                    chunk = prunable_ev_ids[i : i + 500]
+                    for eid in chunk:
+                        tomb_id = f"tomb_evt_{sha256(f'{eid}:{now_str}'.encode('utf-8')).hexdigest()[:24]}"
+                        conn.execute(
+                            """
+                            INSERT OR IGNORE INTO retention_tombstone_ledger (
+                                tombstone_id, record_type, original_id, original_sha256,
+                                pruned_at, operator_authorization, policy_reason
+                            ) VALUES (?, 'event', ?, '', ?, ?, 'policy_ttl')
+                            """,
+                            (tomb_id, eid, now_str, policy.operator_authorization or "policy_authorized"),
+                        )
+                    placeholders = ",".join("?" for _ in chunk)
+                    cur = conn.execute(
+                        f"DELETE FROM real_events WHERE event_id IN ({placeholders})",
+                        chunk,
+                    )
+                    evt_pruned += cur.rowcount
 
     # Checkpoint WAL
     store.checkpoint_wal(truncate=True)
@@ -470,3 +505,95 @@ class StorageGrowthModel:
             for d in [30, 90, 180, 365]:
                 projections.append(cls.project(prof_name, d))
         return projections
+
+
+def rebuild_derived_indexes(store: RealObservationStore) -> dict[str, int]:
+    """Deterministically rebuild derived graph nodes and edges from authoritative records.
+
+    Milestone M3.9 Lifecycle Policy:
+    Authoritative tables (real_observations, real_events) are immutable empirical sources of truth.
+    Derived graph nodes and edges are strictly secondary and can be safely compacted, dropped,
+    and rebuilt from scratch without loss of evidence integrity.
+    """
+    rebuilt_nodes = 0
+    rebuilt_edges = 0
+
+    with store._connect() as conn:
+        # 1. Clear existing derived graph indexes
+        conn.execute("DELETE FROM graph_edges")
+        conn.execute("DELETE FROM graph_nodes")
+
+        # 2. Iterate through authoritative real_observations
+        obs_rows = conn.execute(
+            """
+            SELECT observation_id, evidence_id, subject, kind, observed_at, status, source_id, payload
+            FROM real_observations
+            ORDER BY observed_at ASC, observation_id ASC
+            """
+        ).fetchall()
+
+        from .canonical_entities import (
+            canonical_domain_uri,
+            canonical_ipv4_uri,
+            canonical_ipv6_uri,
+            canonicalize_domain,
+        )
+        from .graph_models import EpistemicLayer, NodeType, RelationType, format_node_id
+
+        for r in obs_rows:
+            obs_id, ev_id, subj, kind, obs_at, status, src_id, payload_str = r
+            p_data = json.loads(payload_str) if payload_str else {}
+            vals = p_data.get("values", [])
+
+            # Domain node
+            if "." in subj and not subj.replace(".", "").isdigit():
+                c_domain = canonicalize_domain(subj)
+                d_uri = format_node_id(NodeType.DOMAIN, c_domain)
+                conn.execute(
+                    """
+                    INSERT INTO graph_nodes (
+                        node_id, node_type, canonical_name, layer, first_observed_at,
+                        last_observed_at, properties_json, payload
+                    ) VALUES (?, ?, ?, ?, ?, ?, '{}', '{}')
+                    ON CONFLICT(node_id) DO UPDATE SET
+                        last_observed_at = max(last_observed_at, excluded.last_observed_at)
+                    """,
+                    (d_uri, NodeType.DOMAIN.value, c_domain, EpistemicLayer.FACT.value, obs_at, obs_at),
+                )
+                rebuilt_nodes += 1
+
+                # IP nodes and RESOLVES_TO edges
+                for v in vals:
+                    if isinstance(v, str) and ("." in v or ":" in v):
+                        v_clean = v.strip()
+                        ip_uri = format_node_id(NodeType.IP, v_clean)
+                        conn.execute(
+                            """
+                            INSERT INTO graph_nodes (
+                                node_id, node_type, canonical_name, layer, first_observed_at,
+                                last_observed_at, properties_json, payload
+                            ) VALUES (?, ?, ?, ?, ?, ?, '{}', '{}')
+                            ON CONFLICT(node_id) DO UPDATE SET
+                                last_observed_at = max(last_observed_at, excluded.last_observed_at)
+                            """,
+                            (ip_uri, NodeType.IP.value, v_clean, EpistemicLayer.FACT.value, obs_at, obs_at),
+                        )
+                        rebuilt_nodes += 1
+
+                        # Edge
+                        edge_id = f"edge_res_{sha256(f'{d_uri}:{ip_uri}:{obs_at}'.encode('utf-8')).hexdigest()[:24]}"
+                        conn.execute(
+                            """
+                            INSERT INTO graph_edges (
+                                edge_id, source_id, target_id, relation_type, layer,
+                                observed_at, valid_from, valid_until, confidence,
+                                ruleset_version, evidence_hashes_json, properties_json, payload
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 1.0, 'anie.rebuild.v1', '[]', '{}', '{}')
+                            ON CONFLICT(edge_id) DO UPDATE SET
+                                observed_at = max(observed_at, excluded.observed_at)
+                            """,
+                            (edge_id, d_uri, ip_uri, RelationType.RESOLVES_TO.value, EpistemicLayer.FACT.value, obs_at, obs_at),
+                        )
+                        rebuilt_edges += 1
+
+    return {"rebuilt_nodes": rebuilt_nodes, "rebuilt_edges": rebuilt_edges}
