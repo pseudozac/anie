@@ -122,7 +122,16 @@ class GraphEngine:
                 valid_until = None
 
         # 1. Subject Node (Domain or IP)
-        subj_type = NodeType.DOMAIN if observation.kind in ("dns_a", "dns_aaaa") else NodeType.IP
+        if observation.kind in ("dns_ptr", "rdap_asn", "rdap_network"):
+            subj_type = NodeType.IP
+        elif observation.kind in ("dns_a", "dns_aaaa", "http_metadata", "tls_cert", "tls_handshake"):
+            subj_type = NodeType.DOMAIN
+        else:
+            try:
+                ipaddress.ip_address(observation.subject)
+                subj_type = NodeType.IP
+            except ValueError:
+                subj_type = NodeType.DOMAIN
         domain_node = GraphNode.create(
             node_type=subj_type,
             canonical_name=observation.subject,

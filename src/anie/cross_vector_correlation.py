@@ -397,6 +397,35 @@ class CrossVectorCorrelator:
                 metadata=http_meta,
             )
 
+        # Multi-Vector Evidence Binding (Milestone M3.10 Security Audit):
+        # Reject mismatched source-vector evidence (e.g. DNS event passed as HTTP evidence)
+        for v_name, v_summary in active_vectors.items():
+            ev_ref = v_summary.evidence_hash or v_summary.evidence_id
+            if not ev_ref:
+                continue
+
+            ev_kind = None
+            if self.store is not None and hasattr(self.store, "verify_evidence_authoritativeness"):
+                ver_res = self.store.verify_evidence_authoritativeness(ev_ref)
+                if ver_res.get("kind"):
+                    ev_kind = ver_res.get("kind")
+            elif events_by_id and v_summary.evidence_id in events_by_id:
+                e = events_by_id[v_summary.evidence_id]
+                ev_kind = getattr(e, "kind", None) or (e.get("kind") if isinstance(e, dict) else None)
+            elif events_by_hash and v_summary.evidence_hash in events_by_hash:
+                e = events_by_hash[v_summary.evidence_hash]
+                ev_kind = getattr(e, "kind", None) or (e.get("kind") if isinstance(e, dict) else None)
+
+            if ev_kind:
+                if v_name == "dns" and not (ev_kind.startswith("dns_") or ev_kind == "dns"):
+                    raise ValueError(f"Mismatched vector evidence: vector 'dns' cannot bind to evidence of kind {ev_kind!r}")
+                elif v_name == "http" and not (ev_kind.startswith("http_") or ev_kind == "http"):
+                    raise ValueError(f"Mismatched vector evidence: vector 'http' cannot bind to evidence of kind {ev_kind!r}")
+                elif v_name == "tls" and not (ev_kind.startswith("tls_") or ev_kind == "tls"):
+                    raise ValueError(f"Mismatched vector evidence: vector 'tls' cannot bind to evidence of kind {ev_kind!r}")
+                elif v_name in ("bgp", "rdap") and not (ev_kind.startswith("rdap") or ev_kind.startswith("bgp")):
+                    raise ValueError(f"Mismatched vector evidence: vector {v_name!r} cannot bind to evidence of kind {ev_kind!r}")
+
         # Authoritative Evidence Verification Invariant (Priority 5):
         # A user-supplied hash alone NEVER authenticates an observation.
         unverified_refs: list[str] = []

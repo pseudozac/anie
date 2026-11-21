@@ -124,6 +124,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--obs-ttl", type=int, default=90, help="observation TTL in days (default: 90)")
     p.add_argument("--evt-ttl", type=int, default=180, help="raw event TTL in days (default: 180)")
     p.add_argument("--no-vacuum", action="store_true", help="skip incremental vacuum compaction")
+    p.add_argument("--allow-destructive-pruning", action="store_true", default=False, help="explicit authorization to execute destructive pruning of expired non-claimed records")
+    p.add_argument("--operator-authorization", default=None, help="operator identity or audit authorization string required for destructive pruning")
     p = sub.add_parser("project-storage", help="calculate empirical storage, WAL, backup, and release growth projections")
     p.add_argument("--profile", choices=["pilot", "production", "scale"], default=None, help="filter by workload profile")
     p.add_argument("--days", type=int, choices=[30, 90, 180, 365], default=None, help="filter by projection horizon days")
@@ -414,6 +416,8 @@ def main(argv: list[str] | None = None) -> int:
                 observation_ttl_days=args.obs_ttl,
                 event_ttl_days=args.evt_ttl,
                 compact_vacuum=not args.no_vacuum,
+                allow_destructive_pruning=args.allow_destructive_pruning,
+                operator_authorization=args.operator_authorization,
             )
             report = safe_prune_retention(store, policy)
             print(json.dumps(report.to_dict(), indent=2))

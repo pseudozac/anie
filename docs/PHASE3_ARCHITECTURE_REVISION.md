@@ -195,8 +195,8 @@ To preserve architectural focus and prevent premature complexity, the following 
 
 - **Baseline Code Commit:** `a532322bbdbabccf175e283d293ac9c35631b543`
 - **Milestone M3.9 Acceptance Commit:** `ba267fcffc0f55a57a006c05eaaabf3231091efa`
-- **Milestone M3.10 Acceptance Commit:** Feature Branch `feat/m3.10-verification-and-consumer-readiness`
-- **Unit & Integration Test Results:** 495 tests (494 passed, 0 failed, 1 skipped; 100% pass rate).
+- **Milestone M3.10 Acceptance Commit:** `17feac882e0207e1f22a6843aac504bd4800fa3c` (Remediation PR pending merge)
+- **Unit & Integration Test Results:** 503 tests (502 passed, 0 failed, 1 skipped; 100% pass rate).
 - **Security Preflight & Sandbox Tests:** 18 passed, 0 failed.
 - **Multi-Resolver & Discrepancy Tests:** 21 passed, 0 failed.
 - **Temporal Graph & ML Drift Tests:** 26 passed, 0 failed.
@@ -205,7 +205,7 @@ To preserve architectural focus and prevent premature complexity, the following 
 - **TLS Certificate Handshake Tests:** 28 passed, 0 failed.
 - **HTTP Enrichment & Hypothesis Tests:** 15 passed, 0 failed.
 - **Cross-Vector Correlation & Contract V2 Tests:** 14 passed, 0 failed.
-- **M3.10 Verification & Readiness Tests:** 11 passed, 0 failed.
+- **M3.10 Verification, Remediation & Readiness Tests:** 19 passed, 0 failed.
 - **Repository Structural Guardrails (`tools/check_repo.py`):** 100% PASS.
 - **Live VM Collector State:** Quiescent on `anie-collector-01` (`129.225.109.227`), `anie-pilot.timer` disabled, sentinel active, 100% Phase 2 evidence preserved at ₹0.00 / $0.00 cost.
 - **Ampere A1 Capacity Acquisition Runner:** Operating autonomously under Windows Task Scheduler (`ANIE_Ampere_A1_Capacity_Retry`), hourly rate governor, 7-day expiration ceiling.

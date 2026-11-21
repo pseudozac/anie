@@ -1902,15 +1902,18 @@ class RealObservationStore:
         self,
         evidence_id_or_hash: str,
         *,
-        custom_allowed_sources: set[str] | None = None,
+        collector_policy: Any | None = None,
+        custom_allowed_sources: set[str] | frozenset[str] | None = None,
     ) -> dict[str, Any]:
         """Verify whether an evidence identifier or wire hash resolves to an authentic authoritative record.
 
-        Strict Epistemic Invariants (Milestone M3.9/M3.10):
+        Strict Epistemic Invariants (Milestone M3.9/M3.10 Security Audit):
         1. A user-supplied hash alone NEVER authenticates an observation.
         2. Retained raw payload bytes MUST match expected SHA-256 (cryptographic preimage check).
-        3. Collector source_id MUST be an authorized first-party collector (not an unvetted arbitrary string).
-        4. Raw evidence status MUST be 'captured'.
+        3. Collector source_id is an identifier, not authentication; it MUST be explicitly authenticated under TrustedCollectorPolicy.
+        4. Permissive fallbacks to 'first_party' for missing collector identities are strictly prohibited.
+        5. Raw evidence status MUST be 'captured'.
+        6. Differentiates hash-verified raw evidence, authenticated collector metadata, and records whose raw bytes are unavailable.
         """
         if not evidence_id_or_hash or not isinstance(evidence_id_or_hash, str):
             return {
@@ -1918,6 +1921,11 @@ class RealObservationStore:
                 "status": "UNVERIFIED_EVIDENCE_REFERENCE",
                 "reason": "invalid or empty evidence reference",
             }
+
+        from .real_models import TrustedCollectorPolicy
+        policy = collector_policy or TrustedCollectorPolicy(
+            custom_allowed_collectors=frozenset(custom_allowed_sources) if custom_allowed_sources else frozenset()
+        )
 
         ref = evidence_id_or_hash.strip()
         with self._connect() as conn:
@@ -1936,9 +1944,39 @@ class RealObservationStore:
             if ev_row is not None:
                 ev_id, subj, kind, obs_at, rcode, expected_hash, raw_status, payload_json, raw_blob = ev_row
                 ev_payload = json.loads(payload_json) if payload_json else {}
-                source_id = ev_payload.get("source_id", "first_party")
+                source_id = ev_payload.get("source_id")
 
-                # Invariant 2: Cryptographic preimage verification
+                # Invariant 4: No permissive fallback for missing collector identity
+                if not source_id or not isinstance(source_id, str):
+                    return {
+                        "is_authoritative": False,
+                        "status": "MISSING_COLLECTOR_IDENTITY",
+                        "reason": "Record does not declare a valid collector source_id (fallback to first_party is prohibited)",
+                        "event_id": ev_id,
+                        "raw_sha256": expected_hash,
+                    }
+
+                # Invariant 3: Collector provenance & explicit policy authorization
+                if not policy.is_trusted_collector(source_id):
+                    return {
+                        "is_authoritative": False,
+                        "status": "UNAUTHENTICATED_COLLECTOR",
+                        "reason": f"Source ID '{source_id}' is not an authorized collector under trusted policy.",
+                        "event_id": ev_id,
+                        "raw_sha256": expected_hash,
+                    }
+
+                # Invariant 5: Status validation
+                if raw_status != "captured":
+                    return {
+                        "is_authoritative": False,
+                        "status": f"EVIDENCE_STATUS_{raw_status.upper()}",
+                        "reason": f"raw evidence status is {raw_status!r}, not 'captured'",
+                        "event_id": ev_id,
+                        "raw_sha256": expected_hash,
+                    }
+
+                # Invariant 2 & 6: Preimage check and evidence quality differentiation
                 if raw_blob is not None:
                     actual_hash = sha256(raw_blob).hexdigest()
                     if actual_hash != expected_hash:
@@ -1949,27 +1987,24 @@ class RealObservationStore:
                             "event_id": ev_id,
                             "raw_sha256": expected_hash,
                         }
-
-                # Invariant 3: Collector provenance & source authorization
-                from .real_models import is_authorized_collector_source
-                if not is_authorized_collector_source(source_id, custom_allowed_sources=custom_allowed_sources):
-                    return {
-                        "is_authoritative": False,
-                        "status": "UNAUTHORIZED_COLLECTOR_SOURCE",
-                        "reason": f"Source ID '{source_id}' is not an authorized first-party collector.",
-                        "event_id": ev_id,
-                        "raw_sha256": expected_hash,
-                    }
-
-                # Invariant 4: Status validation
-                if raw_status != "captured":
-                    return {
-                        "is_authoritative": False,
-                        "status": f"EVIDENCE_STATUS_{raw_status.upper()}",
-                        "reason": f"raw evidence status is {raw_status!r}, not 'captured'",
-                        "event_id": ev_id,
-                        "raw_sha256": expected_hash,
-                    }
+                    evidence_quality = "RAW_PAYLOAD_HASH_VERIFIED"
+                    is_auth = True
+                    status_str = "AUTHORITATIVE_VERIFIED"
+                else:
+                    evidence_quality = "EVIDENCE_RAW_BYTES_UNAVAILABLE"
+                    if policy.require_retained_raw_payload:
+                        return {
+                            "is_authoritative": False,
+                            "status": "EVIDENCE_RAW_BYTES_UNAVAILABLE",
+                            "reason": "Original raw payload wire bytes are unavailable in store for cryptographic preimage verification",
+                            "event_id": ev_id,
+                            "raw_sha256": expected_hash,
+                            "source_id": source_id,
+                            "evidence_quality": evidence_quality,
+                        }
+                    else:
+                        is_auth = True
+                        status_str = "AUTHORITATIVE_METADATA_ONLY"
 
                 obs_row = conn.execute(
                     """
@@ -1982,8 +2017,9 @@ class RealObservationStore:
                 ).fetchone()
 
                 return {
-                    "is_authoritative": True,
-                    "status": "AUTHORITATIVE_VERIFIED",
+                    "is_authoritative": is_auth,
+                    "status": status_str,
+                    "evidence_quality": evidence_quality,
                     "event_id": ev_id,
                     "raw_sha256": expected_hash,
                     "subject": subj,
@@ -2006,6 +2042,23 @@ class RealObservationStore:
 
             if obs_row is not None:
                 o_id, e_id, o_subj, o_kind, o_at, o_status, o_source = obs_row
+
+                if not o_source or not isinstance(o_source, str):
+                    return {
+                        "is_authoritative": False,
+                        "status": "MISSING_COLLECTOR_IDENTITY",
+                        "reason": "Observation does not declare a valid collector source_id (fallback to first_party is prohibited)",
+                        "observation_id": o_id,
+                    }
+
+                if not policy.is_trusted_collector(o_source):
+                    return {
+                        "is_authoritative": False,
+                        "status": "UNAUTHENTICATED_COLLECTOR",
+                        "reason": f"Source ID '{o_source}' is not an authorized collector under trusted policy.",
+                        "observation_id": o_id,
+                    }
+
                 ev_row = conn.execute(
                     """
                     SELECT event_id, raw_sha256, response_code, raw_evidence_status, raw_payload
@@ -2018,26 +2071,6 @@ class RealObservationStore:
 
                 if ev_row is not None:
                     ev_id, expected_hash, rcode, raw_status, raw_blob = ev_row
-                    if raw_blob is not None:
-                        actual_hash = sha256(raw_blob).hexdigest()
-                        if actual_hash != expected_hash:
-                            return {
-                                "is_authoritative": False,
-                                "status": "CORRUPT_PAYLOAD_DIGEST_MISMATCH",
-                                "reason": f"retained payload hash {actual_hash} does not match expected {expected_hash}",
-                                "event_id": ev_id,
-                                "raw_sha256": expected_hash,
-                            }
-
-                    from .real_models import is_authorized_collector_source
-                    if not is_authorized_collector_source(o_source, custom_allowed_sources=custom_allowed_sources):
-                        return {
-                            "is_authoritative": False,
-                            "status": "UNAUTHORIZED_COLLECTOR_SOURCE",
-                            "reason": f"Source ID '{o_source}' is not an authorized first-party collector.",
-                            "event_id": ev_id,
-                            "raw_sha256": expected_hash,
-                        }
 
                     if raw_status != "captured":
                         return {
@@ -2048,9 +2081,39 @@ class RealObservationStore:
                             "raw_sha256": expected_hash,
                         }
 
+                    if raw_blob is not None:
+                        actual_hash = sha256(raw_blob).hexdigest()
+                        if actual_hash != expected_hash:
+                            return {
+                                "is_authoritative": False,
+                                "status": "CORRUPT_PAYLOAD_DIGEST_MISMATCH",
+                                "reason": f"retained payload hash {actual_hash} does not match expected {expected_hash}",
+                                "event_id": ev_id,
+                                "raw_sha256": expected_hash,
+                            }
+                        evidence_quality = "RAW_PAYLOAD_HASH_VERIFIED"
+                        is_auth = True
+                        status_str = "AUTHORITATIVE_VERIFIED"
+                    else:
+                        evidence_quality = "EVIDENCE_RAW_BYTES_UNAVAILABLE"
+                        if policy.require_retained_raw_payload:
+                            return {
+                                "is_authoritative": False,
+                                "status": "EVIDENCE_RAW_BYTES_UNAVAILABLE",
+                                "reason": "Original raw payload wire bytes are unavailable in store for cryptographic preimage verification",
+                                "event_id": ev_id,
+                                "raw_sha256": expected_hash,
+                                "source_id": o_source,
+                                "evidence_quality": evidence_quality,
+                            }
+                        else:
+                            is_auth = True
+                            status_str = "AUTHORITATIVE_METADATA_ONLY"
+
                     return {
-                        "is_authoritative": True,
-                        "status": "AUTHORITATIVE_VERIFIED",
+                        "is_authoritative": is_auth,
+                        "status": status_str,
+                        "evidence_quality": evidence_quality,
                         "event_id": ev_id,
                         "raw_sha256": expected_hash,
                         "subject": o_subj,

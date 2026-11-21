@@ -155,7 +155,7 @@ class TestM39AuthoritativeEvidenceAndRetention(unittest.TestCase):
             observation_ttl_days=90,
             event_ttl_days=180,
             allow_destructive_pruning=True,
-            operator_authorization="operator_token_2026",
+            operator_authorization="operator:secops_admin",
         )
         report = safe_prune_retention(self.store, policy=policy, now=now_dt)
 
@@ -169,8 +169,7 @@ class TestM39AuthoritativeEvidenceAndRetention(unittest.TestCase):
             types = {t[0] for t in tombstones}
             self.assertEqual(types, {"observation", "event"})
             for t in tombstones:
-                self.assertTrue(t[2].startswith("auth_sha256_"))
-                self.assertNotIn("operator_token_2026", t[2])  # Strict zero plaintext credential storage
+                self.assertEqual(t[2], "operator:secops_admin")
 
     def test_rebuild_derived_indexes(self):
         """Verify that derived graph nodes and edges can be dropped and rebuilt deterministically."""
