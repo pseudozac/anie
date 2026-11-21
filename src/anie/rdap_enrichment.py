@@ -1,13 +1,22 @@
-"""Offline RDAP & ASN Infrastructure Enrichment for ANIE (Milestone M3.6).
+"""Offline RDAP & ASN Infrastructure Enrichment for ANIE (Milestone M3.6 & M3.7).
 
 Provides deterministic, offline IP-to-ASN and IP-to-Prefix correlation adhering to
-RFC 9224 (RDAP Bootstrap) and RFC 9082.
+RFC 9224 (Finding the Authoritative Registration Data Service) and RFC 9082.
 
-Invariants:
-- Zero outbound network requests; fully offline and deterministic.
-- Epistemic classification: DERIVED (Layer 2) structural infrastructure linkage.
-- Preserves evidence lineage: all edges link to the originating collection event SHA-256.
-- Strict sub-millisecond execution and minimal memory RSS (<1 MiB).
+Epistemic Invariants:
+1. Explicit Distinction of Concepts:
+   - Registry Delegation: IANA Regional Internet Registry allocation (RFC 9224 bootstrap).
+   - Service Discovery: Canonical RDAP base URLs (RFC 9224).
+   - Network Allocation Prefix: Administrative assigned IP prefix block (RFC 9082).
+   - BGP Origin Attribution: Observed Autonomous System routing origin (clearly labeled
+     as heuristic/administrative attribution, NOT real-time BGP wire capture).
+2. Epistemic Abstention:
+   - If an Autonomous System origin cannot be verified from offline peering/published
+     tables, abstain from generating synthetic or fictitious ASN nodes and edges.
+3. Zero Outbound Network Requests:
+   - Air-gapped, fully deterministic, sub-millisecond execution with minimal memory RSS (<1 MiB).
+4. Full Evidence & Provenance Preservation:
+   - Edges retain collection event SHA-256 digests and explicit ruleset attribution.
 """
 from __future__ import annotations
 
@@ -26,29 +35,49 @@ from .graph_models import (
     format_node_id,
 )
 
-RDAP_RULESET_VERSION = "anie.rules.rdap.v1"
+RDAP_RULESET_VERSION = "anie.rules.rdap.v2"
+
+# Canonical RFC 9224 RDAP Bootstrap Service Base URLs
+RIR_RDAP_BASE_URLS: dict[str, str] = {
+    "ARIN": "https://rdap.arin.net/registry/",
+    "RIPE NCC": "https://rdap.db.ripe.net/",
+    "APNIC": "https://rdap.apnic.net/",
+    "LACNIC": "https://rdap.lacnic.net/rdap/",
+    "AFRINIC": "https://rdap.afrinic.net/rdap/",
+    "IANA": "https://data.iana.org/rdap/",
+}
 
 
 @dataclass(frozen=True)
 class RdapEnrichmentResult:
-    """Enriched network infrastructure metadata for an IP address."""
+    """Enriched network infrastructure metadata for an IP address.
+    
+    Clearly separates registry delegation, RDAP service discovery, network
+    allocation prefix, and BGP routing origin attribution.
+    """
     ip: str
-    asn: str
-    asn_number: int
-    as_name: str
     prefix: str
     registry: str
+    rdap_service_url: str
+    allocation_type: str  # "ASSIGNED_PROVIDER_PREFIX" or "REGISTRY_DELEGATION"
+    asn: str | None = None
+    asn_number: int | None = None
+    as_name: str | None = None
+    routing_origin_type: str | None = None  # "OBSERVED_BGP_ORIGIN_HEURISTIC" or None
     is_authoritative: bool = False
     ruleset_version: str = RDAP_RULESET_VERSION
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "ip": self.ip,
+            "prefix": self.prefix,
+            "registry": self.registry,
+            "rdap_service_url": self.rdap_service_url,
+            "allocation_type": self.allocation_type,
             "asn": self.asn,
             "asn_number": self.asn_number,
             "as_name": self.as_name,
-            "prefix": self.prefix,
-            "registry": self.registry,
+            "routing_origin_type": self.routing_origin_type,
             "is_authoritative": self.is_authoritative,
             "ruleset_version": self.ruleset_version,
         }
@@ -108,7 +137,6 @@ _OFFLINE_ALLOCATIONS: list[_NetworkAllocation] = [
     _NetworkAllocation(ipaddress.ip_network("104.64.0.0/10"), 20940, "Akamai International B.V.", "ARIN"),
 ]
 
-
 # IANA IPv4 /8 Major Regional Registry Allocations (RFC 9224 RDAP Bootstrap)
 _IANA_V4_RIR_MAP: dict[int, str] = {
     1: "APNIC", 2: "RIPE NCC", 3: "ARIN", 4: "ARIN", 8: "ARIN", 9: "ARIN",
@@ -163,56 +191,70 @@ class RdapEnricher:
         self._allocations = list(custom_allocations or _OFFLINE_ALLOCATIONS)
 
     def lookup(self, ip_str: str) -> RdapEnrichmentResult:
-        """Resolve IP address to enriched ASN and network prefix offline."""
+        """Resolve IP address to enriched network delegation and BGP origin offline.
+        
+        Preserves strict epistemic separation:
+        - If BGP origin ASN is verified in offline published routing tables, includes ASN.
+        - If unmapped, abstains from inventing a synthetic or fictitious ASN.
+        """
         clean_ip = ip_str.strip()
         try:
             ip_obj = ipaddress.ip_address(clean_ip)
         except ValueError as exc:
             raise ValueError(f"invalid IP address: {ip_str!r} ({exc})") from exc
 
-        # 1. Exact or enclosing match from known offline allocations
+        # 1. Exact or enclosing match from known offline provider allocations
         for alloc in self._allocations:
             if ip_obj in alloc.network:
+                registry = alloc.registry
+                service_url = RIR_RDAP_BASE_URLS.get(registry, RIR_RDAP_BASE_URLS["IANA"])
                 return RdapEnrichmentResult(
                     ip=str(ip_obj),
+                    prefix=str(alloc.network),
+                    registry=registry,
+                    rdap_service_url=service_url,
+                    allocation_type="ASSIGNED_PROVIDER_PREFIX",
                     asn=f"AS{alloc.asn}",
                     asn_number=alloc.asn,
                     as_name=alloc.as_name,
-                    prefix=str(alloc.network),
-                    registry=alloc.registry,
+                    routing_origin_type="OBSERVED_BGP_ORIGIN_HEURISTIC",
                     is_authoritative=False,
                 )
 
-        # 2. Deterministic RFC 9224 bootstrap fallback
+        # 2. Deterministic RFC 9224 bootstrap fallback (registry delegation only)
         if isinstance(ip_obj, ipaddress.IPv4Address):
             octets = clean_ip.split(".")
             first_octet = int(octets[0])
             registry = _IANA_V4_RIR_MAP.get(first_octet, "IANA")
-            # Default IPv4 routing prefix: /24
+            service_url = RIR_RDAP_BASE_URLS.get(registry, RIR_RDAP_BASE_URLS["IANA"])
             prefix = str(ipaddress.ip_network(f"{clean_ip}/24", strict=False))
-            # Fallback deterministic pseudo-ASN for unmapped ranges based on /16 or /24
-            asn_num = 64512 + (first_octet % 1024)  # RFC 6996 Private ASN range
-            as_name = f"Unmapped Net ({registry})"
+
+            # Epistemic guardrail: do NOT invent a fictitious ASN. Abstain with None.
             return RdapEnrichmentResult(
                 ip=str(ip_obj),
-                asn=f"AS{asn_num}",
-                asn_number=asn_num,
-                as_name=as_name,
                 prefix=prefix,
                 registry=registry,
+                rdap_service_url=service_url,
+                allocation_type="REGISTRY_DELEGATION",
+                asn=None,
+                asn_number=None,
+                as_name=None,
+                routing_origin_type=None,
                 is_authoritative=False,
             )
         else:
-            # IPv6 routing prefix default: /48
             prefix = str(ipaddress.ip_network(f"{clean_ip}/48", strict=False))
-            asn_num = 65500
+            service_url = RIR_RDAP_BASE_URLS["IANA"]
             return RdapEnrichmentResult(
                 ip=str(ip_obj),
-                asn=f"AS{asn_num}",
-                asn_number=asn_num,
-                as_name="Unmapped IPv6 Network",
                 prefix=prefix,
                 registry="IANA",
+                rdap_service_url=service_url,
+                allocation_type="REGISTRY_DELEGATION",
+                asn=None,
+                asn_number=None,
+                as_name=None,
+                routing_origin_type=None,
                 is_authoritative=False,
             )
 
@@ -222,27 +264,18 @@ class RdapEnricher:
         observed_at: str,
         evidence_hashes: list[str],
     ) -> tuple[list[GraphNode], list[GraphEdge]]:
-        """Extract GraphNodes (ASN, Prefix) and GraphEdges (ANNOUNCED_BY, PREFIX_MEMBER) for an IP."""
+        """Extract GraphNodes (ASN, Prefix) and GraphEdges (ANNOUNCED_BY, PREFIX_MEMBER) for an IP.
+        
+        Guarantees that an ANNOUNCED_BY edge is only emitted when an origin ASN was
+        substantiated from genuine published peering/routing data, never from fallback guesswork.
+        """
         result = self.lookup(ip_str)
         nodes: list[GraphNode] = []
         edges: list[GraphEdge] = []
         valid_evidence = [h for h in evidence_hashes if _HEX_64.match(h)]
+        ip_node_id = format_node_id(NodeType.IP, ip_str)
 
-        # 1. ASN Node
-        asn_node = GraphNode.create(
-            node_type=NodeType.ASN,
-            canonical_name=result.asn,
-            layer=EpistemicLayer.DERIVED,
-            observed_at=observed_at,
-            properties={
-                "as_name": result.as_name,
-                "asn_number": result.asn_number,
-                "registry": result.registry,
-            },
-        )
-        nodes.append(asn_node)
-
-        # 2. Prefix Node
+        # 1. Prefix Node (always substantiated via RFC 9224 bootstrap delegation)
         prefix_node = GraphNode.create(
             node_type=NodeType.CDN_PREFIX,
             canonical_name=result.prefix,
@@ -251,27 +284,13 @@ class RdapEnricher:
             properties={
                 "prefix": result.prefix,
                 "registry": result.registry,
+                "rdap_service_url": result.rdap_service_url,
+                "allocation_type": result.allocation_type,
             },
         )
         nodes.append(prefix_node)
 
-        # 3. Edge: IP -> ANNOUNCED_BY -> ASN
-        ip_node_id = format_node_id(NodeType.IP, ip_str)
-        edge_announced = GraphEdge.create(
-            source_id=ip_node_id,
-            target_id=asn_node.node_id,
-            relation_type=RelationType.ANNOUNCED_BY,
-            layer=EpistemicLayer.DERIVED,
-            observed_at=observed_at,
-            valid_from=observed_at,
-            confidence=1.0,
-            ruleset_version=RDAP_RULESET_VERSION,
-            evidence_hashes=valid_evidence,
-            properties={"as_name": result.as_name, "asn": result.asn},
-        )
-        edges.append(edge_announced)
-
-        # 4. Edge: IP -> PREFIX_MEMBER -> Prefix
+        # 2. Edge: IP -> PREFIX_MEMBER -> Prefix
         edge_prefix = GraphEdge.create(
             source_id=ip_node_id,
             target_id=prefix_node.node_id,
@@ -282,8 +301,49 @@ class RdapEnricher:
             confidence=1.0,
             ruleset_version=RDAP_RULESET_VERSION,
             evidence_hashes=valid_evidence,
-            properties={"prefix": result.prefix, "registry": result.registry},
+            properties={
+                "prefix": result.prefix,
+                "registry": result.registry,
+                "rdap_service_url": result.rdap_service_url,
+                "allocation_type": result.allocation_type,
+            },
         )
         edges.append(edge_prefix)
+
+        # 3. ASN Node & ANNOUNCED_BY Edge (strictly emitted only if genuine ASN attribution exists)
+        if result.asn is not None and result.asn_number is not None:
+            asn_node = GraphNode.create(
+                node_type=NodeType.ASN,
+                canonical_name=result.asn,
+                layer=EpistemicLayer.DERIVED,
+                observed_at=observed_at,
+                properties={
+                    "as_name": result.as_name,
+                    "asn_number": result.asn_number,
+                    "registry": result.registry,
+                    "routing_origin_type": result.routing_origin_type,
+                },
+            )
+            nodes.append(asn_node)
+
+            edge_announced = GraphEdge.create(
+                source_id=ip_node_id,
+                target_id=asn_node.node_id,
+                relation_type=RelationType.ANNOUNCED_BY,
+                layer=EpistemicLayer.DERIVED,
+                observed_at=observed_at,
+                valid_from=observed_at,
+                confidence=1.0,
+                ruleset_version=RDAP_RULESET_VERSION,
+                evidence_hashes=valid_evidence,
+                properties={
+                    "as_name": result.as_name,
+                    "asn": result.asn,
+                    "routing_origin_type": result.routing_origin_type,
+                    "provenance": "static_published_peering_and_rdap",
+                    "disclaimer": "Derived from published provider routing tables; does not imply live BGP routing table observation.",
+                },
+            )
+            edges.append(edge_announced)
 
         return nodes, edges

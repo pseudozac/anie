@@ -20,6 +20,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import re
 import sqlite3
 from typing import Any
 
@@ -36,6 +37,58 @@ from .graph_models import (
 from .observations import canonical_json, normalized_domain, normalized_ip, utc_iso
 from .rdap_enrichment import RdapEnricher
 from .real_models import RealCollectionEvent, RealObservation
+
+
+_WINDOWS_RESERVED_NAMES = frozenset({
+    "CON", "PRN", "AUX", "NUL",
+    "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+})
+
+
+def sanitize_vault_filename(raw_name: str) -> str:
+    """Sanitize entity identifier for safe cross-platform filesystem note storage.
+    
+    Protects against:
+    - Path traversal: removes path separators and parent directory references
+    - Null bytes and ASCII control characters (0x00-0x1F, 0x7F)
+    - Windows reserved device names (CON, PRN, AUX, NUL, COM*, LPT*)
+    - Characters illegal in Windows/Linux/macOS filenames (/ \\ : * ? \" < > |)
+    - Leading/trailing whitespace and dots
+    """
+    clean = re.sub(r"[\x00-\x1f\x7f]", "", str(raw_name))
+    clean = re.sub(r'[/\\:*?"<>|]', "_", clean)
+    clean = clean.strip(". ")
+    if not clean or clean in (".", ".."):
+        clean = "unnamed_entity"
+    stem = clean.split(".")[0].upper()
+    if stem in _WINDOWS_RESERVED_NAMES:
+        clean = f"_{clean}"
+    return clean[:200]
+
+
+def _safe_write_vault_note(target_dir: Path, vault_root: Path, filename: str, content: str) -> bool:
+    """Safely write a vault note preventing path traversal, symlink attacks, and oversized files."""
+    safe_fn = sanitize_vault_filename(filename) + ".md"
+    target_path = target_dir / safe_fn
+    resolved_target = target_path.resolve()
+    resolved_root = vault_root.resolve()
+
+    try:
+        resolved_target.relative_to(resolved_root)
+    except ValueError:
+        raise ValueError(f"path traversal attempt rejected: {filename!r}")
+
+    if target_path.is_symlink():
+        raise PermissionError(f"symlink attack rejected on vault target: {target_path}")
+
+    # Bounded note size ceiling (500 KB)
+    encoded = content.encode("utf-8")
+    if len(encoded) > 500_000:
+        content = encoded[:500_000].decode("utf-8", errors="ignore") + "\n\n<!-- TRUNCATED: note exceeded 500 KB vault ceiling -->\n"
+
+    target_path.write_text(content, encoding="utf-8")
+    return True
 
 
 class GraphEngine:
@@ -736,18 +789,21 @@ class GraphEngine:
         ips_dir = v_path / "ips"
         asns_dir = v_path / "asns"
         prefixes_dir = v_path / "prefixes"
+        certs_dir = v_path / "certificates"
         claims_dir = v_path / "claims"
 
         domains_dir.mkdir(parents=True, exist_ok=True)
         ips_dir.mkdir(parents=True, exist_ok=True)
         asns_dir.mkdir(parents=True, exist_ok=True)
         prefixes_dir.mkdir(parents=True, exist_ok=True)
+        certs_dir.mkdir(parents=True, exist_ok=True)
         claims_dir.mkdir(parents=True, exist_ok=True)
 
         exported_domains = 0
         exported_ips = 0
         exported_asns = 0
         exported_prefixes = 0
+        exported_certs = 0
         exported_claims = 0
 
         # 1. Export domains
@@ -757,8 +813,7 @@ class GraphEngine:
         for (dom,) in domain_rows:
             try:
                 md_content = self.export_obsidian_markdown(dom)
-                safe_name = dom.replace("/", "_").replace("\\", "_")
-                (domains_dir / f"{safe_name}.md").write_text(md_content, encoding="utf-8")
+                _safe_write_vault_note(domains_dir, v_path, dom, md_content)
                 exported_domains += 1
             except Exception:
                 pass
@@ -769,7 +824,6 @@ class GraphEngine:
         ).fetchall()
         for ip, node_id, first_seen, last_seen in ip_rows:
             co_hosted = self.find_co_hosted_domains(ip)
-            safe_ip = ip.replace(":", "_")
 
             # Query ASN and Prefix linkages
             asn_row = self.conn.execute(
@@ -812,13 +866,13 @@ class GraphEngine:
                 ip_lines.append("## Infrastructure Topology")
                 if asn_row:
                     asn_name = asn_row[0]
-                    safe_asn = asn_name.replace(":", "_").replace("/", "_")
+                    safe_asn = sanitize_vault_filename(asn_name)
                     asn_props = json.loads(asn_row[1] or "{}")
                     org_name = asn_props.get("as_name", "Unknown Org")
                     ip_lines.append(f"- **Autonomous System:** [[asns/{safe_asn}|{asn_name}]] ({org_name})")
                 if prefix_row:
                     pref_name = prefix_row[0]
-                    safe_pref = pref_name.replace("/", "_").replace(":", "_")
+                    safe_pref = sanitize_vault_filename(pref_name)
                     pref_props = json.loads(prefix_row[1] or "{}")
                     reg = pref_props.get("registry", "IANA")
                     ip_lines.append(f"- **Network Prefix:** [[prefixes/{safe_pref}|{pref_name}]] ({reg})")
@@ -831,7 +885,7 @@ class GraphEngine:
             else:
                 ip_lines.append("*No co-hosted domains identified.*")
             ip_lines.append("")
-            (ips_dir / f"{safe_ip}.md").write_text("\n".join(ip_lines) + "\n", encoding="utf-8")
+            _safe_write_vault_note(ips_dir, v_path, ip, "\n".join(ip_lines) + "\n")
             exported_ips += 1
 
         # 3. Export ASNs
@@ -839,7 +893,6 @@ class GraphEngine:
             "SELECT canonical_name, node_id, first_observed_at, last_observed_at, properties_json FROM graph_nodes WHERE node_type = 'asn' ORDER BY canonical_name"
         ).fetchall()
         for asn_name, node_id, first_seen, last_seen, props_json in asn_rows:
-            safe_asn = asn_name.replace(":", "_").replace("/", "_")
             props = json.loads(props_json or "{}")
             as_org = props.get("as_name", "Unknown Autonomous System")
             registry = props.get("registry", "IANA")
@@ -877,12 +930,12 @@ class GraphEngine:
             ]
             if announced_ips:
                 for ip in announced_ips:
-                    s_ip = ip.replace(":", "_")
+                    s_ip = sanitize_vault_filename(ip)
                     asn_lines.append(f"- [[ips/{s_ip}|{ip}]]")
             else:
                 asn_lines.append("*No member IPs directly linked.*")
             asn_lines.append("")
-            (asns_dir / f"{safe_asn}.md").write_text("\n".join(asn_lines) + "\n", encoding="utf-8")
+            _safe_write_vault_note(asns_dir, v_path, asn_name, "\n".join(asn_lines) + "\n")
             exported_asns += 1
 
         # 4. Export Prefixes
@@ -890,7 +943,6 @@ class GraphEngine:
             "SELECT canonical_name, node_id, first_observed_at, last_observed_at, properties_json FROM graph_nodes WHERE node_type = 'cdn_prefix' ORDER BY canonical_name"
         ).fetchall()
         for pref_name, node_id, first_seen, last_seen, props_json in prefix_rows:
-            safe_pref = pref_name.replace("/", "_").replace(":", "_")
             props = json.loads(props_json or "{}")
             registry = props.get("registry", "IANA")
 
@@ -925,15 +977,96 @@ class GraphEngine:
             ]
             if member_ips:
                 for ip in member_ips:
-                    s_ip = ip.replace(":", "_")
+                    s_ip = sanitize_vault_filename(ip)
                     pref_lines.append(f"- [[ips/{s_ip}|{ip}]]")
             else:
                 pref_lines.append("*No member IPs directly linked.*")
             pref_lines.append("")
-            (prefixes_dir / f"{safe_pref}.md").write_text("\n".join(pref_lines) + "\n", encoding="utf-8")
+            _safe_write_vault_note(prefixes_dir, v_path, pref_name, "\n".join(pref_lines) + "\n")
             exported_prefixes += 1
 
-        # 5. Export Claims
+        # 5. Export Certificates
+        cert_rows = self.conn.execute(
+            "SELECT canonical_name, node_id, first_observed_at, last_observed_at, properties_json FROM graph_nodes WHERE node_type = 'certificate' ORDER BY canonical_name"
+        ).fetchall()
+        for fp, node_id, first_seen, last_seen, props_json in cert_rows:
+            props = json.loads(props_json or "{}")
+            subject_cn = props.get("subject_cn", "Unknown Subject")
+            issuer_cn = props.get("issuer_cn", "Unknown Issuer")
+            not_before = props.get("not_before", "")
+            not_after = props.get("not_after", "")
+            is_self_signed = props.get("is_self_signed", False)
+            is_multi_tenant = props.get("is_multi_tenant", False)
+
+            serving_ips = [
+                r[0] for r in self.conn.execute(
+                    """
+                    SELECT n.canonical_name
+                    FROM graph_edges e
+                    JOIN graph_nodes n ON n.node_id = e.source_id
+                    WHERE e.target_id = ? AND e.relation_type = 'SERVES_CERTIFICATE'
+                    ORDER BY n.canonical_name ASC
+                    """,
+                    (node_id,),
+                ).fetchall()
+            ]
+
+            named_domains = [
+                r[0] for r in self.conn.execute(
+                    """
+                    SELECT n.canonical_name
+                    FROM graph_edges e
+                    JOIN graph_nodes n ON n.node_id = e.target_id
+                    WHERE e.source_id = ? AND e.relation_type = 'NAMES_DOMAIN'
+                    ORDER BY n.canonical_name ASC
+                    """,
+                    (node_id,),
+                ).fetchall()
+            ]
+
+            cert_lines = [
+                "---",
+                f'id: "{node_id}"',
+                'type: "certificate"',
+                f'fingerprint_sha256: "{fp}"',
+                f'subject_cn: "{subject_cn}"',
+                f'issuer_cn: "{issuer_cn}"',
+                f'not_before: "{not_before}"',
+                f'not_after: "{not_after}"',
+                f'is_self_signed: {str(is_self_signed).lower()}',
+                f'is_multi_tenant: {str(is_multi_tenant).lower()}',
+                f'first_observed_at: "{first_seen}"',
+                f'last_observed_at: "{last_seen}"',
+                "tags:",
+                '  - "anie/certificate"',
+                "---",
+                f"# X.509 Certificate: {fp[:16]}...",
+                f"**Subject Common Name:** {subject_cn}  ",
+                f"**Issuer:** {issuer_cn}  ",
+                f"**Validity:** `{not_before}` to `{not_after}`",
+                "",
+                "## Serving IP Endpoints",
+            ]
+            if serving_ips:
+                for ip in serving_ips:
+                    s_ip = sanitize_vault_filename(ip)
+                    cert_lines.append(f"- [[ips/{s_ip}|{ip}]]")
+            else:
+                cert_lines.append("*No serving IP endpoints recorded.*")
+            cert_lines.append("")
+
+            cert_lines.append("## Named Subject Alternative Domains")
+            if named_domains:
+                for dom in named_domains:
+                    cert_lines.append(f"- [[{dom}]]")
+            else:
+                cert_lines.append("*No named domains recorded.*")
+            cert_lines.append("")
+
+            _safe_write_vault_note(certs_dir, v_path, fp, "\n".join(cert_lines) + "\n")
+            exported_certs += 1
+
+        # 6. Export Claims
         claim_rows = self.conn.execute(
             "SELECT payload FROM intelligence_claims ORDER BY asserted_at DESC"
         ).fetchall()
@@ -963,10 +1096,10 @@ class GraphEngine:
                 f"> {claim.falsifiability_condition or 'None specified'}",
                 "",
             ]
-            (claims_dir / f"{claim.claim_id}.md").write_text("\n".join(c_lines) + "\n", encoding="utf-8")
+            _safe_write_vault_note(claims_dir, v_path, claim.claim_id, "\n".join(c_lines) + "\n")
             exported_claims += 1
 
-        # 6. Vault Readme Index
+        # 7. Vault Readme Index
         readme = [
             "# ANIE Knowledge Graph Vault",
             "",
@@ -974,6 +1107,7 @@ class GraphEngine:
             f"- **IPs Indexed:** {exported_ips}",
             f"- **Autonomous Systems (ASNs):** {exported_asns}",
             f"- **BGP Allocation Prefixes:** {exported_prefixes}",
+            f"- **TLS Certificates:** {exported_certs}",
             f"- **Intelligence Claims:** {exported_claims}",
             "",
             "## Exploration Roots",
@@ -981,9 +1115,10 @@ class GraphEngine:
             "- [[ips/|IP Infrastructure Notes]]",
             "- [[asns/|Autonomous Systems (ASN)]]",
             "- [[prefixes/|BGP Allocation Prefixes]]",
+            "- [[certificates/|TLS Certificates]]",
             "- [[claims/|Temporal Intelligence Claims]]",
         ]
-        (v_path / "README.md").write_text("\n".join(readme) + "\n", encoding="utf-8")
+        _safe_write_vault_note(v_path, v_path, "README", "\n".join(readme) + "\n")
 
         return {
             "vault_dir": str(v_path),
@@ -991,6 +1126,7 @@ class GraphEngine:
             "ips_exported": exported_ips,
             "asns_exported": exported_asns,
             "prefixes_exported": exported_prefixes,
+            "certs_exported": exported_certs,
             "claims_exported": exported_claims,
         }
 

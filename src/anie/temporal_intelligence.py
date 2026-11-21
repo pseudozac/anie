@@ -62,6 +62,8 @@ class ProvenanceTaggedNetwork:
 # Publicly published CDN / Anycast network ranges with explicit provenance attribution
 _PROVENANCE_TAGGED_NETWORKS: list[ProvenanceTaggedNetwork] = [
     # Cloudflare published edge ranges
+    ProvenanceTaggedNetwork(ipaddress.ip_network("1.1.1.0/24"), "Cloudflare", "CDN_ANYCAST_HEURISTIC", "Cloudflare public DNS range"),
+    ProvenanceTaggedNetwork(ipaddress.ip_network("1.0.0.0/24"), "Cloudflare", "CDN_ANYCAST_HEURISTIC", "Cloudflare public DNS range"),
     ProvenanceTaggedNetwork(ipaddress.ip_network("104.16.0.0/12"), "Cloudflare", "CDN_ANYCAST_HEURISTIC", "Cloudflare published prefix range"),
     ProvenanceTaggedNetwork(ipaddress.ip_network("104.24.0.0/14"), "Cloudflare", "CDN_ANYCAST_HEURISTIC", "Cloudflare published prefix range"),
     ProvenanceTaggedNetwork(ipaddress.ip_network("172.64.0.0/13"), "Cloudflare", "CDN_ANYCAST_HEURISTIC", "Cloudflare published prefix range"),
@@ -78,15 +80,42 @@ _PROVENANCE_TAGGED_NETWORKS: list[ProvenanceTaggedNetwork] = [
     ProvenanceTaggedNetwork(ipaddress.ip_network("13.32.0.0/15"), "AWS CloudFront", "CDN_ANYCAST_HEURISTIC", "AWS ip-ranges.json CLOUDFRONT service"),
     ProvenanceTaggedNetwork(ipaddress.ip_network("52.84.0.0/15"), "AWS CloudFront", "CDN_ANYCAST_HEURISTIC", "AWS ip-ranges.json CLOUDFRONT service"),
     ProvenanceTaggedNetwork(ipaddress.ip_network("54.230.0.0/16"), "AWS CloudFront", "CDN_ANYCAST_HEURISTIC", "AWS ip-ranges.json CLOUDFRONT service"),
-    # Google Public DNS Anycast
+    # Akamai Edge Network
+    ProvenanceTaggedNetwork(ipaddress.ip_network("23.0.0.0/12"), "Akamai", "CDN_ANYCAST_HEURISTIC", "Akamai published edge ranges"),
+    ProvenanceTaggedNetwork(ipaddress.ip_network("104.64.0.0/10"), "Akamai", "CDN_ANYCAST_HEURISTIC", "Akamai published edge ranges"),
+    ProvenanceTaggedNetwork(ipaddress.ip_network("184.24.0.0/13"), "Akamai", "CDN_ANYCAST_HEURISTIC", "Akamai published edge ranges"),
+    ProvenanceTaggedNetwork(ipaddress.ip_network("2.16.0.0/13"), "Akamai", "CDN_ANYCAST_HEURISTIC", "Akamai published edge ranges"),
+    # Microsoft / Azure CDN
+    ProvenanceTaggedNetwork(ipaddress.ip_network("20.150.0.0/15"), "Microsoft Azure", "CDN_ANYCAST_HEURISTIC", "Azure Front Door and CDN ranges"),
+    ProvenanceTaggedNetwork(ipaddress.ip_network("13.107.0.0/16"), "Microsoft Azure", "CDN_ANYCAST_HEURISTIC", "Azure Front Door and CDN ranges"),
+    ProvenanceTaggedNetwork(ipaddress.ip_network("20.0.0.0/11"), "Microsoft Azure", "CLOUD_EDGE_HEURISTIC", "Microsoft public cloud prefix"),
+    ProvenanceTaggedNetwork(ipaddress.ip_network("40.74.0.0/15"), "Microsoft Azure", "CLOUD_EDGE_HEURISTIC", "Microsoft public cloud prefix"),
+    # Google Public DNS & Edge
     ProvenanceTaggedNetwork(ipaddress.ip_network("8.8.8.0/24"), "Google Public DNS", "ANYCAST_RESOLVER_HEURISTIC", "Google Public DNS Anycast documentation"),
     ProvenanceTaggedNetwork(ipaddress.ip_network("8.8.4.0/24"), "Google Public DNS", "ANYCAST_RESOLVER_HEURISTIC", "Google Public DNS Anycast documentation"),
     ProvenanceTaggedNetwork(ipaddress.ip_network("142.250.0.0/15"), "Google Edge", "CLOUD_EDGE_HEURISTIC", "Google Cloud / 1e100 net IP blocks"),
     ProvenanceTaggedNetwork(ipaddress.ip_network("172.217.0.0/16"), "Google Edge", "CLOUD_EDGE_HEURISTIC", "Google Cloud / 1e100 net IP blocks"),
+    # EdgeCast / Verizon Digital Media
+    ProvenanceTaggedNetwork(ipaddress.ip_network("93.184.216.0/24"), "EdgeCast", "CDN_ANYCAST_HEURISTIC", "EdgeCast Anycast edge network"),
     # Quad9 Anycast Resolvers
     ProvenanceTaggedNetwork(ipaddress.ip_network("9.9.9.0/24"), "Quad9", "ANYCAST_RESOLVER_HEURISTIC", "Quad9 Anycast public resolver documentation"),
     ProvenanceTaggedNetwork(ipaddress.ip_network("149.112.112.0/24"), "Quad9", "ANYCAST_RESOLVER_HEURISTIC", "Quad9 Anycast public resolver documentation"),
 ]
+
+# Recognized Public Dynamic DNS Provider Suffixes
+_KNOWN_DYNAMIC_DNS_SUFFIXES: frozenset[str] = frozenset({
+    "duckdns.org",
+    "no-ip.com",
+    "no-ip.org",
+    "ddns.net",
+    "dyndns.org",
+    "zapto.org",
+    "hopto.org",
+    "freedns.afraid.org",
+    "dynu.net",
+    "dynu.com",
+    "spdyn.de",
+})
 
 
 def classify_ip_infrastructure(ip_str: str) -> dict[str, Any]:
@@ -424,6 +453,7 @@ class TemporalIntelligenceEngine:
             if other_domains:
                 is_anycast, provider = is_known_anycast_ip(ip)
                 ip_uri = format_node_id(NodeType.IP, ip)
+                hosting_density = "HIGH_DENSITY_MULTI_TENANT" if len(other_domains) >= 20 else "LOW_DENSITY_POOL"
 
                 guardrail_notice = (
                     "Co-hosting reflects shared multi-tenant hosting, CDN edge routing, or Anycast pools. "
@@ -432,7 +462,7 @@ class TemporalIntelligenceEngine:
 
                 explanation = (
                     f"Shared infrastructure correlation: {domain} is co-hosted with {len(other_domains)} other domain(s) "
-                    f"on IP {ip} ({provider}). Correlated domains include: {other_domains[:5]}. {guardrail_notice}"
+                    f"on IP {ip} ({provider}, density: {hosting_density}). Correlated domains include: {other_domains[:5]}. {guardrail_notice}"
                 )
 
                 claim = IntelligenceClaim.create(
@@ -451,6 +481,7 @@ class TemporalIntelligenceEngine:
                         "ip": ip,
                         "co_hosted_count": len(other_domains),
                         "co_hosted_sample": other_domains[:10],
+                        "hosting_density": hosting_density,
                         "is_known_anycast": is_anycast,
                         "provider": provider,
                         "guardrail_status": "PASS_NO_MALICIOUS_INFERENCE",
@@ -605,6 +636,7 @@ class TemporalIntelligenceEngine:
 
         total_subnets = len(subnets_v4) + len(subnets_v6)
         median_ttl = sorted(ttls)[len(ttls) // 2] if ttls else 300
+        is_dynamic_dns = any(domain == sfx or domain.endswith("." + sfx) for sfx in _KNOWN_DYNAMIC_DNS_SUFFIXES)
 
         # Fast-Flux Heuristic Condition:
         # 1. >= 5 unique IPs observed within 24h
@@ -612,12 +644,22 @@ class TemporalIntelligenceEngine:
         # 3. >= 2 distinct /24 (IPv4) or /48 (IPv6) subnets
         # 4. Not in known CDN Anycast pool
         if len(observed_ips) >= 5 and median_ttl <= 300 and total_subnets >= 2 and not anycast_present:
-            explanation = (
-                f"Fast-flux candidate indicator detected for {domain}: Observed {len(observed_ips)} unique IPs "
-                f"across {total_subnets} distinct subnets ({len(subnets_v4)} IPv4 /24, {len(subnets_v6)} IPv6 /48) "
-                f"with low median TTL ({median_ttl}s) in past 24 hours. "
-                f"Notice: Fast-flux indicators measure dynamic volatility and do NOT infer maliciousness."
-            )
+            if is_dynamic_dns:
+                confidence = 0.35
+                explanation = (
+                    f"Dynamic IP rotation evaluated for {domain}: Observed {len(observed_ips)} unique IPs "
+                    f"across {total_subnets} subnets with low median TTL ({median_ttl}s). Domain is hosted on "
+                    f"a recognized public dynamic DNS provider; rapid residential IP churn is typical of consumer "
+                    f"dynamic allocations rather than adversary fast-flux infrastructure."
+                )
+            else:
+                confidence = 0.70
+                explanation = (
+                    f"Fast-flux candidate indicator detected for {domain}: Observed {len(observed_ips)} unique IPs "
+                    f"across {total_subnets} distinct subnets ({len(subnets_v4)} IPv4 /24, {len(subnets_v6)} IPv6 /48) "
+                    f"with low median TTL ({median_ttl}s) in past 24 hours. "
+                    f"Notice: Fast-flux indicators measure dynamic volatility and do NOT infer maliciousness."
+                )
 
             claim = IntelligenceClaim.create(
                 subject_uri=domain_uri,
@@ -625,7 +667,7 @@ class TemporalIntelligenceEngine:
                 layer=EpistemicLayer.HYPOTHESIS,
                 asserted_at=now_iso,
                 valid_from=t_window_start_iso,
-                confidence=0.70,
+                confidence=confidence,
                 explanation=explanation,
                 supporting_evidence_hashes=sorted(evidence_hashes),
                 supporting_node_ids=[domain_uri] + [format_node_id(NodeType.IP, ip) for ip in list(observed_ips)[:10]],
@@ -641,6 +683,7 @@ class TemporalIntelligenceEngine:
                     "ipv4_subnet_count": len(subnets_v4),
                     "ipv6_subnet_count": len(subnets_v6),
                     "median_ttl": median_ttl,
+                    "is_dynamic_dns": is_dynamic_dns,
                     "window_start": t_window_start_iso,
                     "window_end": now_iso,
                     "guardrail_status": "PASS_NO_MALICIOUS_INFERENCE",

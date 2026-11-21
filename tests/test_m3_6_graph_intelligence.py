@@ -121,16 +121,21 @@ class TestRdapEnrichment(unittest.TestCase):
         self.assertEqual(res_ec.prefix, "93.184.216.0/24")
 
     def test_unmapped_fallback_rfc9224(self):
-        # 198.51.100.1 is in ARIN range (198/8)
+        # 198.51.100.1 is in ARIN range (198/8) - registry delegation discovered per RFC 9224
         res = self.enricher.lookup("198.51.100.1")
         self.assertEqual(res.prefix, "198.51.100.0/24")
         self.assertEqual(res.registry, "ARIN")
-        self.assertTrue(res.asn.startswith("AS"))
+        self.assertEqual(res.rdap_service_url, "https://rdap.arin.net/registry/")
+        self.assertEqual(res.allocation_type, "REGISTRY_DELEGATION")
+        # Epistemic abstention: no synthetic ASN is invented without BGP/peering observation
+        self.assertIsNone(res.asn)
+        self.assertIsNone(res.asn_number)
 
         # IPv6 unmapped
         res_v6 = self.enricher.lookup("2001:db8::1")
         self.assertEqual(res_v6.prefix, "2001:db8::/48")
         self.assertEqual(res_v6.registry, "IANA")
+        self.assertIsNone(res_v6.asn)
 
     def test_enrich_ip_generates_nodes_and_edges(self):
         dummy_hash = "a" * 64
@@ -157,6 +162,15 @@ class TestRdapEnrichment(unittest.TestCase):
         self.assertEqual(prefix_edge.source_id, "anie:entity:ip:93.184.216.34")
         self.assertEqual(prefix_edge.target_id, pref_node.node_id)
         self.assertEqual(prefix_edge.layer, EpistemicLayer.DERIVED.value)
+
+    def test_enrich_unmapped_ip_abstains_from_inventing_asn(self):
+        dummy_hash = "b" * 64
+        nodes, edges = self.enricher.enrich_ip("198.51.100.1", "2026-11-20T10:00:00Z", [dummy_hash])
+        # Only prefix node and prefix edge; no synthetic ASN or ANNOUNCED_BY edge is invented
+        self.assertEqual(len(nodes), 1)
+        self.assertEqual(nodes[0].node_type, NodeType.CDN_PREFIX.value)
+        self.assertEqual(len(edges), 1)
+        self.assertEqual(edges[0].relation_type, RelationType.PREFIX_MEMBER.value)
 
 
 class TestGraphRebuildWithEnrichment(unittest.TestCase):
