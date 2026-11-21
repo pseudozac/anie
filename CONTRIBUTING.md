@@ -7,15 +7,24 @@ Read [AGENTS.md](AGENTS.md) and [docs/DEVELOPMENT_WORKFLOW.md](docs/DEVELOPMENT_
 ## Getting started
 
 - Python 3.10+; no paid APIs or external services required.
-- Use a branch and a small pull request; include synthetic fixtures and tests for every behavior change.
-- Run `PYTHONPATH=src python -m unittest discover -s tests -v` and `python tools/check_repo.py`.
-- A new `PYTHONPATH=src python -m anie demo --out ./local-data/demo` produces offline synthetic data; the output directory must be empty.
-- Document security, privacy, licensing, performance and contract changes in the PR template.
+- Follow Spec-Driven Development: open an issue/spec, use a feature branch, and submit a focused pull request. Include fixtures and regression tests for every behavior change.
+- Run the full test suite and repository governance check:
+  ```powershell
+  $env:PYTHONPATH="src;."
+  python -m unittest discover -s tests -v
+  python tools/check_repo.py
+  ```
+- Generate and verify offline synthetic intelligence:
+  ```powershell
+  python -m anie demo --out ./local-data/demo
+  python -m anie verify --dir ./local-data/demo/publication
+  ```
+- Document security, privacy, licensing, performance, and contract impacts in the pull request template.
 
 ## Research claims and data safety
 
-AI anomaly labels are not malicious verdicts or calibrated confidence. Report baselines, evaluation windows, cohort size, missing evidence, and failure cases. Do not submit real customer telemetry, live URLs, private data, secrets or unlicensed third-party datasets.
+Statistical novelty, clustering distance, or temporal change are strictly empirical drift indicators—**not malicious verdicts, threat classifications, or calibrated confidence**. Report baselines, observation windows, cohort sizes, missing evidence, and failure modes. Never submit real customer telemetry, private credentials, internal investigation context, or unlicensed third-party datasets.
 
-The v0.1 repository has **no authorized network collection or public real-data feed**. A crawler/collector/active-scanning proposal needs explicit scope, threat model, licensing/retention review and owner authorization before any live execution. Build and test offline first.
+Live network collection is governed by strict fail-closed preflight hardening, target allowlists, and operator authorization under [docs/PILOT_SCOPE_AND_COLLECTION_POLICY.md](docs/PILOT_SCOPE_AND_COLLECTION_POLICY.md). All new telemetry vectors must be designed and verified offline with mock fixtures before any live execution. Egress from production collectors is restricted to authorized DoH endpoints. Private provenance signing keys are strictly air-gapped from collector runtimes.
 
 Open a synthetic bug report or feature proposal through GitHub Issues. Do **not** disclose vulnerabilities through public issues; use [SECURITY.md](SECURITY.md).

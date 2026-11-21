@@ -1,101 +1,101 @@
-# ANIE release authenticity and independent consumer design (Issue #6)
+# ANIE Cryptographic Release Trust Architecture & Verification Protocol
 
-**Status: design + offline trust-pin verifier. No signed publisher, live dataset, public release, or AEGIS connection exists.**
+**Project:** Autonomous Network Intelligence Engine (ANIE)  
+**Document:** `docs/RELEASE_TRUST_DESIGN.md`  
+**Accepted Baseline:** Milestone M3.8 (`6352bc6`)  
+**Status:** Implemented, Formally Accepted & Verified
 
-## Threat boundary and trust
+---
 
-A checksum downloaded with the same artifact **cannot authenticate its publisher**: an attacker can replace both. The shipped `ConsumerTrustPolicy` requires a manifest SHA-256 pinned through a separate authenticated operator channel. This is an integrity check against a trusted digest, **not a digital signature**, and it is vulnerable if the pin-distribution channel is compromised. A GitHub URL alone does not replace a verified signature.
+## 1. Architectural Philosophy & Threat Boundary
 
-Future production design: use a transparency-logged Sigstore/GitHub Artifact Attestation bound to the reviewed GitHub repository, workflow identity, source commit, and artifact digest; alternatively use a separately controlled offline signing key with explicitly pinned public-key fingerprint and documented rotation/revocation. Verification must reject unsigned artifacts, mismatched identities, unsupported algorithms and expired/revoked trust roots. **Neither signature option is implemented here.** The pure `validate_release_provenance` function checks metadata consistency only and explicitly returns `publisher_signature_verified=False`.
+In decentralized internet intelligence distribution, a checksum downloaded from the same channel as a dataset **cannot authenticate its publisher**: an adversary compromising the distribution channel can replace both the payload and the checksum.
 
-## Three independently versioned release types
+To establish genuine provenance and supply-chain integrity without introducing complex online infrastructure, ANIE implements a **detached, air-gapped cryptographic attestation model**:
 
-1. **Source release:** reviewed code/tag/commit; no automatic releases.
-2. **Raw public evidence snapshot:** future `anie.observations.vN`, source- and rights-bound, timestamps and collection method; **not yet authorized or implemented**.
-3. **Derived intelligence snapshot:** `anie.intelligence.v1` plus immutable model version and referenced observation IDs. Findings must not infer maliciousness from novelty.
+```mermaid
+flowchart TD
+    subgraph Publisher["Publisher Infrastructure"]
+        Collector["Untrusted Collector Node<br/>(anie-collector-01)"] -->|export_canonical_dataset| Bundle["Unsigned Candidate Release Bundle<br/>(manifest.json, *.jsonl.gz)"]
+        Bundle -.->|Secure Air-Gap Staging| AirGapWorkstation["Air-Gapped Operator Workstation"]
+        PrivKey[("Operator Private Ed25519 Key<br/>(Never leaves air-gap)")] --> AirGapSigner["anie.signed_release sign"]
+        AirGapWorkstation --> AirGapSigner
+        AirGapSigner --> DetachedSig["Detached Attestation Manifest<br/>(signature.ed25519.json)"]
+    end
 
-The existing `anie.dataset-manifest.v1` contains synthetic-only observation and intelligence files. This milestone does **not** change its bytes, schema, observation IDs, or historical release replay. A future authenticated manifest version must contain source commit, exact build recipe, source-specific rights, dataset version, model version, input snapshot digest, output digest, signing identity, attestation reference, assessment time, validity bounds, revocation location and supported consumer range.
+    subgraph Distribution["Public / Untrusted Distribution Channel"]
+        Bundle & DetachedSig --> DistPkg["Release Package (Snapshots + Signature)"]
+    end
 
-## Offline trust-pin verification
-
-```python
-from hashlib import sha256
-from pathlib import Path
-from anie.release_trust import ConsumerTrustPolicy, verify_pinned_synthetic_release
-
-# EXAMPLE ONLY: Obtain digest through an independently authenticated channel.
-# Do NOT derive the trust pin from the same downloaded untrusted directory.
-trusted_pin = "..."  # 64 hex characters supplied by an approved operator
-result = verify_pinned_synthetic_release(
-    Path("local-data/demo/publication"),
-    ConsumerTrustPolicy(trusted_pin, max_age_seconds=30 * 86400),
-    now="2026-11-11T11:00:00Z",
-)
-assert result["verified"] and not result["publisher_signature_verified"]
+    subgraph Consumer["Independent Downstream Consumer (AEGIS)"]
+        DistPkg --> Verifier["4-Tier Offline Verifier<br/>(verify_real_release)"]
+        TrustedKeys[("Pinned Trust Policy<br/>(trusted_keys.json)")] --> Verifier
+        SequenceTracker[("Persistent High-Water Mark<br/>(consumer_highwater.json)")] <--> Verifier
+        Verifier -->|100% Cryptographically Verified| AtomicIngest["Atomic SQLite Ingestion<br/>(Events, Observations, Discrepancies, Claims)"]
+    end
 ```
 
-The verifier fails closed for untrusted manifest hash, unsupported schema, non-synthetic dataset, future-dated or stale assessment, corrupt/oversized gzip, unresolved evidence IDs, and inconsistencies against the deterministic model. It does not touch private AEGIS or trigger incident response.
+### Core Trust Invariants
+1. **Air-Gapped Private Keys:** Primary Ed25519 signing keys (`Ed25519PrivateKey`) **never reside on collector nodes or CI runners**. Cloud collectors only export candidate unsigned release bundles.
+2. **Deterministic Reproducibility:** Data partitions are formatted in canonical JSON, strictly sorted (`observed_at ASC, id ASC`), and compressed with fixed gzip headers (`mtime=0`, empty filename, `compresslevel=9`).
+3. **Detached Attestation:** Signatures are stored in a standalone attestation file (`signature.ed25519.json`) following the `anie.attestation.v1` schema, binding the manifest SHA-256 digest, publisher identity, Git commit SHA, and monotonic sequence counter.
+4. **Offline Independent Verification:** Downstream consumers verify cryptographic signatures, wire digests, and sequence numbers with zero network callbacks.
 
-## AEGIS read-only consumer protocol (design only)
+---
 
-- Download to an untrusted quarantine directory with strict byte and decompression limits.
-- Verify signature/attestation against independently pinned trust roots and exact source workflow/commit (future work); require authorized data license and version.
-- Validate manifest, evidence graph, model version and freshness before any parsing into a staging database.
-- Apply immutable import transaction; idempotently identify by content digest; never overwrite analyst evidence or previous assessments.
-- Fail closed on corruption, stale or conflicting source versions. Keep the last verified, non-expired snapshot; otherwise mark external enrichment unavailable. Never interpret unavailable as benign.
-- Rollback by atomically restoring the previous trusted snapshot pointer, retaining audit history. Key revocation must invalidate affected future imports and trigger re-evaluation of cached trust.
-- AEGIS continues making its own evidence-based findings. ANIE novelty is context, not a verdict or authority to contain endpoints.
+## 2. Four-Tier Verification Hierarchy
 
-No AEGIS implementation, credentials or production data are included in this PR.
+The verification engine (`verify_real_release()`) evaluates candidate releases across four independent tiers:
 
-## Hosting and cost tradeoffs
+| Tier | Name | Invariants Verified | Failure Mode |
+| :---: | :--- | :--- | :--- |
+| **Tier 1** | `structural_valid` | - Directory structure and file presence.<br>- Manifest JSON schema compliance.<br>- Compressed archive file size limits ($\le 100\text{ MiB}$). | `StructuralIntegrityError` |
+| **Tier 2** | `evidence_integrity_valid` | - Record schema validation (`RealObservation`, `RealCollectionEvent`).<br>- SHA-256 wire digest verification (`raw_sha256`).<br>- Deterministic record sorting and non-empty IDs.<br>- Complete referential integrity (zero orphan IDs). | `EvidenceIntegrityError` |
+| **Tier 3** | `publisher_authenticated` | - Detached Ed25519 signature verified against pinned public keys.<br>- Publisher string matches trust policy.<br>- Git commit format and signing timestamp bounds validated. | `PublisherAuthenticationError` |
+| **Tier 4** | `anti_rollback_verified` | - Monotonic sequence number $>$ stored high-water mark.<br>- High-water mark updated atomically upon successful verification.<br>- Explicit bypass only when `--allow-rollback` is supplied for historical audits. | `AntiRollbackError` |
 
-| Option | Appropriate use | Limits / cost risk |
-| --- | --- | --- |
-| GitHub source tags/releases | Low-frequency signed source and small synthetic examples | Release quotas and artifact provenance; do not use for unbounded continuously updated datasets |
-| GitHub Actions artifacts | CI test evidence and short-lived staging | Retention limits, quota and supply-chain permissions; not a long-lived public intelligence feed |
-| R2 / other object storage | Future versioned immutable public snapshots | Storage, operations, egress and custom-domain costs vary; no zero-cost guarantee |
-| Consumer-local SQLite / Neon | Index only validated snapshots, avoid repeated downloads | Retention, storage growth, and provider billing limits |
+---
 
-Default decision: **do not deploy distribution infrastructure**. Stay with offline demo files until rights, signing identity, actual data volume and spending cap are approved.
+## 3. Atomic Downstream Consumer Ingestion Protocol (AEGIS V4)
 
-## Activation gates
+Downstream consumers (including the AEGIS framework) ingest verified releases through `RealObservationStore.ingest_release_bundle()` under strict transactional guarantees:
 
-1. GitHub branch protection / required CI and repository security settings verified (Issue #3 remains open).
-2. Owner approves source/rights/privacy scope and release cadence.
-3. Cryptographic signature verification against independent trust anchors is implemented and adversarially tested.
-4. Real-world source provenance and data-retention rules approved; synthetic-only until then.
-5. AEGIS consumer compatibility and rollback tested against its private environment in a separate authorized change.
-6. Cost ceiling, storage and bandwidth forecasts approved; no uncontrolled public endpoint.
+```mermaid
+sequenceDiagram
+    participant C as AEGIS Consumer Engine
+    participant V as 4-Tier Verifier
+    participant DB as Consumer SQLite Store (BEGIN IMMEDIATE)
+    participant J as Consumer Release Journal
 
-**Decision: NO-GO for authenticated real-world dataset publication. GO for offline design tests only.**
-
-## v0.3 offline Ed25519 reference implementation (Issue #10)
-
-`src/anie/signed_release.py` adds **actual Ed25519 signature verification** through PyCA `cryptography`, an optional dependency. The signature is over a domain-separated, canonical signed payload containing the exact `manifest.json` digest, repository identity (`pseudozac/anie`), full source commit, builder identity (`local-offline`), dataset type (`synthetic_demo_only`), monotonically increasing release sequence and issue/expiry timestamps. It does **not** modify the v0.1 manifest format.
-
-A verifier MUST receive the expected Ed25519 **public key bytes** and exact source commit through a separate trusted channel, never from the downloaded release. It checks the signature before treating the signed metadata as authoritative, then revalidates the entire manifest, compressed artifacts, evidence references and deterministic model replay. It rejects outdated releases and release sequence downgrades against `last_accepted_sequence`.
-
-Important limitations: this authenticates **possession of a pinned signing key**, not legal identity, a GitHub Actions OIDC identity, a transparency-log inclusion proof, or a production-ready supply-chain attestation. No production trust key is created, committed, uploaded, or provisioned. The offline demonstration creates a temporary, in-memory key for *test-only* synthetic data. Do **not** treat the demo key as a persistent production identity.
-
-### Offline demonstration
-
-```bash
-python -m pip install -e '.[signing]'
-PYTHONPATH=src python examples/offline_signed_release_demo.py
-PYTHONPATH=src python -m unittest discover -s tests -v
+    C->>V: verify_real_release(bundle_dir, trust_policy, highwater_tracker)
+    V-->>C: Verification Report (Tier 1-4 Validated)
+    C->>DB: Begin Atomic Ingestion Transaction
+    DB->>DB: Insert Raw Events (real_events)
+    DB->>DB: Insert Empirical Observations (real_observations)
+    DB->>DB: Insert Multi-Resolver Discrepancies (real_discrepancies)
+    DB->>DB: Insert Reversible Claims (real_claims_v4)
+    DB->>DB: Index Release Evidence Membership (release_evidence_retention)
+    DB->>J: Record Release Journal Entry (release_id, sequence, manifest_sha256)
+    DB->>DB: Commit Atomic Transaction
+    DB-->>C: Ingestion Success (Atomic & Replayable)
 ```
 
-### Owner-held trust state and rotation
+### Guarantees Enforced:
+- **All-or-Nothing Atomicity:** If a crash or error occurs at any point during event, observation, discrepancy, or claim insertion, the entire transaction rolls back cleanly without leaving orphaned records.
+- **Durable Evidence Retention:** `release_evidence_retention` establishes a durable index linking every retained signed release to its prerequisite observations. Evidence required to independently verify retained releases is protected against automated pruning.
+- **Reversible Claim Assertions:** Every claim asserts specific lifecycle states (`ACTIVE`, `SUPERSEDED`, `REVOKED`) bound to the originating release ID, enabling surgical rollback if an upstream key or release is revoked.
 
-The consumer/operator must independently maintain: (1) the accepted publisher public key fingerprint and raw key, (2) approved repository+source commit+builder, (3) a monotonic `last_accepted_sequence` updated atomically after import, (4) separately authenticated key revocations and validity windows, and (5) a trusted time source. An attacker who can roll back the consumer's trusted state can replay old signed releases. Without that external state, **replay prevention cannot be claimed**.
+---
 
-For key rotation, authenticate and distribute the new public key through an independent trusted mechanism; revoke the old fingerprint where necessary; ensure sequence continuity; do not rely on unsigned downloaded metadata. If the trusted time source, revocation record, or signing identity is unavailable, fail closed rather than silently falling back to unsigned import.
+## 4. Key Custody, Rotation & Rollback Lifecycle
 
-### Remaining NO-GO conditions
-
-There is no independently established long-lived publisher identity or key custody system, no trusted key distribution or revocation feed, no Sigstore certificate/transparency validation, no consumer-side durable rollback database, and no real-world public-data approval. **A valid synthetic Ed25519 signature is not authorization to publish real IOC data, connect AEGIS or take automated security action.** The private AEGIS project remains unchanged.
-
-Research references: [PyCA Ed25519 interface](https://cryptography.io/en/latest/hazmat/primitives/asymmetric/ed25519/), [Sigstore verification trust model](https://docs.sigstore.dev/about/overview/).
-
-**Fail-closed API refinement:** `SignedReleaseTrust` now *requires* an explicit `last_accepted_sequence`, `key_valid_from`, and `key_valid_until` for every verification, even for a synthetic demo. The accepted sequence and key validity data must be maintained independently; these defaults cannot be inferred from a downloaded attestation.
+1. **Air-Gapped Key Custody:**
+   - Keys are generated and stored exclusively on secure, air-gapped workstations using encrypted PKCS#8 PEM encoding.
+   - Operator workstations execute detached signing via `anie sign-release` without network connectivity.
+2. **Dual-Key Rotation Policy:**
+   - The consumer trust policy (`config/trusted_keys.json`) maintains a registry of authorized key IDs with explicit validity intervals.
+   - During key rotation, the retiring key and new key overlap for at least two release cycles.
+3. **Monotonic Sequence & Anti-Rollback:**
+   - Releases carry a strictly increasing integer `sequence` counter.
+   - Consumers store the latest accepted sequence in a concurrency-safe local state tracker (`consumer_highwater.json`).
+   - Replay attacks presenting validly signed but older releases are rejected.

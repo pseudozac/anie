@@ -3,8 +3,8 @@
 **Project:** Autonomous Network Intelligence Engine (ANIE)  
 **Document:** `docs/PHASE3_ARCHITECTURE_REVISION.md`  
 **Baseline Commit:** `a532322bbdbabccf175e283d293ac9c35631b543`  
-**Remediation Commit:** `e053c7a` (`feat/phase3-m3.1-security-remediation`)  
-**Status:** Approved for Phase 3 Engineering  
+**Current Accepted Baseline:** `6352bc65e6a81a535fa1d1de60ef0de4f0074d59` (Milestone M3.8 / PR #36)  
+**Status:** Phase 3 Milestones M3.1 through M3.8 Completed & Accepted  
 **Licensing:** Apache 2.0 Open Source Core  
 
 ---
@@ -152,15 +152,19 @@ Milestone M3.1 resolves the confirmed operational security defects identified du
 
 ---
 
-## 5. Phase 3 Staged Roadmap (Milestones M3.1 through M3.5)
+## 5. Phase 3 Staged Roadmap (Milestones M3.1 through M3.8)
 
 | Milestone | Scope & Deliverables | Security & Architectural Constraints | Status |
 | :--- | :--- | :--- | :--- |
-| **M3.1** | **Security Remediation**<br>- Fail-closed preflight egress enforcement<br>- Unprivileged sandbox firewall classification<br>- Sentinel reconciliation & regression tests | No new collection features; no Merkle trees; mock/offline test validation only. | **COMPLETED** (`e053c7a`) |
-| **M3.2** | **Independent Attestation & Provenance**<br>- Candidate release extraction pipeline<br>- Offline Ed25519 signing CLI runbook<br>- Anti-rollback sequence enforcement | Private key never on collector node; zero call-home verification; deterministic JSON canonicalization. | Planned (Next) |
-| **M3.3** | **Multi-Vector Observable Ingestion**<br>- Passive TLS & HTTP header normalization<br>- Cryptographic wire digest retention<br>- Strict isolation boundary enforcement | Bounded query envelopes; no exploratory web crawling; fail-closed schema validation. | Staged |
-| **M3.4** | **Temporal Drift & Uncertainty Analytics**<br>- Calibrated temporal variance estimators<br>- Explicit abstention models for sparse observations<br>- Separation of empirical drift from anomaly scoring | Novelty distance != maliciousness; deterministic reproducible mathematical baselines; memory <200 MiB. | Staged |
-| **M3.5** | **AEGIS Federation & Export Interface**<br>- Hardened, versioned export formats (`.jsonl.gz`)<br>- Offline AEGIS ingestion adapter<br>- Backward compatibility verification suite | Strictly one-way data flow; zero leakage of AEGIS investigation context or target entities. | Staged |
+| **M3.1** | **Security Remediation**<br>- Fail-closed preflight egress enforcement<br>- Unprivileged sandbox firewall classification<br>- Sentinel reconciliation & regression tests | No new collection features; no Merkle trees; mock/offline test validation only. | **COMPLETED** (PR #31, `e053c7a`) |
+| **M3.2** | **Independent Attestation & Provenance**<br>- Candidate release extraction pipeline<br>- Offline Ed25519 signing CLI runbook<br>- Anti-rollback sequence enforcement | Private key never on collector node; zero call-home verification; deterministic JSON canonicalization. | **COMPLETED** (PR #32, `13f2dae`) |
+| **M3.3** | **Multi-Resolver Observable Ingestion**<br>- Multi-resolver discrepancy matrix (Cloudflare, Google, Quad9)<br>- Cryptographic wire digest retention<br>- Strict isolation boundary enforcement | Bounded query envelopes; no exploratory web crawling; fail-closed schema validation. | **COMPLETED** (PR #33, `b331002`) |
+| **M3.4** | **Temporal Graph & Uncertainty Analytics**<br>- Temporal property graph engine with 7 entity types<br>- Explicit edge temporal intervals (`valid_from`, `valid_until`)<br>- Nonparametric temporal drift scoring with abstention | Novelty distance != maliciousness; deterministic reproducible mathematical baselines; memory <200 MiB. | **COMPLETED** (PR #34, `cdd615b`) |
+| **M3.5** | **AEGIS Federation & Export Interface**<br>- Hardened, versioned export formats (`.jsonl.gz`)<br>- V4 consumer contract with atomic SQLite ingestion<br>- Reversible claims, provenance verification, and rollback testing | Strictly one-way data flow; zero leakage of AEGIS investigation context or target entities. | **COMPLETED** (PR #35, `966d759`) |
+| **M3.5.1** | **Consumer Integrity Corrections**<br>- Atomic V4 claims ingestion transaction barrier<br>- Signed-release evidence retention guarantees<br>- Consumer provenance isolation and crash-injection resilience | Complete transactional atomicity across events, observations, discrepancies, claims, and journal. | **COMPLETED** (PR #35, `68d370f`) |
+| **M3.6** | **RDAP Enrichment & BGP Routing Graph**<br>- RFC 9224/9082 bootstrap discovery & IANA delegation<br>- BGP origin-AS attribution and `PREFIX_MEMBER` edges<br>- Legitimate CDN, Anycast, and Dynamic DNS false-positive controls | Strictly bounded parsing; offline fixture replay; determinism and uncertainty preserved. | **COMPLETED** (PR #35, `f864834`) |
+| **M3.7** | **TLS Certificate Graph & Knowledge Hardening**<br>- Passive and active TLS x509 SAN parsing<br>- Live `SERVES_CERTIFICATE` fact edges requiring verified handshake<br>- Certificate SAN correlation and path traversal hardening | No synthetic certificate injection; vault export sanitize path traversal; deterministic graph rebuild. | **COMPLETED** (PR #36, `9b3e30d`) |
+| **M3.8** | **Passive HTTP Metadata & Competing Hypotheses**<br>- Bounded HTTP/1.1 and HTTP/2 response metadata normalization<br>- Competing Hypothesis Engine with corroboration scoring<br>- Markdown Obsidian knowledge vault export (`.obsidian/vault`) | Bounded header parsing; sensitive fields excluded; memory-bounded SHA-256 wire digests. | **COMPLETED** (PR #36, `6352bc6`) |
 
 ---
 
@@ -188,8 +192,15 @@ To preserve architectural focus and prevent premature complexity, the following 
 ## 8. Verification & Sign-Off
 
 - **Baseline Code Commit:** `a532322bbdbabccf175e283d293ac9c35631b543`
-- **Milestone M3.1 Commit:** `e053c7a7f45cbb66835a6435bc351bf6e72957b1`
-- **Unit & Integration Test Results:** 306 passed, 0 failed, 1 skipped (100% pass rate).
-- **Security Preflight Test Results:** 18 passed, 0 failed.
-- **Pilot Execution Path Test Results:** 18 passed, 0 failed.
-- **Live VM Collector State:** Quiescent, `anie-pilot.timer` disabled, sentinel active, 100% Phase 2 evidence preserved.
+- **Milestone M3.8 Acceptance Commit:** `6352bc65e6a81a535fa1d1de60ef0de4f0074d59`
+- **Unit & Integration Test Results:** 470 tests (469 passed, 0 failed, 1 skipped; 100% pass rate).
+- **Security Preflight & Sandbox Tests:** 18 passed, 0 failed.
+- **Multi-Resolver & Discrepancy Tests:** 21 passed, 0 failed.
+- **Temporal Graph & ML Drift Tests:** 26 passed, 0 failed.
+- **Consumer Integrity & Claims Tests:** 32 passed, 0 failed.
+- **RDAP, BGP & CDN False-Positive Tests:** 24 passed, 0 failed.
+- **TLS Certificate Handshake Tests:** 28 passed, 0 failed.
+- **HTTP Enrichment & Hypothesis Tests:** 15 passed, 0 failed.
+- **Repository Structural Guardrails (`tools/check_repo.py`):** 100% PASS.
+- **Live VM Collector State:** Quiescent on `anie-collector-01` (`129.225.109.227`), `anie-pilot.timer` disabled, sentinel active, 100% Phase 2 evidence preserved at ₹0.00 / $0.00 cost.
+- **Ampere A1 Capacity Acquisition Runner:** Operating autonomously under Windows Task Scheduler (`ANIE_Ampere_A1_Capacity_Retry`), hourly rate governor, 7-day expiration ceiling.
