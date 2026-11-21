@@ -75,7 +75,7 @@ from .real_models import (
 from .discrepancy_models import RealDiscrepancyReport, DISCREPANCY_REPORT_SCHEMA
 from .graph_models import GraphEdge, GraphNode, IntelligenceClaim
 
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 
 _FTS_SYNC_ERRORS: list[str] = []
 
@@ -317,7 +317,7 @@ class RealObservationStore:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_claims_subject ON intelligence_claims(subject_uri)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_claims_time ON intelligence_claims(asserted_at)")
 
-        # 5. Consumer Release Journal (Milestone M3.3.2)
+        # 5. Consumer Release Journal (Milestone M3.3.2 & M3.5.1)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS consumer_releases (
                 publisher TEXT NOT NULL,
@@ -327,11 +327,27 @@ class RealObservationStore:
                 total_observations INTEGER NOT NULL,
                 total_events INTEGER NOT NULL,
                 total_discrepancies INTEGER NOT NULL,
+                total_claims INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL CHECK(status IN ('COMMITTED', 'INSPECTION')),
                 PRIMARY KEY (publisher, release_sequence)
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_consumer_releases_pub ON consumer_releases(publisher, release_sequence)")
+
+        # 5b. Release Evidence Membership Index (Milestone M3.5.1)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS release_evidence_index (
+                publisher TEXT NOT NULL,
+                release_sequence INTEGER NOT NULL,
+                manifest_sha256 TEXT NOT NULL,
+                observation_id TEXT,
+                event_id TEXT NOT NULL,
+                raw_sha256 TEXT NOT NULL,
+                PRIMARY KEY (publisher, release_sequence, event_id, observation_id)
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_rel_ev_obs ON release_evidence_index(observation_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_rel_ev_raw ON release_evidence_index(raw_sha256)")
 
         # 6. Local Searchable Knowledge FTS5 (Milestone M3.4)
         conn.execute("""
@@ -456,6 +472,7 @@ class RealObservationStore:
                 )
             """)
         if from_version < 4:
+            # Upgrade intelligence_claims if needed
             table_info = conn.execute("PRAGMA table_info(intelligence_claims)").fetchall()
             if table_info:
                 conn.execute("""
@@ -482,6 +499,28 @@ class RealObservationStore:
                 conn.execute("ALTER TABLE intelligence_claims_v4 RENAME TO intelligence_claims")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_claims_subject ON intelligence_claims(subject_uri)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_claims_time ON intelligence_claims(asserted_at)")
+
+            # Upgrade consumer_releases with total_claims if missing
+            cr_info = conn.execute("PRAGMA table_info(consumer_releases)").fetchall()
+            if cr_info:
+                cr_cols = [r[1] for r in cr_info]
+                if "total_claims" not in cr_cols:
+                    conn.execute("ALTER TABLE consumer_releases ADD COLUMN total_claims INTEGER NOT NULL DEFAULT 0")
+
+            # Create release_evidence_index if missing
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS release_evidence_index (
+                    publisher TEXT NOT NULL,
+                    release_sequence INTEGER NOT NULL,
+                    manifest_sha256 TEXT NOT NULL,
+                    observation_id TEXT,
+                    event_id TEXT NOT NULL,
+                    raw_sha256 TEXT NOT NULL,
+                    PRIMARY KEY (publisher, release_sequence, event_id, observation_id)
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_rel_ev_obs ON release_evidence_index(observation_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_rel_ev_raw ON release_evidence_index(raw_sha256)")
         conn.execute(f"PRAGMA user_version = {to_version}")
 
     def insert_record(
@@ -1527,6 +1566,7 @@ class RealObservationStore:
         observations: list[RealObservation],
         events: list[RealCollectionEvent],
         discrepancies: list[RealDiscrepancyReport] | None = None,
+        claims: list[IntelligenceClaim] | None = None,
         *,
         publisher: str,
         release_sequence: int,
@@ -1536,13 +1576,14 @@ class RealObservationStore:
         """Atomically persist a verified release bundle and advance the consumer release journal.
         
         Transactional Guarantee:
-        - All events, observations, discrepancies, graph syncs, and the consumer release record
-          are committed in a SINGLE SQLite transaction.
+        - All events, observations, discrepancies, claims, graph syncs, release evidence index,
+          and the consumer release journal record are committed in a SINGLE SQLite transaction.
         - If a crash or error occurs at any point during persistence, all records are rolled back.
         - Historical inspection (is_historical=True) persists data without advancing the release journal.
         - Returns True if newly committed, False if already present identically (idempotent).
         """
         discrepancies = discrepancies or []
+        claims = claims or []
         events_by_id = {ev.event_id: ev for ev in events}
 
         with self._connect() as conn:
@@ -1565,6 +1606,7 @@ class RealObservationStore:
             engine = GraphEngine(conn)
 
             # Persist events & observations
+            linked_event_ids: set[str] = set()
             for obs in observations:
                 ev = events_by_id.get(obs.evidence_id)
                 if ev is None:
@@ -1573,6 +1615,8 @@ class RealObservationStore:
                     if ev_row is None:
                         raise ValueError(f"missing supporting event {obs.evidence_id} for observation {obs.observation_id}")
                     ev = RealCollectionEvent.from_dict(json.loads(ev_row[0]))
+
+                linked_event_ids.add(ev.event_id)
 
                 # Insert event if not present
                 ev_canonical = canonical_json(ev.to_dict())
@@ -1611,12 +1655,28 @@ class RealObservationStore:
                 elif existing_obs[0] != obs_canonical:
                     raise sqlite3.IntegrityError(f"conflicting real_observation with observation_id {obs.observation_id}")
 
+                # Record in release_evidence_index
+                conn.execute("""
+                    INSERT OR IGNORE INTO release_evidence_index (
+                        publisher, release_sequence, manifest_sha256, observation_id, event_id, raw_sha256
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                """, (publisher, release_sequence, manifest_sha256, obs.observation_id, ev.event_id, ev.raw_sha256))
+
                 # Automatic graph sync
                 nodes, edges = engine.extract_from_observation(ev, obs)
                 for node in nodes:
                     engine.upsert_node(node)
                 for edge in edges:
                     engine.insert_edge(edge)
+
+            # Record any events not tied directly to observations into release_evidence_index
+            for ev in events:
+                if ev.event_id not in linked_event_ids:
+                    conn.execute("""
+                        INSERT OR IGNORE INTO release_evidence_index (
+                            publisher, release_sequence, manifest_sha256, observation_id, event_id, raw_sha256
+                        ) VALUES (?, ?, ?, '', ?, ?)
+                    """, (publisher, release_sequence, manifest_sha256, ev.event_id, ev.raw_sha256))
 
             # Persist discrepancies
             for disc in discrepancies:
@@ -1639,17 +1699,75 @@ class RealObservationStore:
                 for edge in edges:
                     engine.insert_edge(edge)
 
+            # Persist intelligence claims atomically
+            for claim in claims:
+                node_row = conn.execute("SELECT node_id FROM graph_nodes WHERE node_id = ?", (claim.subject_uri,)).fetchone()
+                if node_row is None:
+                    conn.execute(
+                        """
+                        INSERT INTO graph_nodes (
+                            node_id, node_type, canonical_name, layer,
+                            first_observed_at, last_observed_at, properties_json, payload
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            claim.subject_uri,
+                            "domain" if ":domain:" in claim.subject_uri else "claim",
+                            claim.subject_uri.split(":")[-1],
+                            claim.layer,
+                            claim.asserted_at,
+                            claim.asserted_at,
+                            "{}",
+                            "{}",
+                        ),
+                    )
+
+                c_canonical = canonical_json(claim.to_dict())
+                existing_c = conn.execute("SELECT payload FROM intelligence_claims WHERE claim_id = ?", (claim.claim_id,)).fetchone()
+                if existing_c is None:
+                    conn.execute(
+                        """
+                        INSERT INTO intelligence_claims (
+                            claim_id, subject_uri, claim_type, layer,
+                            asserted_at, valid_from, valid_until, ruleset_version,
+                            confidence, explanation, supporting_evidence_hashes_json,
+                            supporting_node_ids_json, analyst_identity, attestation_signature,
+                            payload
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            claim.claim_id,
+                            claim.subject_uri,
+                            claim.claim_type,
+                            claim.layer,
+                            claim.asserted_at,
+                            claim.valid_from,
+                            claim.valid_until,
+                            claim.ruleset_version,
+                            claim.confidence,
+                            claim.explanation,
+                            json.dumps(list(claim.supporting_evidence_hashes)),
+                            json.dumps(list(claim.supporting_node_ids)),
+                            claim.analyst_identity,
+                            claim.attestation_signature,
+                            c_canonical,
+                        ),
+                    )
+                    sync_claim_to_fts(conn, claim)
+                elif existing_c[0] != c_canonical:
+                    raise sqlite3.IntegrityError(f"conflicting intelligence_claim with claim_id {claim.claim_id}")
+
             # Record consumer release
             if not is_historical:
                 now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
                 conn.execute("""
                     INSERT INTO consumer_releases (
                         publisher, release_sequence, manifest_sha256, accepted_at,
-                        total_observations, total_events, total_discrepancies, status
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'COMMITTED')
+                        total_observations, total_events, total_discrepancies, total_claims, status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'COMMITTED')
                 """, (
                     publisher, release_sequence, manifest_sha256, now_iso,
-                    len(observations), len(events), len(discrepancies)
+                    len(observations), len(events), len(discrepancies), len(claims)
                 ))
 
             return True
@@ -1666,15 +1784,16 @@ class RealObservationStore:
     def get_consumer_release(self, publisher: str, release_sequence: int) -> dict[str, Any] | None:
         """Return journal record for specific publisher and sequence."""
         with self._connect() as conn:
-            row = conn.execute(
-                """
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(consumer_releases)").fetchall()]
+            has_claims = "total_claims" in cols
+            select_sql = f"""
                 SELECT publisher, release_sequence, manifest_sha256, accepted_at,
-                       total_observations, total_events, total_discrepancies, status
+                       total_observations, total_events, total_discrepancies,
+                       {'total_claims' if has_claims else '0'}, status
                 FROM consumer_releases
                 WHERE publisher = ? AND release_sequence = ?
-                """,
-                (publisher, release_sequence),
-            ).fetchone()
+            """
+            row = conn.execute(select_sql, (publisher, release_sequence)).fetchone()
             if row is None:
                 return None
             return {
@@ -1685,5 +1804,6 @@ class RealObservationStore:
                 "total_observations": row[4],
                 "total_events": row[5],
                 "total_discrepancies": row[6],
-                "status": row[7],
+                "total_claims": row[7],
+                "status": row[8],
             }

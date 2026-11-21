@@ -42,7 +42,7 @@ The pilot targets an initial corpus of 25–50 core internet infrastructure doma
 
 ---
 
-## 3. Rate Limits & Cooldown Governance
+## 3. Rate Limits, Workload Arithmetic & Cooldown Governance
 
 Collection is mediated by the fail-closed `DohRateGovernor` backed by SQLite ACID transactions:
 
@@ -53,6 +53,21 @@ Collection is mediated by the fail-closed `DohRateGovernor` backed by SQLite ACI
 | **Max Queries per Hourly Window** | 60 queries total across all domains | Fail-closed skip |
 | **Batch Timeout Deadline** | 30.0 seconds monotonic | Immediate batch termination |
 | **Consecutive Failure Cooldown** | 3 failures $\implies$ 1-hour backoff | Cooldown enforced in DB |
+
+### 3.1 Pilot Workload Arithmetic & Hourly Batch Reconciliation
+
+The governed pilot executes an empirical baseline of 25 domains across 3 independent resolvers every 4 hours:
+- **Queries per 4-Hour Cycle:** $25 \text{ domains} \times 3 \text{ resolvers} = 75 \text{ queries/cycle}$.
+- **Daily Cycles:** $24 \text{ hours} / 4 \text{ hours} = 6 \text{ cycles/day}$.
+- **Total Daily Workload:** $75 \text{ queries/cycle} \times 6 \text{ cycles/day} = \mathbf{450 \text{ requests/day}}$ (before retries).
+
+#### Batch Partitioning & Rate-Governor Compliance:
+Executing 75 queries in a single unpartitioned batch would violate the 60-query hourly threshold ($75 > 60$) and risk exceeding the 30.0-second timeout deadline. To reconcile the workload with operational limits:
+1. Each 4-hour collection epoch is partitioned into **2 staggered hourly sub-batches**:
+   - **Hour 0:** Sub-batch 1 runs 13 domains $\times 3 \text{ resolvers} = \mathbf{39 \text{ queries}}$ (execution time $\approx 13\text{--}15\text{ s} \le 30\text{ s}$ deadline).
+   - **Hour 1:** Sub-batch 2 runs 12 domains $\times 3 \text{ resolvers} = \mathbf{36 \text{ queries}}$ (execution time $\approx 12\text{--}14\text{ s} \le 30\text{ s}$ deadline).
+   - **Hours 2 & 3:** Quiet cooldown window ($0 \text{ queries}$).
+2. Each sub-batch strictly honors $\le 39 < 60 \text{ queries/hour}$ per resolver and completes within half the 30-second monotonic deadline.
 
 ---
 

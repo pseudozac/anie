@@ -39,6 +39,8 @@ class TestIntelligenceEvaluator(unittest.TestCase):
         for name, sc in scenarios.items():
             self.assertIn("domain", sc)
             self.assertIn("ground_truth", sc)
+            self.assertIn("benchmark_type", sc)
+            self.assertEqual(sc["benchmark_type"], "CONTROLLED_SYNTHETIC_BENCHMARK")
             self.assertIn("records", sc)
             self.assertTrue(len(sc["records"]) > 0)
 
@@ -70,6 +72,23 @@ class TestIntelligenceEvaluator(unittest.TestCase):
         for res in report.scenario_results:
             self.assertTrue(res.is_correct)
             self.assertTrue(res.evidence_complete)
+            self.assertEqual(res.benchmark_type, "CONTROLLED_SYNTHETIC_BENCHMARK")
+
+    def test_contamination_guard_refuses_production_store(self):
+        # Insert a committed release record simulating a production consumer store
+        with self.store._connect() as conn:
+            conn.execute("""
+                INSERT INTO consumer_releases (
+                    publisher, release_sequence, manifest_sha256, accepted_at,
+                    total_observations, total_events, total_discrepancies, total_claims, status
+                ) VALUES ('anie-first-party', 1, 'c' * 64, '2026-11-20T12:00:00Z', 10, 10, 0, 0, 'COMMITTED')
+            """)
+
+        # Evaluator must refuse execution on production store to prevent synthetic benchmark contamination
+        with self.assertRaises(RuntimeError) as cm:
+            self.evaluator.evaluate()
+        self.assertIn("refused execution", str(cm.exception))
+        self.assertIn("contaminate", str(cm.exception))
 
 
 if __name__ == "__main__":

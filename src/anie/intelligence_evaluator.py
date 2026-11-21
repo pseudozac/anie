@@ -45,6 +45,7 @@ class ScenarioEvaluationResult:
     claims_generated: int
     discrepancies_generated: int
     evidence_complete: bool
+    benchmark_type: str = "CONTROLLED_SYNTHETIC_BENCHMARK"
     details: dict[str, Any] = field(default_factory=dict)
 
 
@@ -84,9 +85,11 @@ class IntelligenceEvaluationReport:
             "scenario_results": [asdict(r) for r in self.scenario_results],
             "limitations": self.limitations,
             "disclaimer": (
-                "Empirical evaluation metrics represent tested accuracy against controlled "
-                "ground-truth benchmark datasets. Heuristic detector confidence scores remain "
-                "uncalibrated and must not be interpreted as absolute statistical probabilities."
+                "Empirical evaluation metrics represent tested rule-conformance against controlled "
+                "synthetic benchmark datasets. 100% precision and recall across 3 positive cases "
+                "(fast-flux, resolution flip, resolver filtering) reflects deterministic rule verification "
+                "and does NOT equal demonstrated real-world detection accuracy. Heuristic detector "
+                "confidence scores remain uncalibrated and must not be interpreted as absolute statistical probabilities."
             ),
         }
 
@@ -185,6 +188,7 @@ class IntelligenceEvaluator:
                 cf_records.append(_make_event_and_obs(cf_domain, "dns_a", t, [ip], resolver=r, ttl=300, synthetic_id_suffix=f"cdn_{i}_{r}"))
         scenarios["legitimate_cdn_rotation"] = {
             "domain": cf_domain,
+            "benchmark_type": "CONTROLLED_SYNTHETIC_BENCHMARK",
             "ground_truth": "BENIGN_CDN_ROTATION",
             "records": cf_records,
             "expected_claim_types": ["INFRASTRUCTURE_TRANSITION", "IP_RELATIONSHIP_EVOLUTION"],
@@ -201,6 +205,7 @@ class IntelligenceEvaluator:
                 rr_records.append(_make_event_and_obs(rr_domain, "dns_a", t, pair, resolver=r, ttl=600, synthetic_id_suffix=f"rr_{i}_{r}"))
         scenarios["legitimate_round_robin"] = {
             "domain": rr_domain,
+            "benchmark_type": "CONTROLLED_SYNTHETIC_BENCHMARK",
             "ground_truth": "BENIGN_LOAD_BALANCING",
             "records": rr_records,
             "expected_claim_types": [],
@@ -217,6 +222,7 @@ class IntelligenceEvaluator:
         ]
         scenarios["resolver_filtering"] = {
             "domain": filt_domain,
+            "benchmark_type": "CONTROLLED_SYNTHETIC_BENCHMARK",
             "ground_truth": "RESOLVER_SECURITY_FILTERING",
             "records": filt_records,
             "expected_discrepancy_categories": ["POLICY_FILTER_BLOCK", "SUSPECTED_BLOCKING", "SECURITY_FILTERING", "SECURITY_FILTERING_DETECTED", "DISCREPANCY"],
@@ -237,6 +243,7 @@ class IntelligenceEvaluator:
                 mig_records.append(_make_event_and_obs(mig_domain, "dns_a", t, ["198.51.100.99"], resolver=r, ttl=86400, synthetic_id_suffix=f"mig2_{i}_{r}"))
         scenarios["infrastructure_migration"] = {
             "domain": mig_domain,
+            "benchmark_type": "CONTROLLED_SYNTHETIC_BENCHMARK",
             "ground_truth": "INFRASTRUCTURE_TRANSITION",
             "records": mig_records,
             "expected_claim_types": ["INFRASTRUCTURE_TRANSITION", "IP_RELATIONSHIP_EVOLUTION"],
@@ -256,6 +263,7 @@ class IntelligenceEvaluator:
                 flux_records.append(_make_event_and_obs(flux_domain, "dns_a", t, [ip], resolver=r, ttl=60, synthetic_id_suffix=f"flux_{i}_{r}"))
         scenarios["fast_flux_botnet"] = {
             "domain": flux_domain,
+            "benchmark_type": "CONTROLLED_SYNTHETIC_BENCHMARK",
             "ground_truth": "FAST_FLUX_BOTNET",
             "records": flux_records,
             "expected_claim_types": ["FAST_FLUX_INDICATOR"],
@@ -269,6 +277,7 @@ class IntelligenceEvaluator:
         ]
         scenarios["unexpected_resolution_flip"] = {
             "domain": flip_domain,
+            "benchmark_type": "CONTROLLED_SYNTHETIC_BENCHMARK",
             "ground_truth": "UNEXPECTED_RESOLUTION_FLIP",
             "records": flip_records,
             "expected_claim_types": ["RESOLUTION_DIVERGENCE_INDICATOR"],
@@ -283,6 +292,7 @@ class IntelligenceEvaluator:
                 stable_records.append(_make_event_and_obs(stable_domain, "dns_a", t, ["93.184.216.34"], resolver=r, ttl=3600, synthetic_id_suffix=f"stable_{i}_{r}"))
         scenarios["stable_baseline"] = {
             "domain": stable_domain,
+            "benchmark_type": "CONTROLLED_SYNTHETIC_BENCHMARK",
             "ground_truth": "BENIGN_STABLE",
             "records": stable_records,
             "expected_claim_types": [],
@@ -292,6 +302,23 @@ class IntelligenceEvaluator:
         return scenarios
 
     def evaluate(self) -> IntelligenceEvaluationReport:
+        """Run the comprehensive evaluation benchmark against all 7 scenarios."""
+        # Contamination Guard: Refuse execution if target store contains committed production release records
+        with self.store._connect() as conn:
+            for tbl in ("consumer_releases", "real_releases"):
+                exists = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (tbl,)
+                ).fetchone()
+                if exists:
+                    count = conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+                    if count > 0:
+                        raise RuntimeError(
+                            f"IntelligenceEvaluator refused execution: target store contains {count} committed "
+                            f"production release records in {tbl}. Controlled synthetic benchmark records must NEVER "
+                            f"contaminate production evidence stores."
+                        )
+
+        scenarios = self.generate_benchmark_scenarios()
         """Run the comprehensive evaluation benchmark against all 7 scenarios."""
         scenarios = self.generate_benchmark_scenarios()
         results: list[ScenarioEvaluationResult] = []
@@ -422,7 +449,8 @@ class IntelligenceEvaluator:
         evidence_completeness_rate = valid_claims_emitted / total_claims_emitted if total_claims_emitted > 0 else 1.0
 
         limitations = [
-            "Evaluation reflects synthetic benchmark data modeling known behaviors; real-world adversaries may employ novel evasion.",
+            "Evaluation reflects 7 controlled synthetic benchmark scenarios modeling known patterns; 100% precision and recall across 3 positive cases demonstrates rule-conformance on synthetic signatures, not demonstrated real-world detection accuracy.",
+            "Real-world adversaries may employ novel evasion techniques, slow-flux timing, or low-and-slow infrastructure transitions not captured by synthetic datasets.",
             "Heuristic confidence scores are uncalibrated rule outputs and do not represent formal Bayesian probabilities.",
             "Resolver filtering evaluation assumes Quad9 and CleanBrowsing blocklists match test corpus signatures.",
             "Dual-stack IPv4 / IPv6 correlation is evaluated on simulated dual-record responses, not live BGP path variations.",

@@ -227,6 +227,74 @@ class TestV4ClaimsRelease(unittest.TestCase):
             self.assertEqual(len(bundle.events), 1)
             self.assertEqual(len(bundle.claims), 0)
 
+    def test_atomic_v4_claims_ingestion_crash_rollback(self):
+        obs, evt, claim = _sample_records()
+
+        with TemporaryDirectory() as tmp:
+            consumer_db = Path(tmp) / "consumer_atomic.db"
+            c_store = RealObservationStore(consumer_db)
+
+            # Simulated crash during claim insertion (inject an invalid claim object that fails serialization)
+            class FaultyClaim:
+                pass
+
+            bad_claim = FaultyClaim()
+
+            # Attempt ingestion with faulty claim: should raise TypeError/AttributeError
+            with self.assertRaises((TypeError, AttributeError)):
+                c_store.ingest_release_bundle(
+                    observations=[obs],
+                    events=[evt],
+                    discrepancies=[],
+                    claims=[bad_claim],  # Fault injection
+                    publisher="anie-first-party",
+                    release_sequence=1,
+                    manifest_sha256="a" * 64,
+                )
+
+            # Assert complete rollback: store must have 0 observations, 0 events, 0 claims, 0 releases
+            with c_store._connect() as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM real_observations").fetchone()[0], 0)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM real_events").fetchone()[0], 0)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM intelligence_claims").fetchone()[0], 0)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM consumer_releases").fetchone()[0], 0)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM release_evidence_index").fetchone()[0], 0)
+
+            # Now replay with valid claim: should succeed atomically
+            res = c_store.ingest_release_bundle(
+                observations=[obs],
+                events=[evt],
+                discrepancies=[],
+                claims=[claim],
+                publisher="anie-first-party",
+                release_sequence=1,
+                manifest_sha256="a" * 64,
+            )
+            self.assertTrue(res)
+
+            # Verify persisted counts and release_evidence_index
+            with c_store._connect() as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM real_observations").fetchone()[0], 1)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM real_events").fetchone()[0], 1)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM intelligence_claims").fetchone()[0], 1)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM consumer_releases").fetchone()[0], 1)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM release_evidence_index").fetchone()[0], 1)
+                rel_rec = conn.execute("SELECT total_claims FROM consumer_releases WHERE release_sequence = 1").fetchone()
+                self.assertEqual(rel_rec[0], 1)
+
+            # Idempotent replay: calling ingest_release_bundle again returns False without error
+            replay_res = c_store.ingest_release_bundle(
+                observations=[obs],
+                events=[evt],
+                discrepancies=[],
+                claims=[claim],
+                publisher="anie-first-party",
+                release_sequence=1,
+                manifest_sha256="a" * 64,
+            )
+            self.assertFalse(replay_res)
+
+
 
 if __name__ == "__main__":
     unittest.main()

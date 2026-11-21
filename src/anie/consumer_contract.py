@@ -132,9 +132,13 @@ class CanonicalIocFeed:
     feed_schema: str = IOC_FEED_SCHEMA
     publisher: str = "anie-first-party"
     license: str = "Apache-2.0"
+    next_cursor: str | None = None
+    has_more: bool = False
+    limit: int | None = None
     notice: str = (
         "First-party empirical threat intelligence observations and unverified hypotheses. "
-        "Heuristic confidence scores are uncalibrated and require independent verification."
+        "Heuristic confidence scores are uncalibrated and require independent verification. "
+        "Indicators represent infrastructure observations and anomaly hypotheses, not confirmed maliciousness."
     )
 
     @property
@@ -279,10 +283,19 @@ class AnieIntelligenceClient:
         params: list[Any] = [float(min_confidence)]
 
         if subject_uri is not None:
-            # Canonicalize search subject URI
-            _, cval = parse_entity_uri(subject_uri)
-            query_sql.append("AND (subject_uri = ? OR subject_uri LIKE ?)")
-            params.extend([subject_uri, f"%{cval}%"])
+            # Canonicalize search subject URI and match exact candidates
+            etype, cval = parse_entity_uri(subject_uri)
+            candidates = [subject_uri, f"{etype}:{cval}", f"anie:entity:{etype}:{cval}", cval]
+            if etype in ("ipv4", "ipv6"):
+                candidates.extend([f"ip:{cval}", f"anie:entity:ip:{cval}"])
+            elif etype == "domain":
+                candidates.extend([f"domain:{cval}", f"anie:entity:domain:{cval}"])
+            # Deduplicate preserving order
+            seen_c = set()
+            cand_list = [c for c in candidates if not (c in seen_c or seen_c.add(c))]
+            placeholders = ",".join("?" for _ in cand_list)
+            query_sql.append(f"AND subject_uri IN ({placeholders})")
+            params.extend(cand_list)
 
         if claim_type is not None:
             query_sql.append("AND claim_type = ?")
@@ -474,16 +487,32 @@ class AnieIntelligenceClient:
         )
 
     def get_entity_provenance(self, entity_uri: str) -> EntityProvenanceBundle:
-        """Retrieve full forensic evidence bundle for a canonical entity."""
+        """Retrieve full forensic evidence bundle for a canonical entity using strict provenance isolation."""
         etype, cval = parse_entity_uri(entity_uri)
         canon_uri = f"{etype}:{cval}"
         legacy_node = f"anie:entity:{etype}:{cval}"
 
+        # Construct strict candidate set for exact node / claim matching (NO substring LIKE matches)
+        exact_node_candidates = [canon_uri, legacy_node, cval]
+        if etype in ("ipv4", "ipv6"):
+            exact_node_candidates.extend([f"ip:{cval}", f"anie:entity:ip:{cval}"])
+        elif etype == "domain":
+            exact_node_candidates.extend([f"domain:{cval}", f"anie:entity:domain:{cval}"])
+
+        # Deduplicate preserving order
+        seen_cand = set()
+        cand_list = [c for c in exact_node_candidates if not (c in seen_cand or seen_cand.add(c))]
+
         with self.store._connect() as conn:
-            # 1. Node metadata
+            # 1. Node metadata (Exact matching)
+            placeholders_nodes = ",".join("?" for _ in cand_list)
             node_row = conn.execute(
-                "SELECT node_id, node_type, canonical_name, layer, first_observed_at, last_observed_at, properties_json FROM graph_nodes WHERE node_id IN (?, ?, ?)",
-                (canon_uri, legacy_node, cval),
+                f"""
+                SELECT node_id, node_type, canonical_name, layer, first_observed_at, last_observed_at, properties_json
+                FROM graph_nodes
+                WHERE node_id IN ({placeholders_nodes}) OR canonical_name = ?
+                """,
+                cand_list + [cval],
             ).fetchone()
 
             node_dict = {}
@@ -498,10 +527,15 @@ class AnieIntelligenceClient:
                     "properties": json.loads(node_row[6]) if node_row[6] else {},
                 }
 
-            # 2. Associated Claims
+            # 2. Associated Claims (Exact canonical subject match only)
             claim_rows = conn.execute(
-                "SELECT claim_id, subject_uri, claim_type, asserted_at, confidence, explanation, supporting_evidence_hashes_json, payload FROM intelligence_claims WHERE subject_uri IN (?, ?, ?) OR subject_uri LIKE ?",
-                (canon_uri, legacy_node, cval, f"%{cval}%"),
+                f"""
+                SELECT claim_id, subject_uri, claim_type, asserted_at, confidence, explanation,
+                       supporting_evidence_hashes_json, payload
+                FROM intelligence_claims
+                WHERE subject_uri IN ({placeholders_nodes})
+                """,
+                cand_list,
             ).fetchall()
 
             claims = []
@@ -521,10 +555,14 @@ class AnieIntelligenceClient:
                     "supporting_evidence_hashes": c_hashes,
                 })
 
-            # 3. Direct Relationships (Incoming & Outgoing)
+            # 3. Direct Relationships (Incoming & Outgoing - Exact endpoint match)
             edge_rows = conn.execute(
-                "SELECT edge_id, source_id, target_id, relation_type, observed_at, confidence, evidence_hashes_json FROM graph_edges WHERE source_id IN (?, ?, ?) OR target_id IN (?, ?, ?)",
-                (canon_uri, legacy_node, cval, canon_uri, legacy_node, cval),
+                f"""
+                SELECT edge_id, source_id, target_id, relation_type, observed_at, confidence, evidence_hashes_json
+                FROM graph_edges
+                WHERE source_id IN ({placeholders_nodes}) OR target_id IN ({placeholders_nodes})
+                """,
+                cand_list + cand_list,
             ).fetchall()
 
             relationships = []
@@ -541,15 +579,50 @@ class AnieIntelligenceClient:
                     "evidence_hashes": e_hashes,
                 })
 
-            # 4. Underlying Observations
-            obs_rows = conn.execute(
-                "SELECT observation_id, evidence_id, subject, kind, observed_at, status, source_id, payload FROM real_observations WHERE subject = ? OR subject LIKE ?",
-                (cval, f"%{cval}%"),
+            # 4. Underlying Observations (Strict Provenance Isolation: NO substring LIKE)
+            obs_dict: dict[str, Any] = {}
+            # Match observations where subject exactly equals cval or cval with trailing dot
+            exact_subj_rows = conn.execute(
+                """
+                SELECT observation_id, evidence_id, subject, kind, observed_at, status, source_id, payload
+                FROM real_observations
+                WHERE subject = ? OR subject = ?
+                """,
+                (cval, f"{cval}."),
             ).fetchall()
+            for orow in exact_subj_rows:
+                obs_dict[orow[0]] = orow
+
+            # If evidence hashes exist (from incoming edges or claims for this entity), pull linked observations
+            if evidence_hashes:
+                hash_list = list(evidence_hashes)
+                for i in range(0, len(hash_list), 500):
+                    chunk = hash_list[i : i + 500]
+                    placeholders_chunk = ",".join("?" for _ in chunk)
+                    linked_rows = conn.execute(
+                        f"""
+                        SELECT o.observation_id, o.evidence_id, o.subject, o.kind, o.observed_at, o.status, o.source_id, o.payload
+                        FROM real_observations o
+                        JOIN real_events e ON o.evidence_id = e.event_id
+                        WHERE e.raw_sha256 IN ({placeholders_chunk})
+                        """,
+                        chunk,
+                    ).fetchall()
+                    for lrow in linked_rows:
+                        # For IP entities, verify that the observation payload actually contains this IP in values
+                        if etype in ("ipv4", "ipv6"):
+                            payload_data = json.loads(lrow[7]) if lrow[7] else {}
+                            vals = [str(v).strip().lower() for v in payload_data.get("values", [])]
+                            if cval.lower() in vals:
+                                obs_dict[lrow[0]] = lrow
+                        else:
+                            # For domain or other entities, verify exact subject match
+                            if lrow[2].strip().lower().rstrip(".") == cval.strip().lower():
+                                obs_dict[lrow[0]] = lrow
 
             obs_list = []
             event_ids = set()
-            for orow in obs_rows:
+            for orow in obs_dict.values():
                 event_ids.add(orow[1])
                 obs_list.append({
                     "observation_id": orow[0],
@@ -565,22 +638,25 @@ class AnieIntelligenceClient:
             # 5. Raw Forensic Events
             events_list = []
             if event_ids:
-                placeholders = ",".join("?" for _ in event_ids)
-                event_rows = conn.execute(
-                    f"SELECT event_id, subject, kind, observed_at, response_code, raw_sha256, payload FROM real_events WHERE event_id IN ({placeholders})",
-                    list(event_ids),
-                ).fetchall()
+                event_id_list = list(event_ids)
+                for i in range(0, len(event_id_list), 500):
+                    chunk = event_id_list[i : i + 500]
+                    placeholders_ev = ",".join("?" for _ in chunk)
+                    event_rows = conn.execute(
+                        f"SELECT event_id, subject, kind, observed_at, response_code, raw_sha256, payload FROM real_events WHERE event_id IN ({placeholders_ev})",
+                        chunk,
+                    ).fetchall()
 
-                for er in event_rows:
-                    events_list.append({
-                        "event_id": er[0],
-                        "subject": er[1],
-                        "kind": er[2],
-                        "observed_at": er[3],
-                        "response_code": er[4],
-                        "raw_sha256": er[5],
-                        "payload": json.loads(er[6]) if er[6] else {},
-                    })
+                    for er in event_rows:
+                        events_list.append({
+                            "event_id": er[0],
+                            "subject": er[1],
+                            "kind": er[2],
+                            "observed_at": er[3],
+                            "response_code": er[4],
+                            "raw_sha256": er[5],
+                            "payload": json.loads(er[6]) if er[6] else {},
+                        })
 
         now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         return EntityProvenanceBundle(
@@ -600,34 +676,64 @@ class AnieIntelligenceClient:
         as_of: str | None = None,
         min_confidence: float = 0.0,
         layer: str | None = None,
+        cursor: str | None = None,
+        limit: int = DEFAULT_PAGE_SIZE,
+        fetch_all: bool = False,
     ) -> CanonicalIocFeed:
-        """Export standardized Canonical Threat Intelligence IOC Feed."""
-        res = self.query_claims(
-            min_confidence=min_confidence,
-            layer=layer,
-            as_of=as_of,
-            limit=MAX_PAGE_SIZE,
-        )
+        """Export standardized Canonical Threat Intelligence IOC Feed with bounded pagination."""
+        bounded_limit = max(1, min(limit, MAX_PAGE_SIZE))
+        all_indicators: list[dict[str, Any]] = []
+        curr_cursor = cursor
+        has_more_feed = False
+        next_cursor_feed = None
 
-        indicators = []
-        for claim in res.items:
-            etype = parse_entity_uri(claim["subject_uri"])[0]
-            indicators.append({
-                "indicator_id": f"ioc:{claim['claim_id']}",
-                "indicator_uri": claim["subject_uri"],
-                "entity_uri": claim["subject_uri"],
-                "ioc_type": etype,
-                "entity_type": etype,
-                "claim_type": claim["claim_type"],
-                "epistemic_status": claim["verification_state"],
-                "confidence": claim["confidence"],
-                "confidence_type": claim["confidence_type"],
-                "confidence_disclaimer": claim["confidence_disclaimer"],
-                "ruleset_version": claim["ruleset_version"],
-                "explanation": claim["explanation"],
-                "asserted_at": claim["asserted_at"],
-                "supporting_evidence_hashes": claim["supporting_evidence_hashes"],
-            })
+        while True:
+            fetch_limit = MAX_PAGE_SIZE if fetch_all else bounded_limit
+            res = self.query_claims(
+                min_confidence=min_confidence,
+                layer=layer,
+                as_of=as_of,
+                cursor=curr_cursor,
+                limit=fetch_limit,
+            )
+
+            for claim in res.items:
+                etype = parse_entity_uri(claim["subject_uri"])[0]
+                vstate = claim["verification_state"]
+                if vstate == ClaimVerificationState.ATTESTED_ASSERTION.value:
+                    indicator_category = "validated_threat_indicator"
+                elif vstate in (ClaimVerificationState.UNVERIFIED_HYPOTHESIS.value, "HYPOTHESIS"):
+                    indicator_category = "infrastructure_observation"
+                else:
+                    indicator_category = "contested_or_revoked_observation"
+
+                all_indicators.append({
+                    "indicator_id": f"ioc:{claim['claim_id']}",
+                    "indicator_uri": claim["subject_uri"],
+                    "entity_uri": claim["subject_uri"],
+                    "ioc_type": etype,
+                    "entity_type": etype,
+                    "indicator_category": indicator_category,
+                    "maliciousness_inferred": False,
+                    "claim_type": claim["claim_type"],
+                    "epistemic_status": vstate,
+                    "confidence": claim["confidence"],
+                    "confidence_type": claim["confidence_type"],
+                    "confidence_disclaimer": claim["confidence_disclaimer"],
+                    "ruleset_version": claim["ruleset_version"],
+                    "explanation": claim["explanation"],
+                    "asserted_at": claim["asserted_at"],
+                    "supporting_evidence_hashes": claim["supporting_evidence_hashes"],
+                })
+
+            if not fetch_all:
+                has_more_feed = res.has_more
+                next_cursor_feed = res.next_cursor
+                break
+            else:
+                if not res.has_more or not res.next_cursor:
+                    break
+                curr_cursor = res.next_cursor
 
         now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         feed_as_of = as_of or now_iso
@@ -636,6 +742,9 @@ class AnieIntelligenceClient:
             schema=IOC_FEED_SCHEMA,
             generated_at=now_iso,
             as_of=feed_as_of,
-            total_indicators=len(indicators),
-            indicators=indicators,
+            total_indicators=len(all_indicators),
+            indicators=all_indicators,
+            next_cursor=next_cursor_feed,
+            has_more=has_more_feed,
+            limit=bounded_limit if not fetch_all else None,
         )

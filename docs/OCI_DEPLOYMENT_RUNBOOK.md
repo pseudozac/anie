@@ -1,12 +1,12 @@
 # ANIE — Oracle Cloud Infrastructure (OCI) Deployment Runbook
 ## Ampere A1 Engine Migration & Safe Collector Transition
 
-- **Document Version:** 1.0 (Milestone 3.5)
+- **Document Version:** 1.1 (Milestone 3.5.1)
 - **Target Region:** `ap-hyderabad-1` (Hyderabad, India)
 - **Instance Profile:** `VM.Standard.A1.Flex` (ARM64 Ampere Altra)
-- **Target Allocation:** 2 OCPUs, 12 GiB RAM, 50 GB Boot Volume (Always Free Tier)
-- **Cost Impact:** **$0.00 / ₹0.00 per month** (100% within the 4 OCPU / 24 GiB Always Free allowance)
-- **Preservation Mandate:** Current collector `anie-collector-01` (`129.225.109.227`, E2.1.Micro) must remain completely untouched during staging.
+- **Target Allocation:** 2 OCPUs, 12 GiB RAM, 50 GB Boot Volume
+- **Cost Impact:** $0.00 / ₹0.00 per month *only when strictly within Always Free tenancy allowances* (consumes 50% of the tenancy's 4 OCPU / 24 GiB Ampere allowance). Standard paid rates apply if allowances are exceeded.
+- **Preservation Mandate:** Current collector `anie-collector-01` (`129.225.109.227`, E2.1.Micro) must remain completely untouched during staging. Zero live mutations or collection runs on host.
 
 ---
 
@@ -162,13 +162,44 @@ To prevent any disruption or loss of pilot state:
 
 ---
 
-## 5. Cost Analysis Breakdown
+## 5. Tenancy Allowance, Tier Architecture & Cost Governance
 
-| Resource | Shape / Allocation | Monthly Usage | Cost (INR / USD) |
+### 5.1 Free Allowance vs. Paid Tier Differentiation
+
+OCI provisions different Always Free allowances by compute architecture:
+
+| Tier / Shape Profile | Free Tenancy Allowance | Allocation in ANIE Staging | Tenancy Allowance Impact |
 | :--- | :--- | :--- | :--- |
-| **Compute Core (Ampere A1)** | 2 OCPUs | 1,488 OCPU-hours (Within 3,000 Free Limit) | **₹0.00 / $0.00** |
-| **Memory (Ampere A1)** | 12 GiB RAM | 8,928 GB-hours (Within 18,000 Free Limit) | **₹0.00 / $0.00** |
-| **Boot Volume** | 50 GB Balanced NVMe | 50 GB-months (Within 200 GB Free Limit) | **₹0.00 / $0.00** |
-| **Outbound Data Transfer** | ~500 MB / month DoH | 0.5 GB (Within 10 TB Free Limit) | **₹0.00 / $0.00** |
-| **Public IPv4** | 1 Reserved / Ephemeral | 744 hours (Free on Always Free Instance) | **₹0.00 / $0.00** |
-| **Total Monthly Cost** | — | — | **$0.00 (Free Forever)** |
+| **Ampere A1 (`VM.Standard.A1.Flex`)** | 4 OCPUs & 24 GiB RAM total per tenancy | 2 OCPUs & 12 GiB RAM (`anie-engine-01`) | **Consumes 50%** of tenancy A1 allowance. |
+| **AMD Micro (`VM.Standard.E2.1.Micro`)** | 2 instances (1/8 OCPU, 1 GiB RAM each) | 1 instance (`anie-collector-01`, `129.225.109.227`) | **Consumes 50%** of tenancy AMD micro allowance. |
+| **Block Volume Storage** | 200 GB total boot/block storage | 50 GB boot volume | **Consumes 25%** of tenancy storage allowance. |
+| **Paid / Trial / PAYG Tiers** | Standard hourly meter after trial credits expire | None | $0 charges only while remaining within Free Tier allowances. |
+
+> [!WARNING]
+> **No Unconditional $0 Guarantee:** Zero billing is not unconditional or automatic. It is strictly contingent upon:
+> 1. Total tenancy compute allocation remaining within the combined 4 OCPU / 24 GiB limit for Ampere and 2 instances for AMD.
+> 2. Total boot and block volumes remaining $\le 200$ GB across all compartments.
+> 3. Not attaching billable resources (e.g. paid NAT gateways, secondary IPv4 addresses, cross-region transfers).
+
+### 5.2 Critical Billing Governance: OCI Budgets Are Alert-Only
+
+> [!CAUTION]
+> **OCI Budgets Do NOT Prevent Charges:**
+> OCI Budgets and Quotas are **alerting mechanisms only**. They send email or SNS notifications when actual or forecasted spend reaches a threshold (e.g. $1.00).
+> **OCI Budgets do NOT:**
+> - Automatically halt, stop, or suspend compute instances.
+> - Detach or delete billable block storage.
+> - Cap billing or prevent overage charges.
+>
+> If an operator provisions resources beyond Always Free allowances or if account status transitions to standard paid rates, charges will accrue continuously until the operator manually terminates the instances. Continuous, proactive tenancy audit via OCI CLI or console is mandatory.
+
+### 5.3 Staged Resource Cost Matrix (Within Allowance)
+
+| Resource | Shape / Allocation | Monthly Usage | Allowance Status | Nominal Cost |
+| :--- | :--- | :--- | :--- | :--- |
+| **Compute Core (Ampere A1)** | 2 OCPUs | 1,488 OCPU-hours | Within 3,000 OCPU-hr Free Limit | ₹0.00 / $0.00 |
+| **Memory (Ampere A1)** | 12 GiB RAM | 8,928 GB-hours | Within 18,000 GB-hr Free Limit | ₹0.00 / $0.00 |
+| **Boot Volume** | 50 GB Balanced NVMe | 50 GB-months | Within 200 GB-month Free Limit | ₹0.00 / $0.00 |
+| **Outbound Data Transfer** | ~500 MB / month DoH | 0.5 GB | Within 10 TB Free Limit | ₹0.00 / $0.00 |
+| **Public IPv4** | 1 Ephemeral | 744 hours | Free for active compute instance | ₹0.00 / $0.00 |
+| **Total Net Cost** | — | — | **Contingent on Free Eligibility** | **₹0.00 / $0.00** |

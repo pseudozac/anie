@@ -1953,19 +1953,18 @@ class AegisReleaseConsumer:
         pub_id = res.get("publisher_identity") or publisher_id
         manifest_hash = res.get("manifest_sha256")
 
-        # Atomic consumer store persistence (M3.3.2 & M3.5)
+        # Atomic consumer store persistence (M3.3.2, M3.5 & M3.5.1)
         if self.store is not None and seq is not None and pub_id is not None:
             self.store.ingest_release_bundle(
                 observations=observations,
                 events=events,
                 discrepancies=discrepancies,
+                claims=claims,
                 publisher=pub_id,
                 release_sequence=seq,
                 manifest_sha256=manifest_hash or "",
                 is_historical=allow_rollback,
             )
-            for c in claims:
-                self.store.insert_claim(c)
 
         # Optional consumer persistence callback
         if persist_callback is not None:

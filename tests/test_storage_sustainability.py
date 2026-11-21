@@ -184,6 +184,92 @@ class TestStorageSustainability(unittest.TestCase):
         self.assertGreater(p365["estimated_db_mb"], p30["estimated_db_mb"])
         self.assertGreater(p365["total_observations"], p30["total_observations"])
 
+    def test_safe_prune_preserves_released_evidence(self):
+        now_dt = datetime(2026, 11, 20, 12, 0, 0, tzinfo=timezone.utc)
+        old_time = (now_dt - timedelta(days=120)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        # Create old record that is part of a signed release bundle
+        obs_rel, evt_rel = _create_record("released-evidence.com", old_time, ip="192.0.2.77")
+        self.store.ingest_release_bundle(
+            observations=[obs_rel],
+            events=[evt_rel],
+            discrepancies=[],
+            claims=[],
+            publisher="anie-first-party",
+            release_sequence=1,
+            manifest_sha256="b" * 64,
+        )
+
+        # Also create an unreleased old record
+        obs_unrel, evt_unrel = _create_record("unreleased-old.com", old_time, ip="192.0.2.88")
+        self.store.insert_record(evt_unrel, obs_unrel)
+
+        policy = RetentionPolicy(observation_ttl_days=90, event_ttl_days=90, protect_released_evidence=True)
+        summary = safe_prune_retention(self.store, policy=policy, now=now_dt)
+
+        # Released evidence must be kept; unreleased must be pruned
+        self.assertEqual(summary["pruned_observations"], 1)
+        self.assertEqual(summary["protected_observations_kept"], 1)
+        remaining_ids = {o.observation_id for o in self.store.all_observations()}
+        self.assertIn(obs_rel.observation_id, remaining_ids)
+        self.assertNotIn(obs_unrel.observation_id, remaining_ids)
+
+    def test_revoked_claim_does_not_protect_evidence(self):
+        now_dt = datetime(2026, 11, 20, 12, 0, 0, tzinfo=timezone.utc)
+        old_time = (now_dt - timedelta(days=120)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        obs_revoked, evt_revoked = _create_record("revoked-claim.com", old_time, ip="192.0.2.99")
+        self.store.insert_record(evt_revoked, obs_revoked)
+
+        # Insert REVOKED claim referencing this evidence
+        revoked_claim = IntelligenceClaim(
+            subject_uri="anie:entity:domain:revoked-claim.com",
+            claim_type="INFRASTRUCTURE_TRANSITION",
+            layer="HYPOTHESIS",
+            asserted_at=now_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            valid_from=old_time,
+            valid_until=None,
+            confidence=0.1,
+            ruleset_version="anie.rules.v1",
+            explanation="Revoked hypothesis",
+            supporting_evidence_hashes=(evt_revoked.raw_sha256,),
+            supporting_node_ids=("anie:entity:domain:revoked-claim.com",),
+            verification_state=ClaimVerificationState.REVOKED.value,
+        )
+        self.store.insert_claim(revoked_claim)
+
+        policy = RetentionPolicy(observation_ttl_days=90, event_ttl_days=90, protect_claimed_evidence=True)
+        summary = safe_prune_retention(self.store, policy=policy, now=now_dt)
+
+        # Revoked claim should NOT protect evidence -> observation is pruned
+        self.assertEqual(summary["pruned_observations"], 1)
+        remaining_ids = {o.observation_id for o in self.store.all_observations()}
+        self.assertNotIn(obs_revoked.observation_id, remaining_ids)
+
+    def test_malformed_evidence_reference_fails_closed(self):
+        # Insert a corrupt claim with malformed payload directly into DB
+        with self.store._connect() as conn:
+            conn.execute("""
+                INSERT INTO intelligence_claims (
+                    claim_id, subject_uri, claim_type, layer, asserted_at, valid_from,
+                    confidence, ruleset_version, explanation,
+                    supporting_evidence_hashes_json, supporting_node_ids_json, payload
+                ) VALUES ('claim_corrupt', 'anie:entity:domain:corrupt.com', 'CORRUPT', 'HYPOTHESIS',
+                          '2026-11-20T12:00:00Z', '2026-11-20T12:00:00Z', 0.5, 'v1', 'bad', '["bad_hash_len_12"]', '[]', 'NOT_VALID_JSON')
+            """)
+
+        # collect_protected_evidence_identifiers must fail closed (raise ValueError) instead of silently swallowing
+        with self.assertRaises(ValueError):
+            collect_protected_evidence_identifiers(self.store)
+
+    def test_pilot_workload_450_daily_requests(self):
+        pilot = StorageGrowthModel.PROFILES[PROFILE_PILOT]
+        self.assertEqual(pilot.domains, 25)
+        self.assertEqual(pilot.resolvers, 3)
+        self.assertEqual(pilot.queries_per_day_per_domain, 6)
+        self.assertEqual(pilot.daily_observations, 450)
+
+
 
 if __name__ == "__main__":
     unittest.main()
