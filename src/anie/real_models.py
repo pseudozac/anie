@@ -45,6 +45,31 @@ _HEX_64 = re.compile(r"^[0-9a-f]{64}$")
 _SOURCE = re.compile(r"^[a-zA-Z0-9_.:-]{1,80}$")
 _EVENT_ID = re.compile(r"^event_[0-9a-f]{64}$")
 
+AUTHORIZED_COLLECTOR_PREFIXES: tuple[str, ...] = (
+    "first_party:",
+    "oracle-collector-01",
+    "anie-collector-01",
+    "anie_collector",
+    "operator_",
+    "local_test",
+    "test_collector",
+)
+
+
+def is_authorized_collector_source(
+    source_id: str,
+    *,
+    custom_allowed_sources: set[str] | None = None,
+) -> bool:
+    """Validate that a source_id represents an authentic authorized first-party collector."""
+    if not source_id or not isinstance(source_id, str):
+        return False
+    if source_id.startswith("synthetic:"):
+        return False
+    if custom_allowed_sources and source_id in custom_allowed_sources:
+        return True
+    return any(source_id.startswith(p) for p in AUTHORIZED_COLLECTOR_PREFIXES)
+
 
 @dataclass(frozen=True)
 class FactualVerification:

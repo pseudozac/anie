@@ -217,6 +217,8 @@ class TemporalIntelligenceEngine:
             return claims
 
         observations = [RealObservation.from_dict(json.loads(r[0])) for r in obs_rows]
+        if as_of is None and observations:
+            now_iso = max(o.observed_at for o in observations)
 
         # 2. Fetch all linking evidence events
         ev_ids = list({o.evidence_id for o in observations})
@@ -1023,6 +1025,8 @@ class TemporalIntelligenceEngine:
             ).fetchall()
 
         observations = [RealObservation.from_dict(json.loads(r[0])) for r in obs_rows]
+        if as_of is None and observations:
+            now_iso = max(o.observed_at for o in observations)
         ev_ids = list({o.evidence_id for o in observations})
         events_by_id: dict[str, RealCollectionEvent] = {}
         if ev_ids:

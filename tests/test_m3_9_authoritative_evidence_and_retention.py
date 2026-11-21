@@ -169,7 +169,8 @@ class TestM39AuthoritativeEvidenceAndRetention(unittest.TestCase):
             types = {t[0] for t in tombstones}
             self.assertEqual(types, {"observation", "event"})
             for t in tombstones:
-                self.assertEqual(t[2], "operator_token_2026")
+                self.assertTrue(t[2].startswith("auth_sha256_"))
+                self.assertNotIn("operator_token_2026", t[2])  # Strict zero plaintext credential storage
 
     def test_rebuild_derived_indexes(self):
         """Verify that derived graph nodes and edges can be dropped and rebuilt deterministically."""

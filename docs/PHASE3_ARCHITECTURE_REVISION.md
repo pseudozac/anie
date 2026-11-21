@@ -3,8 +3,8 @@
 **Project:** Autonomous Network Intelligence Engine (ANIE)  
 **Document:** `docs/PHASE3_ARCHITECTURE_REVISION.md`  
 **Baseline Commit:** `a532322bbdbabccf175e283d293ac9c35631b543`  
-**Current Accepted Baseline:** Milestone M3.9 Feature Complete (Pending PR Merge)  
-**Status:** Phase 3 Milestones M3.1 through M3.9 Completed & Verified  
+**Current Accepted Baseline:** Milestone M3.10 Feature Complete  
+**Status:** Phase 3 Milestones M3.1 through M3.10 Completed & Verified  
 **Licensing:** Apache 2.0 Open Source Core  
 
 ---
@@ -165,7 +165,8 @@ Milestone M3.1 resolves the confirmed operational security defects identified du
 | **M3.6** | **RDAP Enrichment & BGP Routing Graph**<br>- RFC 9224/9082 bootstrap discovery & IANA delegation<br>- BGP origin-AS attribution and `PREFIX_MEMBER` edges<br>- Legitimate CDN, Anycast, and Dynamic DNS false-positive controls | Strictly bounded parsing; offline fixture replay; determinism and uncertainty preserved. | **COMPLETED** (PR #35, `f864834`) |
 | **M3.7** | **TLS Certificate Graph & Knowledge Hardening**<br>- Passive and active TLS x509 SAN parsing<br>- Live `SERVES_CERTIFICATE` fact edges requiring verified handshake<br>- Certificate SAN correlation and path traversal hardening | No synthetic certificate injection; vault export sanitize path traversal; deterministic graph rebuild. | **COMPLETED** (PR #36, `9b3e30d`) |
 | **M3.8** | **Passive HTTP Metadata & Competing Hypotheses**<br>- Bounded HTTP/1.1 and HTTP/2 response metadata normalization<br>- Competing Hypothesis Engine with corroboration scoring<br>- Markdown Obsidian knowledge vault export (`.obsidian/vault`) | Bounded header parsing; sensitive fields excluded; memory-bounded SHA-256 wire digests. | **COMPLETED** (PR #36, `6352bc6`) |
-| **M3.9** | **Cross-Vector Intelligence Correlation & AEGIS Contract V2**<br>- DNS + TLS + HTTP bounded cross-vector correlation engine<br>- Temporal correlation $\neq$ causation distinction; competing explanations<br>- Authoritative evidence resolution; non-destructive retention lifecycle<br>- `anie.consumer-contract.v2` & `anie.cross-vector-finding-feed.v2` | Every evidence ref must resolve to authoritative record; user hashes alone never authenticate; 100% backward compatibility. | **COMPLETED** (M3.9) |
+| **M3.9** | **Cross-Vector Intelligence Correlation & AEGIS Contract V2**<br>- DNS + TLS + HTTP bounded cross-vector correlation engine<br>- Temporal correlation $\neq$ causation distinction; competing explanations<br>- Authoritative evidence resolution; non-destructive retention lifecycle<br>- `anie.consumer-contract.v2` & `anie.cross-vector-finding-feed.v2` | Every evidence ref must resolve to authoritative record; user hashes alone never authenticate; 100% backward compatibility. | **COMPLETED** (PR #39, `ba267fc`) |
+| **M3.10** | **End-to-End Intelligence Verification & Consumer Integration Readiness**<br>- Phase A Authoritative Evidence Audit & Retention Hardening (preimage check, authorized sources, sanitized tombstones, deterministic rebuild)<br>- Phase B Signed Release Pipeline with `real_findings.jsonl.gz` & Adversarial Fault Injection<br>- Phase C AEGIS Consumer Contract V2 Frozen Fixtures & Zero-Dependency Demo Client<br>- Phase D 1 GiB Micro VM Resource Envelope Verification | Cryptographic preimage checks; sanitized credentials in tombstones; offline Ed25519 signature & anti-rollback verification; fail-closed verification. | **COMPLETED** (M3.10) |
 
 ---
 
@@ -193,8 +194,9 @@ To preserve architectural focus and prevent premature complexity, the following 
 ## 8. Verification & Sign-Off
 
 - **Baseline Code Commit:** `a532322bbdbabccf175e283d293ac9c35631b543`
-- **Milestone M3.8 Acceptance Commit:** `6352bc65e6a81a535fa1d1de60ef0de4f0074d59`
-- **Unit & Integration Test Results:** 484 tests (483 passed, 0 failed, 1 skipped; 100% pass rate).
+- **Milestone M3.9 Acceptance Commit:** `ba267fcffc0f55a57a006c05eaaabf3231091efa`
+- **Milestone M3.10 Acceptance Commit:** Feature Branch `feat/m3.10-verification-and-consumer-readiness`
+- **Unit & Integration Test Results:** 495 tests (494 passed, 0 failed, 1 skipped; 100% pass rate).
 - **Security Preflight & Sandbox Tests:** 18 passed, 0 failed.
 - **Multi-Resolver & Discrepancy Tests:** 21 passed, 0 failed.
 - **Temporal Graph & ML Drift Tests:** 26 passed, 0 failed.
@@ -203,6 +205,7 @@ To preserve architectural focus and prevent premature complexity, the following 
 - **TLS Certificate Handshake Tests:** 28 passed, 0 failed.
 - **HTTP Enrichment & Hypothesis Tests:** 15 passed, 0 failed.
 - **Cross-Vector Correlation & Contract V2 Tests:** 14 passed, 0 failed.
+- **M3.10 Verification & Readiness Tests:** 11 passed, 0 failed.
 - **Repository Structural Guardrails (`tools/check_repo.py`):** 100% PASS.
 - **Live VM Collector State:** Quiescent on `anie-collector-01` (`129.225.109.227`), `anie-pilot.timer` disabled, sentinel active, 100% Phase 2 evidence preserved at ₹0.00 / $0.00 cost.
 - **Ampere A1 Capacity Acquisition Runner:** Operating autonomously under Windows Task Scheduler (`ANIE_Ampere_A1_Capacity_Retry`), hourly rate governor, 7-day expiration ceiling.

@@ -88,7 +88,7 @@ TRACKER_SCHEMA = TRACKER_SCHEMA_V2
 TRACKER_SCHEMAS = frozenset({TRACKER_SCHEMA_V1, TRACKER_SCHEMA_V2})
 
 REQUIRED_PARTITION_FILES = frozenset({"real_observations.jsonl.gz", "real_events.jsonl.gz"})
-OPTIONAL_PARTITION_FILES = frozenset({"real_discrepancies.jsonl.gz", "real_claims.jsonl.gz"})
+OPTIONAL_PARTITION_FILES = frozenset({"real_discrepancies.jsonl.gz", "real_claims.jsonl.gz", "real_findings.jsonl.gz"})
 ALLOWED_PARTITION_FILES = REQUIRED_PARTITION_FILES | OPTIONAL_PARTITION_FILES
 REAL_PARTITION_FILES = REQUIRED_PARTITION_FILES
 
@@ -278,6 +278,7 @@ def export_canonical_dataset(
     *,
     include_discrepancies: bool = False,
     include_claims: bool = False,
+    include_findings: bool = False,
 ) -> tuple[Any, ...]:
     """Export a consistent SQLite snapshot of real observations and referenced events.
     
@@ -373,7 +374,7 @@ def export_canonical_dataset(
                     f"missing collection events (sample: {sorted(missing_evidence)[:3]})"
                 )
 
-            if not include_discrepancies and not include_claims:
+            if not include_discrepancies and not include_claims and not include_findings:
                 conn.commit()
                 return observations, events
 
@@ -450,7 +451,39 @@ def export_canonical_dataset(
                         claim_obj = IntelligenceClaim.from_dict(raw_c)
                         claims.append(claim_obj)
 
+            # Export cross-vector findings if requested
+            findings: list[Any] = []
+            if include_findings:
+                findings_table_check = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cross_vector_findings'"
+                ).fetchone()
+                if findings_table_check is not None:
+                    finding_rows = conn.execute(
+                        """
+                        SELECT payload FROM cross_vector_findings
+                        WHERE asserted_at <= ?
+                        ORDER BY asserted_at ASC, finding_id ASC
+                        LIMIT ?
+                        """,
+                        (as_of_iso, limit + 1),
+                    ).fetchall()
+
+                    if len(finding_rows) > limit:
+                        raise ValueError(
+                            f"dataset exceeds maximum partition limit of {limit} findings "
+                            f"(found >{limit} records at or before as_of '{as_of_iso}'); "
+                            f"silent truncation rejected"
+                        )
+
+                    from .cross_vector_correlation import CrossVectorFinding
+                    for (f_json,) in finding_rows:
+                        raw_f = json.loads(f_json)
+                        finding_obj = CrossVectorFinding.from_dict(raw_f)
+                        findings.append(finding_obj)
+
             conn.commit()
+            if include_findings:
+                return observations, events, discrepancies, claims, findings
             if include_claims:
                 return observations, events, discrepancies, claims
             return observations, events, discrepancies
@@ -472,8 +505,10 @@ def publish_real(
     limit: int = MAX_RECORDS_PER_PARTITION,
     include_discrepancies: bool = False,
     include_claims: bool = False,
+    include_findings: bool = False,
     discrepancies: list[RealDiscrepancyReport] | None = None,
     claims: list[IntelligenceClaim] | None = None,
+    findings: list[Any] | None = None,
 ) -> dict[str, Any]:
     """Publish a deterministic, canonical real-world intelligence dataset.
     
@@ -505,10 +540,22 @@ def publish_real(
 
     disc_list: list[RealDiscrepancyReport] | None = discrepancies
     claim_list: list[IntelligenceClaim] | None = claims
+    finding_list: list[Any] | None = findings
     if isinstance(store_or_data, RealObservationStore):
         want_discs = include_discrepancies or discrepancies is not None
         want_claims = include_claims or claims is not None
-        if want_claims:
+        want_findings = include_findings or findings is not None
+        if want_findings:
+            exp_res = export_canonical_dataset(
+                store_or_data,
+                as_of_iso,
+                limit=limit,
+                include_discrepancies=want_discs,
+                include_claims=want_claims,
+                include_findings=True,
+            )
+            observations, events, disc_list, claim_list, finding_list = exp_res
+        elif want_claims:
             exp_res = export_canonical_dataset(
                 store_or_data,
                 as_of_iso,
@@ -527,16 +574,18 @@ def publish_real(
         else:
             observations, events = export_canonical_dataset(store_or_data, as_of_iso, limit=limit, include_discrepancies=False)  # type: ignore[misc]
     elif isinstance(store_or_data, tuple):
-        if len(store_or_data) == 4:
+        if len(store_or_data) == 5:
+            observations, events, disc_list, claim_list, finding_list = store_or_data  # type: ignore[misc]
+        elif len(store_or_data) == 4:
             observations, events, disc_list, claim_list = store_or_data  # type: ignore[misc]
         elif len(store_or_data) == 3:
             observations, events, disc_list = store_or_data  # type: ignore[misc]
         elif len(store_or_data) == 2:
             observations, events = store_or_data  # type: ignore[misc]
         else:
-            raise TypeError("store_or_data tuple must have length 2, 3, or 4")
+            raise TypeError("store_or_data tuple must have length 2, 3, 4, or 5")
     else:
-        raise TypeError("store_or_data must be RealObservationStore or (observations, events[, discrepancies, claims]) tuple")
+        raise TypeError("store_or_data must be RealObservationStore or (observations, events[, discrepancies, claims, findings]) tuple")
 
     if not observations:
         raise ValueError("cannot publish empty observation dataset")
@@ -598,6 +647,7 @@ def publish_real(
         partition_files = [obs_meta, ev_meta]
         has_discrepancies = disc_list is not None and len(disc_list) > 0
         has_claims = claim_list is not None and len(claim_list) > 0
+        has_findings = finding_list is not None and len(finding_list) > 0
 
         if has_discrepancies:
             disc_records = (d.to_dict() for d in disc_list)
@@ -609,11 +659,16 @@ def publish_real(
             claim_meta = _write_deterministic_gzip(staging_path / "real_claims.jsonl.gz", claim_records)
             partition_files.append(claim_meta)
 
+        if has_findings:
+            finding_records = (f.to_dict() if hasattr(f, "to_dict") else f for f in finding_list)
+            finding_meta = _write_deterministic_gzip(staging_path / "real_findings.jsonl.gz", finding_records)
+            partition_files.append(finding_meta)
+
         commit_val = source_commit or ("0" * 40)
         if not _COMMIT_RE.fullmatch(commit_val):
             raise ValueError(f"invalid source_commit: {commit_val!r} (must be 40-character hex)")
 
-        if has_claims:
+        if has_findings or has_claims:
             manifest_schema = REAL_MANIFEST_SCHEMA_V4
         elif has_discrepancies:
             manifest_schema = REAL_MANIFEST_SCHEMA_V3
@@ -642,6 +697,8 @@ def publish_real(
             manifest["total_discrepancies"] = len(disc_list)
         if has_claims:
             manifest["total_claims"] = len(claim_list)
+        if has_findings:
+            manifest["total_findings"] = len(finding_list)
 
         manifest_path = staging_path / "manifest.json"
         manifest_path.write_text(canonical_json(manifest) + "\n", encoding="utf-8")
@@ -689,8 +746,8 @@ def _read_and_validate_manifest(directory: Path) -> tuple[bytes, str, dict[str, 
                 raise ValueError(f"invalid prev_manifest_sha256 in v2/v3/v4 manifest: {prev_sha!r}")
 
     files = manifest.get("files")
-    if not isinstance(files, list) or len(files) not in (2, 3, 4):
-        raise ValueError("manifest must specify 2, 3, or 4 partition files")
+    if not isinstance(files, list) or len(files) not in (2, 3, 4, 5):
+        raise ValueError("manifest must specify 2, 3, 4, or 5 partition files")
     found_files = {f.get("file") for f in files}
     if not REQUIRED_PARTITION_FILES.issubset(found_files) or not found_files.issubset(ALLOWED_PARTITION_FILES):
         raise ValueError(f"unexpected manifest partition files: {found_files}")
@@ -704,6 +761,11 @@ def _read_and_validate_manifest(directory: Path) -> tuple[bytes, str, dict[str, 
             raise ValueError("releases containing real_claims.jsonl.gz must use V4 manifest schema")
         if "total_claims" not in manifest or not isinstance(manifest.get("total_claims"), int) or manifest.get("total_claims") < 0:
             raise ValueError("manifest with real_claims.jsonl.gz must specify valid non-negative integer total_claims")
+    if "real_findings.jsonl.gz" in found_files:
+        if manifest.get("schema") != REAL_MANIFEST_SCHEMA_V4:
+            raise ValueError("releases containing real_findings.jsonl.gz must use V4 manifest schema")
+        if "total_findings" not in manifest or not isinstance(manifest.get("total_findings"), int) or manifest.get("total_findings") < 0:
+            raise ValueError("manifest with real_findings.jsonl.gz must specify valid non-negative integer total_findings")
 
     manifest_sha = sha256(raw_bytes).hexdigest()
     return raw_bytes, manifest_sha, manifest
@@ -711,12 +773,13 @@ def _read_and_validate_manifest(directory: Path) -> tuple[bytes, str, dict[str, 
 
 def sign_manifest_detached(
     directory: str | Path,
-    private_key: object,
+    private_key: object = None,
     *,
+    private_key_path: str | Path | None = None,
     key_id: str,
-    release_sequence: int,
-    issued_at: str,
-    expires_at: str,
+    release_sequence: int | None = None,
+    issued_at: str | None = None,
+    expires_at: str | None = None,
     publisher_identity: str = "anie-first-party",
     source_commit: str | None = None,
     prev_manifest_sha256: str | None = None,
@@ -732,15 +795,31 @@ def sign_manifest_detached(
     - Existing attestation files cannot be overwritten.
     """
     _, Ed25519PrivateKey, _, _ = _crypto()
+    if private_key is None and private_key_path is not None:
+        private_key = load_private_key_file(private_key_path)
+    elif isinstance(private_key, (str, Path)):
+        private_key = load_private_key_file(private_key)
+
     if not isinstance(private_key, Ed25519PrivateKey):
-        raise TypeError("private_key must be an instance of cryptography Ed25519PrivateKey")
+        raise TypeError("private_key must be an instance of cryptography Ed25519PrivateKey or valid key file path")
 
     if not isinstance(key_id, str) or not _KEY_ID_RE.fullmatch(key_id):
         raise ValueError(f"invalid key_id: {key_id!r}")
+
+    dir_path = Path(directory)
+    _, manifest_sha, manifest = _read_and_validate_manifest(dir_path)
+
+    if release_sequence is None:
+        release_sequence = manifest.get("release_sequence", 1)
     if not isinstance(release_sequence, int) or release_sequence < 1:
         raise ValueError(f"release_sequence must be >= 1: got {release_sequence}")
 
-    dir_path = Path(directory)
+    from datetime import timedelta
+    if issued_at is None:
+        issued_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if expires_at is None:
+        dt_issued = datetime.fromisoformat(issued_at.replace("Z", "+00:00"))
+        expires_at = (dt_issued + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
     _, manifest_sha, manifest = _read_and_validate_manifest(dir_path)
 
     # 1. Enforce publisher agreement
@@ -1258,6 +1337,7 @@ def verify_real_release(
     events_path = dir_path / "real_events.jsonl.gz"
     event_meta = files_map["real_events.jsonl.gz"]
     event_ids: set[str] = set()
+    event_hashes: set[str] = set()
     prev_event_order: tuple[str, str] | None = None
     event_count = 0
 
@@ -1290,6 +1370,7 @@ def verify_real_release(
             prev_event_order = current_order
 
             event_ids.add(event.event_id)
+            event_hashes.add(event.raw_sha256)
             event_count += 1
 
     if event_count != event_meta.get("records"):
@@ -1424,6 +1505,51 @@ def verify_real_release(
         if manifest.get("total_claims") != claim_count:
             raise ValueError(f"manifest total_claims ({manifest.get('total_claims')}) does not match actual count ({claim_count})")
 
+    # 4c. Bounded Streaming Decompression & Strict Model Reconstruction for Cross-Vector Findings (if present)
+    finding_count = 0
+    if "real_findings.jsonl.gz" in files_map:
+        finding_path = dir_path / "real_findings.jsonl.gz"
+        finding_meta = files_map["real_findings.jsonl.gz"]
+        prev_finding_order: tuple[str, str] | None = None
+
+        with gzip.open(finding_path, "rb") as gz:
+            for line_num, line_bytes in _iter_bounded_gzip_records(
+                gz,
+                max_record_bytes=MAX_SINGLE_RECORD_BYTES,
+                max_total_bytes=MAX_PARTITION_DECOMPRESSED_BYTES,
+                max_records=MAX_RECORDS_PER_PARTITION,
+                partition_name="real_findings.jsonl.gz",
+            ):
+                try:
+                    raw_dict = json.loads(line_bytes.decode("utf-8"))
+                except (ValueError, UnicodeDecodeError) as exc:
+                    raise ValueError(f"malformed JSON in real_findings line #{line_num}: {exc}") from exc
+
+                from .cross_vector_correlation import CrossVectorFinding
+                finding_obj = CrossVectorFinding.from_dict(raw_dict)
+                current_order = (finding_obj.asserted_at, finding_obj.finding_id)
+                if prev_finding_order is not None and current_order <= prev_finding_order:
+                    if current_order == prev_finding_order:
+                        raise ValueError(f"duplicate finding_id '{finding_obj.finding_id}' detected at line #{line_num}")
+                    raise ValueError(f"findings partition out of deterministic order at line #{line_num}: {current_order} <= {prev_finding_order}")
+                prev_finding_order = current_order
+
+                # Referential integrity: check supporting and contradicting evidence hashes exist in events
+                for hyp in finding_obj.competing_hypotheses:
+                    for h in hyp.supporting_evidence_hashes:
+                        if h not in event_hashes:
+                            raise ValueError(f"broken referential integrity: finding '{finding_obj.finding_id}' hypothesis references unknown event hash '{h}'")
+                    for h in hyp.contradicting_evidence_hashes:
+                        if h not in event_hashes:
+                            raise ValueError(f"broken referential integrity: finding '{finding_obj.finding_id}' hypothesis references unknown event hash '{h}'")
+
+                finding_count += 1
+
+        if finding_count != finding_meta.get("records"):
+            raise ValueError(f"record count mismatch for real_findings: expected {finding_meta.get('records')}, got {finding_count}")
+        if manifest.get("total_findings") is not None and manifest.get("total_findings") != finding_count:
+            raise ValueError(f"manifest total_findings ({manifest.get('total_findings')}) does not match actual count ({finding_count})")
+
     # 5. Integrity-Only Early Exit
     if integrity_only:
         return {
@@ -1442,6 +1568,7 @@ def verify_real_release(
             "total_events": event_count,
             "total_discrepancies": disc_count,
             "total_claims": claim_count,
+            "total_findings": finding_count,
             "manifest_sha256": manifest_sha,
             "publisher_identity": manifest.get("publisher"),
             "key_id": None,
@@ -1666,6 +1793,7 @@ def verify_real_release(
         "total_events": event_count,
         "total_discrepancies": disc_count,
         "total_claims": claim_count,
+        "total_findings": finding_count,
         "manifest_sha256": manifest_sha,
         "publisher_identity": payload["publisher"],
         "key_id": key_id,
