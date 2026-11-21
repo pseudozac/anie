@@ -62,6 +62,7 @@ class NodeType(str, Enum):
     ASN = "asn"
     CDN_PREFIX = "cdn_prefix"
     INTELLIGENCE_CLAIM = "claim"
+    CERTIFICATE = "certificate"
 
 
 class RelationType(str, Enum):
@@ -74,6 +75,9 @@ class RelationType(str, Enum):
     DISCREPANCY_FOR = "DISCREPANCY_FOR"
     DERIVED_FROM = "DERIVED_FROM"
     SUPPORTS_CLAIM = "SUPPORTS_CLAIM"
+    SERVES_CERTIFICATE = "SERVES_CERTIFICATE"
+    NAMES_DOMAIN = "NAMES_DOMAIN"
+    ISSUED_BY = "ISSUED_BY"
 
 
 def format_node_id(node_type: NodeType | str, canonical_name: str) -> str:
@@ -90,6 +94,9 @@ def format_node_id(node_type: NodeType | str, canonical_name: str) -> str:
     elif t_val in ("cdn_prefix", "prefix", "cidr"):
         norm_name = norm_name.lower()
         t_val = "cdn_prefix"
+    elif t_val in ("cert", "certificate"):
+        norm_name = norm_name.lower().replace("sha256:", "").replace(":", "")
+        t_val = "cert"
     else:
         norm_name = norm_name.lower()
     return f"anie:entity:{t_val}:{norm_name}"

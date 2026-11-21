@@ -27,6 +27,7 @@ ENTITY_TYPE_CIDR = "cidr"
 ENTITY_TYPE_RESOLVER = "resolver"
 ENTITY_TYPE_CLAIM = "claim"
 ENTITY_TYPE_DISCREPANCY = "discrepancy"
+ENTITY_TYPE_CERT = "cert"
 
 SUPPORTED_ENTITY_TYPES = frozenset({
     ENTITY_TYPE_DOMAIN,
@@ -37,6 +38,7 @@ SUPPORTED_ENTITY_TYPES = frozenset({
     ENTITY_TYPE_RESOLVER,
     ENTITY_TYPE_CLAIM,
     ENTITY_TYPE_DISCREPANCY,
+    ENTITY_TYPE_CERT,
 })
 
 
@@ -49,12 +51,14 @@ class EntityType(str, enum.Enum):
     RESOLVER = ENTITY_TYPE_RESOLVER
     CLAIM = ENTITY_TYPE_CLAIM
     DISCREPANCY = ENTITY_TYPE_DISCREPANCY
+    CERT = ENTITY_TYPE_CERT
 
 
 _ASN_REGEX = re.compile(r"^(?:AS|as)?(\d{1,10})$")
 _RESOLVER_REGEX = re.compile(r"^[a-z0-9][a-z0-9_.-]{1,63}$")
 _IDENTIFIER_REGEX = re.compile(r"^[a-zA-Z0-9_.-]{1,128}$")
 _LABEL_REGEX = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+_HEX_64_REGEX = re.compile(r"^[0-9a-f]{64}$")
 
 
 def canonicalize_domain(domain: str) -> str:
@@ -157,6 +161,19 @@ def canonicalize_identifier(ident_str: str) -> str:
     return clean
 
 
+def canonicalize_cert_fingerprint(fp_str: str) -> str:
+    """Canonicalize an X.509 certificate SHA-256 fingerprint to lowercase 64-hex string."""
+    if not fp_str or not isinstance(fp_str, str):
+        raise ValueError("certificate fingerprint must be a non-empty string")
+    clean = fp_str.strip().lower()
+    if clean.startswith("sha256:"):
+        clean = clean[7:]
+    clean = clean.replace(":", "").replace(" ", "").replace("-", "")
+    if not _HEX_64_REGEX.match(clean):
+        raise ValueError(f"invalid certificate SHA-256 fingerprint syntax: {fp_str!r}")
+    return clean
+
+
 def infer_entity_type(raw_value: str) -> str:
     """Infer the entity type of an unadorned input string."""
     val = raw_value.strip()
@@ -188,6 +205,13 @@ def infer_entity_type(raw_value: str) -> str:
     if val.startswith("discrepancy_") or val.startswith("discrepancy:"):
         return ENTITY_TYPE_DISCREPANCY
 
+    if val.startswith("cert:") or val.startswith("certificate:"):
+        return ENTITY_TYPE_CERT
+
+    clean_fp = val.lower().replace(":", "").replace(" ", "").replace("-", "")
+    if len(clean_fp) == 64 and _HEX_64_REGEX.match(clean_fp):
+        return ENTITY_TYPE_CERT
+
     # Default assumption for text strings with dots or alphabetic characters
     return ENTITY_TYPE_DOMAIN
 
@@ -197,6 +221,8 @@ def build_entity_uri(entity_type: str, value: Any) -> str:
     etype = entity_type.strip().lower()
     if etype in ("prefix", "cdn_prefix"):
         etype = ENTITY_TYPE_CIDR
+    elif etype in ("cert", "certificate"):
+        etype = ENTITY_TYPE_CERT
     if etype not in SUPPORTED_ENTITY_TYPES:
         raise ValueError(f"unsupported entity type: {entity_type!r}; expected one of {sorted(SUPPORTED_ENTITY_TYPES)}")
 
@@ -227,6 +253,8 @@ def build_entity_uri(entity_type: str, value: Any) -> str:
         if val_str.startswith("discrepancy_"):
             val_str = val_str[12:]
         cval = canonicalize_identifier(val_str)
+    elif etype == ENTITY_TYPE_CERT:
+        cval = canonicalize_cert_fingerprint(val_str)
     else:
         raise ValueError(f"unhandled entity type: {etype!r}")
 
@@ -263,6 +291,10 @@ def canonical_claim_uri(claim_id: str) -> str:
 
 def canonical_discrepancy_uri(disc_id: str) -> str:
     return build_entity_uri(ENTITY_TYPE_DISCREPANCY, disc_id)
+
+
+def canonical_cert_uri(fingerprint: str) -> str:
+    return build_entity_uri(ENTITY_TYPE_CERT, fingerprint)
 
 
 def parse_entity_uri(uri: str) -> Tuple[str, str]:
@@ -347,4 +379,6 @@ def node_id_to_canonical_uri(node_id: str, node_type: str) -> str:
         return canonical_claim_uri(node_id)
     elif ntype == "discrepancy":
         return canonical_discrepancy_uri(node_id)
+    elif ntype in ("cert", "certificate"):
+        return canonical_cert_uri(node_id)
     return build_entity_uri(infer_entity_type(node_id), node_id)
