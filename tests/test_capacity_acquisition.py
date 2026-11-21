@@ -16,6 +16,7 @@ from anie.capacity_retry import (
     CapacityAcquisitionConfig,
     CapacityAcquisitionManager,
     CrossPlatformLock,
+    OciProvisioner,
     OUTCOME_API_ERROR,
     OUTCOME_OUT_OF_CAPACITY,
     OUTCOME_SUCCESS,
@@ -190,6 +191,92 @@ class TestCapacityAcquisition(unittest.TestCase):
         # Second process can now acquire lock
         self.assertTrue(lock2.acquire())
         lock2.release()
+
+    def test_run_cycle_skips_when_cooldown_active(self):
+        # Record initial attempt at base_time
+        self.mgr.record_attempt(
+            OUTCOME_OUT_OF_CAPACITY,
+            error_message="Out of host capacity.",
+            now=self.base_time,
+        )
+
+        # Call run_cycle at base_time + 10m (cooldown active)
+        t_10m = self.base_time + timedelta(minutes=10)
+        result = self.mgr.run_cycle(now=t_10m)
+        self.assertFalse(result["cycle_executed"])
+        self.assertIn("rate-governor cooldown active", result["message"])
+
+    def test_run_cycle_idempotency_detects_existing_instance(self):
+        class MockProvisioner:
+            def resolve_resources(self, compartment_name, subnet_name):
+                return {
+                    "compartment_id": "ocid1.comp.mock",
+                    "availability_domain": "mock-ad",
+                    "subnet_id": "ocid1.subnet.mock",
+                    "image_id": "ocid1.image.mock",
+                }
+
+            def find_instance(self, compartment_id, instance_name):
+                return {
+                    "ocid": "ocid1.instance.mock.arm01",
+                    "id": "ocid1.instance.mock.arm01",
+                    "name": "anie-arm-01",
+                    "state": "RUNNING",
+                    "lifecycle_state": "RUNNING",
+                    "public_ip": "129.225.150.1",
+                    "private_ip": "10.42.1.200",
+                }
+
+            def attempt_launch(self, config, ssh_keys, resources):
+                raise AssertionError("attempt_launch should NOT be called when instance already exists!")
+
+        # Create dummy ssh public key in test state dir
+        key_pub = self.state_dir / "test.pub"
+        key_pub.write_text("ssh-rsa AAAAB3NzaC1yc2E test-key")
+
+        result = self.mgr.run_cycle(
+            provisioner=MockProvisioner(),
+            ssh_public_key_path=key_pub,
+            now=self.base_time,
+        )
+
+        self.assertTrue(result["cycle_executed"])
+        self.assertEqual(result["outcome"], OUTCOME_SUCCESS)
+        self.assertIn("Idempotency verified", result["message"])
+        self.assertEqual(self.mgr.state.status, STATE_ACQUIRED)
+        self.assertEqual(self.mgr.state.acquired_instance_ocid, "ocid1.instance.mock.arm01")
+
+    def test_run_cycle_submits_launch_and_records_capacity_exhaustion(self):
+        class MockProvisioner:
+            def resolve_resources(self, compartment_name, subnet_name):
+                return {
+                    "compartment_id": "ocid1.comp.mock",
+                    "availability_domain": "mock-ad",
+                    "subnet_id": "ocid1.subnet.mock",
+                    "image_id": "ocid1.image.mock",
+                }
+
+            def find_instance(self, compartment_id, instance_name):
+                return None  # Instance does not exist
+
+            def attempt_launch(self, config, ssh_keys, resources):
+                return OUTCOME_OUT_OF_CAPACITY, "Out of host capacity (500)", None
+
+        key_pub = self.state_dir / "test.pub"
+        key_pub.write_text("ssh-rsa AAAAB3NzaC1yc2E test-key")
+
+        result = self.mgr.run_cycle(
+            provisioner=MockProvisioner(),
+            ssh_public_key_path=key_pub,
+            now=self.base_time,
+        )
+
+        self.assertTrue(result["cycle_executed"])
+        self.assertEqual(result["outcome"], OUTCOME_OUT_OF_CAPACITY)
+        self.assertEqual(self.mgr.state.status, STATE_RETRYING)
+        self.assertEqual(self.mgr.state.total_attempts, 1)
+        expected_next = (self.base_time + timedelta(seconds=3600)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.assertEqual(self.mgr.state.next_eligible_at, expected_next)
 
 
 if __name__ == "__main__":
