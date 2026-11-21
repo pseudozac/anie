@@ -11,4 +11,6 @@ local-data/
 .env
 *.pem
 *.key
+*.pub
+.anie-capacity/
 .DS_Store
