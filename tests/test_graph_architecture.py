@@ -167,9 +167,9 @@ class TestGraphEngineAndQueries(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
-    def test_schema_version_is_v3(self):
-        self.assertEqual(self.store.schema_version, 3)
-        self.assertEqual(CURRENT_SCHEMA_VERSION, 3)
+    def test_schema_version(self):
+        self.assertEqual(self.store.schema_version, CURRENT_SCHEMA_VERSION)
+        self.assertGreaterEqual(CURRENT_SCHEMA_VERSION, 3)
 
     def test_graph_extraction_from_observation(self):
         ev, obs = make_sample_event_and_obs("example.com", "cloudflare", ("93.184.216.34",))

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -17,7 +18,59 @@ from anie.consumer_contract import (
     encode_cursor,
 )
 from anie.intelligence_evaluator import IntelligenceEvaluator
+from anie.real_models import (
+    FactualVerification,
+    RealCollectionEvent,
+    RealCollectionRequest,
+    RealObservation,
+)
 from anie.real_store import RealObservationStore
+
+
+def _make_record(subject: str, ip: str, observed_at: str = "2026-11-20T12:00:00Z") -> tuple[RealObservation, RealCollectionEvent]:
+    raw_payload = f"raw_{subject}_{ip}".encode("utf-8")
+    raw_hash = hashlib.sha256(raw_payload).hexdigest()
+    req = RealCollectionRequest.create(
+        kind="dns_a",
+        subject=subject,
+        observed_at=observed_at,
+        target_endpoint="https://cloudflare-dns.com/dns-query",
+        pinned_ip="1.1.1.1",
+    )
+    factual = FactualVerification(
+        dnssec_status="indeterminate",
+        response_authenticity="recursive",
+        transport_security="tls_pinned",
+        resolver_identity="cloudflare",
+        wire_rcode="NOERROR",
+        raw_evidence_status="captured",
+    )
+    event = RealCollectionEvent(
+        request=req,
+        response_code="ANSWER",
+        raw_sha256=raw_hash,
+        raw_evidence_status="captured",
+        factual_verification=factual,
+        source_id="first_party:doh:cloudflare",
+        observed_at=observed_at,
+        raw_payload=raw_payload,
+    )
+    obs = RealObservation(
+        subject=subject,
+        kind="dns_a",
+        observed_at=observed_at,
+        values=(ip,),
+        status="ok",
+        source_id="first_party:doh:cloudflare",
+        method="dns",
+        synthetic=False,
+        evidence_id=event.event_id,
+        factual_verification=factual,
+        ttl_seconds=300,
+        error_code=None,
+        confidence=None,
+    )
+    return obs, event
 
 
 class TestConsumerContract(unittest.TestCase):
@@ -131,7 +184,77 @@ class TestConsumerContract(unittest.TestCase):
             self.assertIn("entity_uri", ind)
             self.assertIn("entity_type", ind)
             self.assertIn("claim_type", ind)
+            self.assertIn("indicator_category", ind)
+            self.assertIn("maliciousness_inferred", ind)
+            self.assertFalse(ind["maliciousness_inferred"])
             self.assertGreaterEqual(ind["confidence"], 0.7)
+
+    def test_provenance_isolation_apex_vs_subdomain(self):
+        # Insert records for apex and subdomain
+        obs_apex, evt_apex = _make_record("example.com", "93.184.216.34")
+        obs_sub, evt_sub = _make_record("sub.example.com", "192.0.2.1")
+        self.store.insert_record(evt_apex, obs_apex)
+        self.store.insert_record(evt_sub, obs_sub)
+
+        # Provenance for apex domain MUST NOT include subdomain observations
+        prov_apex = self.client.get_entity_provenance("domain:example.com")
+        subjects_apex = {o["subject"] for o in prov_apex["observations"]}
+        self.assertIn("example.com", subjects_apex)
+        self.assertNotIn("sub.example.com", subjects_apex)
+
+        # Provenance for subdomain MUST NOT include apex observations
+        prov_sub = self.client.get_entity_provenance("domain:sub.example.com")
+        subjects_sub = {o["subject"] for o in prov_sub["observations"]}
+        self.assertIn("sub.example.com", subjects_sub)
+        self.assertNotIn("example.com", subjects_sub)
+
+    def test_provenance_isolation_similar_domains(self):
+        # Insert records for similar domain names (substring match hazard)
+        obs_co, evt_co = _make_record("test.co", "198.51.100.1")
+        obs_com, evt_com = _make_record("test.com", "198.51.100.2")
+        self.store.insert_record(evt_co, obs_co)
+        self.store.insert_record(evt_com, obs_com)
+
+        # Provenance for test.co MUST NOT include test.com
+        prov_co = self.client.get_entity_provenance("domain:test.co")
+        subjects_co = {o["subject"] for o in prov_co["observations"]}
+        self.assertIn("test.co", subjects_co)
+        self.assertNotIn("test.com", subjects_co)
+
+    def test_provenance_isolation_ip_substring_collision(self):
+        # Insert records where one IP is a string prefix of another
+        obs_1, evt_1 = _make_record("host-a.org", "10.0.0.1")
+        obs_10, evt_10 = _make_record("host-b.org", "10.0.0.10")
+        self.store.insert_record(evt_1, obs_1)
+        self.store.insert_record(evt_10, obs_10)
+
+        # Provenance for 10.0.0.1 MUST NOT include host-b.org (resolving to 10.0.0.10)
+        prov_ip1 = self.client.get_entity_provenance("ipv4:10.0.0.1")
+        subjects_ip1 = {o["subject"] for o in prov_ip1["observations"]}
+        self.assertIn("host-a.org", subjects_ip1)
+        self.assertNotIn("host-b.org", subjects_ip1)
+
+    def test_export_canonical_ioc_feed_pagination_and_semantics(self):
+        # Page 1 with limit=2
+        page1 = self.client.export_canonical_ioc_feed(limit=2)
+        self.assertEqual(len(page1.indicators), 2)
+        self.assertTrue(page1.has_more)
+        self.assertIsNotNone(page1.next_cursor)
+
+        # Page 2 using cursor
+        page2 = self.client.export_canonical_ioc_feed(limit=2, cursor=page1.next_cursor)
+        self.assertTrue(len(page2.indicators) > 0)
+        p1_ids = {ind["indicator_id"] for ind in page1.indicators}
+        p2_ids = {ind["indicator_id"] for ind in page2.indicators}
+        self.assertTrue(p1_ids.isdisjoint(p2_ids))
+
+        # fetch_all=True returns all indicators
+        all_feed = self.client.export_canonical_ioc_feed(fetch_all=True)
+        self.assertFalse(all_feed.has_more)
+        self.assertIsNone(all_feed.next_cursor)
+        self.assertGreaterEqual(len(all_feed.indicators), 2)
+        self.assertEqual(all_feed.total_indicators, len(all_feed.indicators))
+
 
 
 if __name__ == "__main__":

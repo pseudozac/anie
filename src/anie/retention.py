@@ -120,52 +120,130 @@ class StorageProjection:
         return hasattr(self, item)
 
 
-def collect_protected_evidence_identifiers(store: RealObservationStore) -> Tuple[Set[str], Set[str]]:
+def collect_protected_evidence_identifiers(
+    store: RealObservationStore,
+    policy: RetentionPolicy | None = None,
+) -> Tuple[Set[str], Set[str]]:
     """Scan store for evidence hashes and observation IDs referenced by claims, discrepancies, or releases.
-    
+
+    Strict Safety & Verification Guarantees:
+    - Never silently swallows corrupt or malformed evidence references (fails closed).
+    - Excludes REVOKED claims from protecting evidence unless independently protected.
+    - Honors policy flags (protect_claimed_evidence, protect_discrepancy_evidence, protect_released_evidence).
+    - Queries durable release_evidence_index for retained signed releases.
+
     Returns:
         (protected_obs_ids, protected_evidence_hashes)
     """
+    if policy is None:
+        policy = RetentionPolicy()
+
     protected_obs_ids: Set[str] = set()
     protected_evidence_hashes: Set[str] = set()
 
     with store._connect() as conn:
-        # 1. From Intelligence Claims
-        claim_rows = conn.execute(
-            "SELECT supporting_evidence_hashes_json, payload FROM intelligence_claims"
-        ).fetchall()
-        for cr in claim_rows:
-            if cr[0]:
-                try:
-                    hashes = json.loads(cr[0])
-                    protected_evidence_hashes.update(hashes)
-                except Exception:
-                    pass
-            if cr[1]:
-                try:
-                    payload = json.loads(cr[1])
-                    obs_refs = payload.get("properties", {}).get("observation_refs", [])
-                    protected_obs_ids.update(obs_refs)
-                except Exception:
-                    pass
-
-        # 2. From Discrepancies
-        disc_rows = conn.execute("SELECT payload FROM real_discrepancies").fetchall()
-        for dr in disc_rows:
-            if dr[0]:
-                try:
-                    data = json.loads(dr[0])
-                    for obs_id in data.get("observation_ids", {}).values():
+        # 1. From Signed Releases (via durable release_evidence_index)
+        if policy.protect_released_evidence:
+            # Check if release_evidence_index exists
+            has_rel_idx = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='release_evidence_index'"
+            ).fetchone()
+            if has_rel_idx:
+                rel_rows = conn.execute(
+                    "SELECT observation_id, event_id, raw_sha256 FROM release_evidence_index WHERE release_sequence > 0"
+                ).fetchall()
+                for obs_id, ev_id, raw_hash in rel_rows:
+                    if obs_id:
                         protected_obs_ids.add(obs_id)
-                    for ev_id in data.get("evidence_ids", {}).values():
-                        # We protect the event directly
+                    if ev_id:
                         protected_obs_ids.add(ev_id)
-                    for ev_hash in data.get("evidence_hashes", {}).values():
-                        protected_evidence_hashes.add(ev_hash)
-                except Exception:
-                    pass
+                    if raw_hash:
+                        if not isinstance(raw_hash, str) or len(raw_hash) != 64 or not all(c in "0123456789abcdefABCDEF" for c in raw_hash):
+                            raise ValueError(f"malformed raw_sha256 in release_evidence_index: {raw_hash!r}")
+                        protected_evidence_hashes.add(raw_hash)
 
-        # 3. Cross-reference: protect observations whose events match protected_evidence_hashes
+        # 2. From Intelligence Claims (Active only; REVOKED claims do NOT protect evidence)
+        if policy.protect_claimed_evidence:
+            has_claims_tbl = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='intelligence_claims'"
+            ).fetchone()
+            if has_claims_tbl:
+                claim_rows = conn.execute(
+                    "SELECT claim_id, supporting_evidence_hashes_json, payload FROM intelligence_claims"
+                ).fetchall()
+                for claim_id, ev_hashes_json, payload_str in claim_rows:
+                    if not payload_str:
+                        raise ValueError(f"missing or empty payload for intelligence_claim: {claim_id!r}")
+                    try:
+                        p_data = json.loads(payload_str)
+                    except Exception as exc:
+                        raise ValueError(f"malformed JSON in payload for claim {claim_id!r}: {exc}") from exc
+
+                    # Check verification state: Skip REVOKED claims
+                    vstate = p_data.get("verification_state", "")
+                    if vstate == "REVOKED":
+                        continue
+
+                    if ev_hashes_json:
+                        try:
+                            hashes = json.loads(ev_hashes_json)
+                        except Exception as exc:
+                            raise ValueError(f"malformed supporting_evidence_hashes_json for claim {claim_id!r}: {exc}") from exc
+                        if not isinstance(hashes, (list, tuple, set)):
+                            raise ValueError(f"supporting_evidence_hashes_json must be list for claim {claim_id!r}")
+                        for h in hashes:
+                            if not isinstance(h, str) or len(h) != 64 or not all(c in "0123456789abcdefABCDEF" for c in h):
+                                raise ValueError(f"invalid SHA256 evidence hash in claim {claim_id!r}: {h!r}")
+                            protected_evidence_hashes.add(h)
+
+                    obs_refs = p_data.get("properties", {}).get("observation_refs", [])
+                    if not isinstance(obs_refs, list):
+                        raise ValueError(f"observation_refs must be a list for claim {claim_id!r}")
+                    for o_ref in obs_refs:
+                        if not isinstance(o_ref, str) or not o_ref.strip():
+                            raise ValueError(f"invalid observation_ref in claim {claim_id!r}: {o_ref!r}")
+                        protected_obs_ids.add(o_ref)
+
+        # 3. From Discrepancies
+        if policy.protect_discrepancy_evidence:
+            has_disc_tbl = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='real_discrepancies'"
+            ).fetchone()
+            if has_disc_tbl:
+                disc_rows = conn.execute("SELECT analysis_id, payload FROM real_discrepancies").fetchall()
+                for analysis_id, payload_str in disc_rows:
+                    if not payload_str:
+                        raise ValueError(f"missing or empty payload for discrepancy: {analysis_id!r}")
+                    try:
+                        data = json.loads(payload_str)
+                    except Exception as exc:
+                        raise ValueError(f"malformed JSON in payload for discrepancy {analysis_id!r}: {exc}") from exc
+
+                    obs_ids_dict = data.get("observation_ids", {})
+                    if not isinstance(obs_ids_dict, dict):
+                        raise ValueError(f"observation_ids in discrepancy {analysis_id!r} must be a dict")
+                    for obs_id in obs_ids_dict.values():
+                        if not isinstance(obs_id, str) or not obs_id.strip():
+                            raise ValueError(f"invalid observation_id in discrepancy {analysis_id!r}: {obs_id!r}")
+                        protected_obs_ids.add(obs_id)
+
+                    ev_ids_dict = data.get("evidence_ids", {})
+                    if not isinstance(ev_ids_dict, dict):
+                        raise ValueError(f"evidence_ids in discrepancy {analysis_id!r} must be a dict")
+                    for ev_id in ev_ids_dict.values():
+                        if not isinstance(ev_id, str) or not ev_id.strip():
+                            raise ValueError(f"invalid evidence_id in discrepancy {analysis_id!r}: {ev_id!r}")
+                        protected_obs_ids.add(ev_id)
+
+                    ev_hashes_dict = data.get("evidence_hashes", {})
+                    if not isinstance(ev_hashes_dict, dict):
+                        raise ValueError(f"evidence_hashes in discrepancy {analysis_id!r} must be a dict")
+                    for ev_hash in ev_hashes_dict.values():
+                        if not isinstance(ev_hash, str) or len(ev_hash) != 64 or not all(c in "0123456789abcdefABCDEF" for c in ev_hash):
+                            raise ValueError(f"invalid SHA256 evidence hash in discrepancy {analysis_id!r}: {ev_hash!r}")
+                        protected_evidence_hashes.add(ev_hash)
+
+        # 4. Cross-reference: protect observations whose events match protected_evidence_hashes
         if protected_evidence_hashes:
             hash_list = list(protected_evidence_hashes)
             # Chunk query to respect SQLite parameter limits
@@ -214,8 +292,8 @@ def safe_prune_retention(
     # Collect protected evidence sets
     protected_obs_ids: Set[str] = set()
     protected_evidence_hashes: Set[str] = set()
-    if policy.protect_claimed_evidence or policy.protect_discrepancy_evidence:
-        protected_obs_ids, protected_evidence_hashes = collect_protected_evidence_identifiers(store)
+    if policy.protect_claimed_evidence or policy.protect_discrepancy_evidence or policy.protect_released_evidence:
+        protected_obs_ids, protected_evidence_hashes = collect_protected_evidence_identifiers(store, policy=policy)
 
     obs_pruned = 0
     evt_pruned = 0
@@ -328,9 +406,9 @@ class StorageGrowthModel:
     PROFILES = {
         "pilot": WorkloadProfile(
             name="pilot",
-            description="Phase 2 / M3.5 Narrow Pilot (25 domains, 4 queries/day, 3 resolvers)",
+            description="Phase 2 / M3.5 Narrow Pilot (25 domains, 6 queries/day (every 4h), 3 resolvers -> 450 req/day)",
             domains=25,
-            queries_per_day_per_domain=4,
+            queries_per_day_per_domain=6,
             resolvers=3,
         ),
         "production": WorkloadProfile(
