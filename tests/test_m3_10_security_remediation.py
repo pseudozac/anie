@@ -26,6 +26,7 @@ from anie.cross_vector_correlation import (
 )
 from anie.real_models import (
     DEFAULT_TRUSTED_COLLECTORS,
+    CollectorIdentityPolicy,
     FactualVerification,
     RealCollectionEvent,
     RealCollectionRequest,
@@ -41,6 +42,7 @@ from anie.real_store import RealObservationStore
 from anie.retention import (
     RetentionPolicy,
     safe_prune_retention,
+    validate_operator_audit_id,
 )
 
 
@@ -136,27 +138,67 @@ class TestM310SecurityRemediation(unittest.TestCase):
         self.assertEqual(len(self.store.all_observations()), 5)
 
     def test_priority_0_destructive_pruning_requires_explicit_authorization(self):
-        """Verify that allow_destructive_pruning=True requires explicit, non-empty operator_authorization."""
-        # 1. Missing operator_authorization
-        policy_missing = RetentionPolicy(allow_destructive_pruning=True, operator_authorization=None)
+        """Verify that allow_destructive_pruning=True requires explicit, non-empty operator_audit_id."""
+        # 1. Missing operator_audit_id
+        policy_missing = RetentionPolicy(allow_destructive_pruning=True, operator_audit_id=None)
         with self.assertRaises(ValueError) as ctx:
             safe_prune_retention(self.store, policy=policy_missing)
-        self.assertIn("explicit authorized intent", str(ctx.exception))
+        self.assertIn("explicit operator audit identity", str(ctx.exception))
 
-        # 2. Empty string operator_authorization
-        policy_empty = RetentionPolicy(allow_destructive_pruning=True, operator_authorization="")
+        # 2. Empty string operator_audit_id
+        policy_empty = RetentionPolicy(allow_destructive_pruning=True, operator_audit_id="")
         with self.assertRaises(ValueError) as ctx:
             safe_prune_retention(self.store, policy=policy_empty)
-        self.assertIn("explicit authorized intent", str(ctx.exception))
+        self.assertIn("explicit operator audit identity", str(ctx.exception))
 
-        # 3. Whitespace string operator_authorization
-        policy_whitespace = RetentionPolicy(allow_destructive_pruning=True, operator_authorization="   ")
+        # 3. Whitespace string operator_audit_id
+        policy_whitespace = RetentionPolicy(allow_destructive_pruning=True, operator_audit_id="   ")
         with self.assertRaises(ValueError) as ctx:
             safe_prune_retention(self.store, policy=policy_whitespace)
-        self.assertIn("explicit authorized intent", str(ctx.exception))
+        self.assertIn("explicit operator audit identity", str(ctx.exception))
 
-    def test_priority_0_tombstone_and_deletion_atomicity_fault_injection(self):
-        """Verify transaction rollback: a failure during pruning leaves records intact and inserts zero tombstones."""
+        # 4. Backward-compatible operator_authorization alias accepted
+        policy_compat = RetentionPolicy(allow_destructive_pruning=True, operator_authorization="ops-compat-user")
+        self.assertEqual(policy_compat.get_operator_audit_id(), "ops-compat-user")
+
+    def test_priority_0_operator_audit_id_validation_rejects_credentials_and_secrets(self):
+        """Verify that operator_audit_id strictly rejects bearer tokens, passwords, and sensitive credentials."""
+        sensitive_samples = [
+            "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+            "bearer abc1234567890",
+            "token secret_api_key_value",
+            "secret top_secret_retention_password",
+            "jwt:eyJhbGciOi...",
+            "eyJh...",
+            "ghp_1234567890abcdefghijklmnopqrstuvwxyz",
+            "sk_live_1234567890abcdef",
+            "pwd:SuperSecretPassword123",
+            "operator with whitespace",
+            "operator\ninjection",
+        ]
+        for sample in sensitive_samples:
+            with self.assertRaises(ValueError) as ctx:
+                validate_operator_audit_id(sample)
+            self.assertTrue(
+                "must not contain secret tokens" in str(ctx.exception)
+                or "whitespace" in str(ctx.exception)
+                or "invalid operator_audit_id" in str(ctx.exception),
+                f"Failed to reject sensitive sample: {sample}",
+            )
+
+        # Valid clean operator identifiers must pass
+        valid_samples = [
+            "operator:alice",
+            "ops-retention-runner",
+            "sys:cron_job_1",
+            "admin@anie.local",
+            "ops/cluster-01",
+        ]
+        for sample in valid_samples:
+            self.assertEqual(validate_operator_audit_id(sample), sample)
+
+    def test_priority_0_transactional_rollback_validation_under_fault_injection(self):
+        """Verify transactional rollback validation under SQLite error injection: aborting row deletion preserves database state and records zero partial tombstones."""
         now_dt = datetime(2026, 11, 21, 12, 0, 0, tzinfo=timezone.utc)
         expired_time = (now_dt - timedelta(days=300)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -167,7 +209,7 @@ class TestM310SecurityRemediation(unittest.TestCase):
             observation_ttl_days=1,
             event_ttl_days=1,
             allow_destructive_pruning=True,
-            operator_authorization="operator:fault_injection_test",
+            operator_audit_id="operator:fault_injection_test",
         )
 
         # Inject failure by adding a trigger on real_observations that forbids DELETE
@@ -184,7 +226,7 @@ class TestM310SecurityRemediation(unittest.TestCase):
             safe_prune_retention(self.store, policy=policy, now=now_dt)
         self.assertIn("simulated crash during deletion", str(ctx.exception))
 
-        # Verify ATOMICITY:
+        # Verify TRANSACTIONAL ROLLBACK VALIDATION:
         # Neither records were deleted, NOR were partial tombstones committed
         with self.store._connect() as conn:
             obs_count = conn.execute("SELECT COUNT(*) FROM real_observations").fetchone()[0]
@@ -373,6 +415,106 @@ class TestM310SecurityRemediation(unittest.TestCase):
             verify_real_release(release_path, integrity_only=True)
         self.assertIn("references mismatched evidence", str(ctx.exception))
         self.assertIn("of kind 'dns_a'", str(ctx.exception))
+
+    def test_priority_1_release_verifier_mandatory_vector_evidence_resolution(self):
+        """Verify that verify_real_release fails closed on missing evidence_id, missing evidence_hash, unknown IDs/hashes, or conflicting ID/hash pairs."""
+        release_path = self.base_path / "mandatory_evidence_test"
+        domain = "mandatory-ev.org"
+
+        ev_dns, obs_dns = _make_telemetry_event_and_obs(domain, kind="dns_a", source_id="first_party:doh:cloudflare")
+        ev_http, obs_http = _make_telemetry_event_and_obs(domain, kind="http_metadata", source_id="first_party:http:direct")
+        self.store.insert_record(ev_dns, obs_dns)
+        self.store.insert_record(ev_http, obs_http)
+
+        correlator = CrossVectorCorrelator(self.store)
+        findings = correlator.correlate_records(
+            domain=domain,
+            vectors={
+                "dns": VectorObservationSummary(
+                    vector="dns",
+                    observed_at="2026-11-21T10:00:00Z",
+                    evidence_id=ev_dns.event_id,
+                    evidence_hash=ev_dns.raw_sha256,
+                    values=["93.184.216.34"],
+                ),
+                "http": VectorObservationSummary(
+                    vector="http",
+                    observed_at="2026-11-21T10:01:00Z",
+                    evidence_id=ev_http.event_id,
+                    evidence_hash=ev_http.raw_sha256,
+                    values=["cloudflare"],
+                ),
+            },
+        )
+        self.store.insert_cross_vector_finding(findings[0])
+        publish_real(self.store, output_dir=release_path, as_of="2026-11-21T12:00:00Z", include_findings=True)
+
+        findings_gz = release_path / "real_findings.jsonl.gz"
+        with gzip.open(findings_gz, "rt", encoding="utf-8") as f_in:
+            base_finding = json.loads(f_in.readline())
+
+        def _rewrite_findings_and_verify(mutator_fn):
+            import copy
+            data = copy.deepcopy(base_finding)
+            mutator_fn(data)
+            tampered_bytes = json.dumps(data).encode("utf-8") + b"\n"
+            with gzip.open(findings_gz, "wb") as f_out:
+                f_out.write(tampered_bytes)
+            new_hash = hashlib.sha256(findings_gz.read_bytes()).hexdigest()
+
+            manifest_path = release_path / "manifest.json"
+            manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+            for f_entry in manifest_data["files"]:
+                if f_entry["file"] == "real_findings.jsonl.gz":
+                    f_entry["sha256"] = new_hash
+                    f_entry["bytes"] = len(findings_gz.read_bytes())
+            manifest_path.write_text(json.dumps(manifest_data, indent=2), encoding="utf-8")
+            return verify_real_release(release_path, integrity_only=True)
+
+        # 1. Missing evidence_id
+        def mut_missing_id(d):
+            d["vectors"]["dns"]["evidence_id"] = ""
+        with self.assertRaises(ValueError) as ctx:
+            _rewrite_findings_and_verify(mut_missing_id)
+        self.assertIn("missing mandatory evidence_id", str(ctx.exception))
+
+        # 2. Missing evidence_hash
+        def mut_missing_hash(d):
+            d["vectors"]["dns"]["evidence_hash"] = ""
+        with self.assertRaises(ValueError) as ctx:
+            _rewrite_findings_and_verify(mut_missing_hash)
+        self.assertIn("missing mandatory evidence_hash", str(ctx.exception))
+
+        # 3. Unknown event_id
+        def mut_unknown_id(d):
+            d["vectors"]["dns"]["evidence_id"] = "event_unknown_does_not_exist"
+        with self.assertRaises(ValueError) as ctx:
+            _rewrite_findings_and_verify(mut_unknown_id)
+        self.assertIn("references unknown event_id", str(ctx.exception))
+
+        # 4. Unknown evidence_hash
+        def mut_unknown_hash(d):
+            d["vectors"]["dns"]["evidence_hash"] = "0" * 64
+        with self.assertRaises(ValueError) as ctx:
+            _rewrite_findings_and_verify(mut_unknown_hash)
+        self.assertIn("references unknown evidence_hash", str(ctx.exception))
+
+        # 5. Conflicting ID/hash pair (event_id exists, but evidence_hash is set to a different valid event's hash)
+        def mut_conflicting_pair(d):
+            d["vectors"]["dns"]["evidence_hash"] = ev_http.raw_sha256  # valid hash in release, but belongs to ev_http, not ev_dns
+        with self.assertRaises(ValueError) as ctx:
+            _rewrite_findings_and_verify(mut_conflicting_pair)
+        self.assertIn("Conflicting evidence ID/hash pair", str(ctx.exception))
+
+    def test_priority_1_collector_identity_policy_clarification(self):
+        """Verify CollectorIdentityPolicy functions as an identity allowlist and maintains backward compatibility with TrustedCollectorPolicy."""
+        self.assertIs(TrustedCollectorPolicy, CollectorIdentityPolicy)
+
+        policy = CollectorIdentityPolicy(trusted_collector_ids=frozenset({"first_party:doh:cloudflare"}))
+        self.assertTrue(policy.is_trusted_collector("first_party:doh:cloudflare"))
+        self.assertFalse(policy.is_trusted_collector("first_party:unlisted:probe"))
+        self.assertFalse(policy.is_trusted_collector("synthetic:sensor"))
+        self.assertFalse(policy.is_trusted_collector(None))
 
 
 if __name__ == "__main__":

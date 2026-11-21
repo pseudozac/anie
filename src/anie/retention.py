@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 import json
 from pathlib import Path
+import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .real_store import RealObservationStore
@@ -23,6 +24,54 @@ from .real_store import RealObservationStore
 PROFILE_PILOT = "pilot"
 PROFILE_PRODUCTION = "production"
 PROFILE_SCALE = "scale"
+
+_AUDIT_ID_ALLOWED_RE = re.compile(r"^[a-zA-Z0-9_\-\.:@/]{1,64}$")
+_SENSITIVE_PREFIXES = (
+    "bearer ",
+    "token ",
+    "secret ",
+    "jwt:",
+    "ey",
+    "ghp_",
+    "gho_",
+    "glpat-",
+    "sk_",
+    "pwd:",
+    "password:",
+    "api_key:",
+    "apikey:",
+)
+
+
+def validate_operator_audit_id(audit_id: str) -> str:
+    """Validate that an operator audit identifier is a clean handle and not a secret credential.
+
+    Epistemic & Security Separation:
+    A non-empty operator_audit_id identifies WHO or what system process triggered retention
+    pruning for the tombstone audit log. It does NOT represent cryptographically verified
+    authorization. Passwords, bearer tokens, API keys, and sensitive tokens must NEVER be passed
+    or stored in the tombstone ledger.
+    """
+    if not audit_id or not isinstance(audit_id, str):
+        raise ValueError("operator_audit_id must be a non-empty string")
+    clean = audit_id.strip()
+    if not clean:
+        raise ValueError("operator_audit_id cannot be blank or whitespace-only")
+    lower = clean.lower()
+    for prefix in _SENSITIVE_PREFIXES:
+        if lower.startswith(prefix):
+            raise ValueError(
+                "operator_audit_id must be an operator or system identifier (e.g. 'operator:alice', "
+                "'sys:retention-cron') and must not contain secret tokens, passwords, or bearer credentials."
+            )
+    if any(c in clean for c in (" ", "\t", "\n", "\r")):
+        raise ValueError("operator_audit_id must not contain whitespace characters")
+    if not _AUDIT_ID_ALLOWED_RE.fullmatch(clean):
+        raise ValueError(
+            f"invalid operator_audit_id {audit_id!r}: must match regex ^[a-zA-Z0-9_\\-\\.:@/]{{1,64}}$ "
+            "and not exceed 64 characters"
+        )
+    return clean
 
 
 @dataclass(frozen=True)
@@ -36,7 +85,12 @@ class RetentionPolicy:
     allow_destructive_pruning: bool = False
     compact_derived_indexes: bool = True
     authoritative_retention: str = "INDEFINITE"
-    operator_authorization: str | None = None
+    operator_audit_id: str | None = None
+    operator_authorization: str | None = None  # Deprecated backward-compatible alias for operator_audit_id
+
+    def get_operator_audit_id(self) -> str | None:
+        """Resolve operator audit identifier from either operator_audit_id or operator_authorization."""
+        return self.operator_audit_id or self.operator_authorization
 
 
 @dataclass(frozen=True)
@@ -319,11 +373,13 @@ def safe_prune_retention(
             obs_protected_count = obs_total
             evt_protected_count = evt_total
         else:
-            # Explicit authorized intent required for destructive pruning
-            if not (policy.operator_authorization and policy.operator_authorization.strip()):
+            # Explicit operator audit identity required for destructive pruning
+            raw_audit_id = policy.get_operator_audit_id()
+            if not (raw_audit_id and raw_audit_id.strip()):
                 raise ValueError(
-                    "Destructive retention pruning requires explicit authorized intent: non-empty operator_authorization is required"
+                    "Destructive retention pruning requires explicit operator audit identity: non-empty operator_audit_id is required"
                 )
+            operator_audit_id = validate_operator_audit_id(raw_audit_id)
 
             # Phase 1: Identify and prune expired observations NOT in protected set
             expired_obs = conn.execute(
@@ -341,7 +397,6 @@ def safe_prune_retention(
 
             if prunable_obs:
                 now_str = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-                operator_audit_id = policy.operator_authorization.strip()
 
                 # Chunk deletions in batches of 500 to bound SQLite query parameters
                 for i in range(0, len(prunable_obs), 500):
@@ -349,6 +404,7 @@ def safe_prune_retention(
                     chunk_ids = [c[0] for c in chunk]
                     for oid, o_hash in chunk:
                         tomb_id = f"tomb_obs_{sha256(f'{oid}:{now_str}'.encode('utf-8')).hexdigest()[:24]}"
+                        # Note: column 'operator_authorization' stores operator_audit_id for audit trail logging
                         conn.execute(
                             """
                             INSERT OR IGNORE INTO retention_tombstone_ledger (
@@ -384,13 +440,13 @@ def safe_prune_retention(
 
             if prunable_evs:
                 now_str = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-                operator_audit_id = policy.operator_authorization.strip()
 
                 for i in range(0, len(prunable_evs), 500):
                     chunk = prunable_evs[i : i + 500]
                     chunk_ids = [c[0] for c in chunk]
                     for eid, e_hash in chunk:
                         tomb_id = f"tomb_evt_{sha256(f'{eid}:{now_str}'.encode('utf-8')).hexdigest()[:24]}"
+                        # Note: column 'operator_authorization' stores operator_audit_id for audit trail logging
                         conn.execute(
                             """
                             INSERT OR IGNORE INTO retention_tombstone_ledger (

@@ -2,7 +2,14 @@
 
 ## 0.6.0 (M3.10) — End-to-End Intelligence Verification & Consumer Integration Readiness (2026-11-21)
 
-- **Security Review Remediation (PR #40 Audit & Hardening):**
+- **Security Review Remediation & Corrective Hardening (PR #40 & PR #41 Audit):**
+  - *Immediate Corrective Hardening (`src/anie/retention.py`, `src/anie/cli.py`, `src/anie/real_publish.py`, `src/anie/real_models.py`):*
+    - Separated `operator_audit_id` from authorization claims: a non-empty string identifies WHO or what process triggered retention for audit logging, NOT verified authorization.
+    - Added `validate_operator_audit_id`: strictly rejects bearer tokens, JWT strings, API keys, passwords, and whitespace.
+    - Added `--operator-audit-id` to `prune-retention` CLI while maintaining backward compatibility for `--operator-authorization`.
+    - Enforced mandatory vector-evidence resolution in `verify_real_release`: missing event IDs/hashes, ungrounded IDs/hashes, conflicting ID/hash pairs, and mismatched event kinds strictly fail verification for authenticated findings.
+    - Clarified `CollectorIdentityPolicy`: exact collector name allowlisting is an identity policy filtering recognizable collector names, NOT cryptographic authentication (which is introduced via signed collector receipts in M3.11).
+    - Accurately relabeled SQLite trigger fault injection test as transactional rollback validation under error injection.
   - *Priority 0: Retention Fail-Closed Defaults (`src/anie/retention.py`, `src/anie/cli.py`):*
     - Changed default `allow_destructive_pruning` from `True` to `False` in `RetentionPolicy`.
     - Enforced explicit authorized intent: destructive retention pruning strictly requires non-empty `operator_authorization`.
