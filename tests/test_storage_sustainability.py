@@ -128,7 +128,13 @@ class TestStorageSustainability(unittest.TestCase):
         self.assertEqual(len(all_obs), 3)
 
         # Execute safe pruning with reference time
-        policy = RetentionPolicy(observation_ttl_days=90, event_ttl_days=180, compact_vacuum=True)
+        policy = RetentionPolicy(
+            observation_ttl_days=90,
+            event_ttl_days=180,
+            compact_vacuum=True,
+            allow_destructive_pruning=True,
+            operator_authorization="operator:test_session",
+        )
         summary = safe_prune_retention(self.store, policy=policy, now=now_dt)
 
         self.assertEqual(summary["pruned_observations"], 1)
@@ -204,7 +210,13 @@ class TestStorageSustainability(unittest.TestCase):
         obs_unrel, evt_unrel = _create_record("unreleased-old.com", old_time, ip="192.0.2.88")
         self.store.insert_record(evt_unrel, obs_unrel)
 
-        policy = RetentionPolicy(observation_ttl_days=90, event_ttl_days=90, protect_released_evidence=True)
+        policy = RetentionPolicy(
+            observation_ttl_days=90,
+            event_ttl_days=90,
+            protect_released_evidence=True,
+            allow_destructive_pruning=True,
+            operator_authorization="operator:test_session",
+        )
         summary = safe_prune_retention(self.store, policy=policy, now=now_dt)
 
         # Released evidence must be kept; unreleased must be pruned
@@ -238,7 +250,13 @@ class TestStorageSustainability(unittest.TestCase):
         )
         self.store.insert_claim(revoked_claim)
 
-        policy = RetentionPolicy(observation_ttl_days=90, event_ttl_days=90, protect_claimed_evidence=True)
+        policy = RetentionPolicy(
+            observation_ttl_days=90,
+            event_ttl_days=90,
+            protect_claimed_evidence=True,
+            allow_destructive_pruning=True,
+            operator_authorization="operator:test_session",
+        )
         summary = safe_prune_retention(self.store, policy=policy, now=now_dt)
 
         # Revoked claim should NOT protect evidence -> observation is pruned

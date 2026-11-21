@@ -2,11 +2,27 @@
 
 ## 0.6.0 (M3.10) — End-to-End Intelligence Verification & Consumer Integration Readiness (2026-11-21)
 
+- **Security Review Remediation (PR #40 Audit & Hardening):**
+  - *Priority 0: Retention Fail-Closed Defaults (`src/anie/retention.py`, `src/anie/cli.py`):*
+    - Changed default `allow_destructive_pruning` from `True` to `False` in `RetentionPolicy`.
+    - Enforced explicit authorized intent: destructive retention pruning strictly requires non-empty `operator_authorization`.
+    - Added CLI flags `--allow-destructive-pruning` and `--operator-authorization` to `prune-retention`.
+    - Fault-injection verification: proved transaction rollback on simulated crash; no observations/events deleted and zero tombstones created on abort.
+  - *Priority 1: Explicit Evidence Authorization Policy (`src/anie/real_models.py`, `src/anie/real_store.py`):*
+    - Replaced permissive open source-prefix matching with explicit `TrustedCollectorPolicy`. A source ID is treated as an identifier, not authentication.
+    - Removed permissive fallback to `"first_party"` for missing collector identities (`MISSING_COLLECTOR_IDENTITY`).
+    - Differentiated epistemic evidence quality: `RAW_PAYLOAD_HASH_VERIFIED` (cryptographic preimage check), `UNAUTHENTICATED_COLLECTOR` (unvetted source), `EVIDENCE_RAW_BYTES_UNAVAILABLE` (retained metadata only), and `CORRUPT_PAYLOAD_DIGEST_MISMATCH`.
+  - *Priority 1: Multi-Vector Evidence Binding (`src/anie/cross_vector_correlation.py`, `src/anie/real_publish.py`):*
+    - Enforced vector-to-source and observation-context relationships in `CrossVectorCorrelator`: vector summaries must strictly bind to events of matching kind (e.g. DNS to `dns_*`, HTTP to `http_*`, TLS to `tls_*`).
+    - Verified release partition verification (`verify_real_release` Section 4c) fails closed on mismatched vector evidence bindings.
+    - Updated integration tests to ingest distinct DNS, HTTP, and TLS events.
+  - *Priority 1: Tombstone Audit Semantics (`src/anie/retention.py`):*
+    - Corrected inaccurate salted-hash claims: tombstones store operator audit identities directly without deriving or retaining credential secrets.
+    - Accurately clarified transactional, crash-consistent SQLite audit recording.
+  - *Consumer Integration Clarification (`examples/aegis_consumer_v2_example.py`):*
+    - Explicitly clarified that the reference client is an offline schema validation fixture against local SQLite stores, and does not constitute production deployment or authenticated-release import into the AEGIS runtime.
 - **Phase A — Authoritative Evidence Audit & Retention Hardening (`src/anie/real_store.py`, `src/anie/retention.py`, `src/anie/real_models.py`):**
   - Cryptographic preimage verification: Hardened `verify_evidence_authoritativeness` to verify that retained wire payload bytes match the expected SHA-256 digest (`CORRUPT_PAYLOAD_DIGEST_MISMATCH` emitted on corruption).
-  - Collector provenance & authorization: Enforced collector vetting via `is_authorized_collector_source(source_id)` against authorized prefixes (`first_party:`, `oracle-collector-01`, `anie-collector-01`, `operator_`, etc.), failing closed on unauthorized sources (`UNAUTHORIZED_COLLECTOR_SOURCE`).
-  - Zero credential leakage in tombstones: Tombstone audit ledger stores salted hashes of operator authorization tokens (`auth_sha256_...`), completely eliminating plaintext credential leakage.
-  - Crash-consistent tombstone recording and verifiable record SHA-256 digests (`orig_sha256`).
   - Deterministic derived index rebuild: `rebuild_derived_indexes(store)` deterministically handles out-of-order, corrected, and superseded records by updating `first_observed_at = min(...)` and `last_observed_at = max(...)`, preserving evidence hashes, and reconstructing intelligence claim nodes and `SUPERSEDES` edges.
   - Deterministic temporal intelligence: Anchored observation windows to the latest observed timestamp during offline replay when `as_of` is omitted, eliminating wall-clock rollover test sensitivity.
 - **Phase B — Signed Release Pipeline & Adversarial Fault Injection (`src/anie/real_publish.py`):**
@@ -21,8 +37,8 @@
   - Verified 100% backward compatibility: Consumer Contract V1 endpoints (`export_canonical_ioc_feed`) operate seamlessly alongside V2 feeds.
   - Epistemic humility enforcement: Findings strictly adhere to epistemic layers (`FACT`, `DERIVED`, `HYPOTHESIS`, `VALIDATED`) with explicit disclaimers that heuristic scores are uncalibrated pattern-corroboration metrics, NOT threat probabilities or maliciousness verdicts.
 - **Verification & Operational Envelope:**
-  - 11 new integration tests across `tests/test_m3_10_authoritative_audit.py`, `tests/test_m3_10_signed_release_pipeline.py`, and `tests/test_m3_10_aegis_consumer_readiness.py`.
-  - 495 total repository tests executed: 494 passed, 0 failed, 1 skipped (`test_schema.py:15` when `jsonschema` library is absent).
+  - 19 integration and security tests across `tests/test_m3_10_authoritative_audit.py`, `tests/test_m3_10_signed_release_pipeline.py`, `tests/test_m3_10_aegis_consumer_readiness.py`, and `tests/test_m3_10_security_remediation.py`.
+  - 503 total repository tests executed: 502 passed, 0 failed, 1 skipped (`test_schema.py:15` when `jsonschema` library is absent).
   - Repository structural guardrails (`tools/check_repo.py`): PASS.
   - Resource consumption verified within 1 GiB Oracle micro VM budget ($<200\text{ MiB}$ RAM, $<500\text{ MiB}$ disk).
   - Invariants preserved: `anie-collector-01` remains quiescent at ₹0.00 spend; Task Scheduler acquisition runner `ANIE_Ampere_A1_Capacity_Retry` untouched.

@@ -80,6 +80,56 @@ def _make_telemetry_records(
     return event, obs
 
 
+def _make_http_telemetry_records(
+    domain: str,
+    server: str = "cloudflare",
+    observed_at: str = "2026-11-21T10:01:00Z",
+) -> tuple[RealCollectionEvent, RealObservation]:
+    raw_payload = f"HTTP/1.1 200 OK\r\nServer: {server}\r\n\r\n".encode("utf-8")
+    raw_hash = hashlib.sha256(raw_payload).hexdigest()
+    req = RealCollectionRequest.create(
+        kind="http_metadata",
+        subject=domain,
+        observed_at=observed_at,
+        target_endpoint=f"https://{domain}/",
+        pinned_ip="104.21.48.12",
+    )
+    factual = FactualVerification(
+        dnssec_status="secure",
+        response_authenticity="authoritative",
+        transport_security="tls_pinned",
+        resolver_identity="first_party_http",
+        wire_rcode="200",
+        raw_evidence_status="captured",
+    )
+    event = RealCollectionEvent(
+        request=req,
+        response_code="200",
+        raw_sha256=raw_hash,
+        raw_evidence_status="captured",
+        factual_verification=factual,
+        source_id="first_party:http:direct",
+        observed_at=observed_at,
+        raw_payload=raw_payload,
+    )
+    obs = RealObservation(
+        subject=domain,
+        kind="http_metadata",
+        observed_at=observed_at,
+        values=(server,),
+        status="ok",
+        source_id="first_party:http:direct",
+        method="http",
+        synthetic=False,
+        evidence_id=event.event_id,
+        factual_verification=factual,
+        ttl_seconds=300,
+        error_code=None,
+        confidence=None,
+    )
+    return event, obs
+
+
 class TestM310SignedReleasePipeline(unittest.TestCase):
     def setUp(self):
         self.tmp_dir = TemporaryDirectory()
@@ -100,7 +150,9 @@ class TestM310SignedReleasePipeline(unittest.TestCase):
         """Verify end-to-end pipeline: ingest -> cross-vector correlate -> publish -> sign -> verify."""
         domain = "cloudflare-cdn.com"
         ev_dns, obs_dns = _make_telemetry_records(domain, "104.21.48.12", "2026-11-21T10:00:00Z")
+        ev_http, obs_http = _make_http_telemetry_records(domain, "cloudflare", "2026-11-21T10:01:00Z")
         self.store.insert_record(ev_dns, obs_dns)
+        self.store.insert_record(ev_http, obs_http)
 
         # Generate a cross-vector finding
         correlator = CrossVectorCorrelator(self.store)
@@ -117,8 +169,8 @@ class TestM310SignedReleasePipeline(unittest.TestCase):
                 "http": VectorObservationSummary(
                     vector="http",
                     observed_at="2026-11-21T10:01:00Z",
-                    evidence_id=ev_dns.event_id,
-                    evidence_hash=ev_dns.raw_sha256,
+                    evidence_id=ev_http.event_id,
+                    evidence_hash=ev_http.raw_sha256,
                     values=["cloudflare"],
                     metadata={"server": "cloudflare"},
                 ),

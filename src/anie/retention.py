@@ -33,7 +33,7 @@ class RetentionPolicy:
     protect_discrepancy_evidence: bool = True
     protect_released_evidence: bool = True
     compact_vacuum: bool = True
-    allow_destructive_pruning: bool = True
+    allow_destructive_pruning: bool = False
     compact_derived_indexes: bool = True
     authoritative_retention: str = "INDEFINITE"
     operator_authorization: str | None = None
@@ -312,13 +312,19 @@ def safe_prune_retention(
         obs_total = conn.execute("SELECT COUNT(*) FROM real_observations").fetchone()[0]
         evt_total = conn.execute("SELECT COUNT(*) FROM real_events").fetchone()[0]
 
-        # Milestone M3.9 Lifecycle Policy: Never destructively prune authoritative evidence if disabled
+        # Milestone M3.9/M3.10 Lifecycle Policy: Fail-closed default. Never destructively prune authoritative evidence if disabled.
         if not policy.allow_destructive_pruning:
-            prunable_obs_ids = []
-            prunable_ev_ids = []
+            prunable_obs = []
+            prunable_evs = []
             obs_protected_count = obs_total
             evt_protected_count = evt_total
         else:
+            # Explicit authorized intent required for destructive pruning
+            if not (policy.operator_authorization and policy.operator_authorization.strip()):
+                raise ValueError(
+                    "Destructive retention pruning requires explicit authorized intent: non-empty operator_authorization is required"
+                )
+
             # Phase 1: Identify and prune expired observations NOT in protected set
             expired_obs = conn.execute(
                 "SELECT observation_id, evidence_id, payload FROM real_observations WHERE observed_at < ?",
@@ -335,8 +341,7 @@ def safe_prune_retention(
 
             if prunable_obs:
                 now_str = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-                raw_auth = policy.operator_authorization or "policy_authorized"
-                auth_digest = f"auth_sha256_{sha256(raw_auth.encode('utf-8')).hexdigest()[:16]}"
+                operator_audit_id = policy.operator_authorization.strip()
 
                 # Chunk deletions in batches of 500 to bound SQLite query parameters
                 for i in range(0, len(prunable_obs), 500):
@@ -351,7 +356,7 @@ def safe_prune_retention(
                                 pruned_at, operator_authorization, policy_reason
                             ) VALUES (?, 'observation', ?, ?, ?, ?, 'policy_ttl')
                             """,
-                            (tomb_id, oid, o_hash, now_str, auth_digest),
+                            (tomb_id, oid, o_hash, now_str, operator_audit_id),
                         )
                     placeholders = ",".join("?" for _ in chunk_ids)
                     cur = conn.execute(
@@ -379,8 +384,7 @@ def safe_prune_retention(
 
             if prunable_evs:
                 now_str = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-                raw_auth = policy.operator_authorization or "policy_authorized"
-                auth_digest = f"auth_sha256_{sha256(raw_auth.encode('utf-8')).hexdigest()[:16]}"
+                operator_audit_id = policy.operator_authorization.strip()
 
                 for i in range(0, len(prunable_evs), 500):
                     chunk = prunable_evs[i : i + 500]
@@ -394,7 +398,7 @@ def safe_prune_retention(
                                 pruned_at, operator_authorization, policy_reason
                             ) VALUES (?, 'event', ?, ?, ?, ?, 'policy_ttl')
                             """,
-                            (tomb_id, eid, e_hash, now_str, auth_digest),
+                            (tomb_id, eid, e_hash, now_str, operator_audit_id),
                         )
                     placeholders = ",".join("?" for _ in chunk_ids)
                     cur = conn.execute(

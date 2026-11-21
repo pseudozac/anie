@@ -1,5 +1,12 @@
 """Production Reference Consumer Client for AEGIS Integration (Contract V2).
 
+Operational Clarification & Architectural Boundary:
+This reference client demonstrates a local, read-only consumer interface directly querying
+an ANIE SQLite storage file. It serves as an offline contract and schema verification fixture,
+and does NOT constitute live system deployment, enterprise federation, or authenticated-release
+bundle import into the operational AEGIS runtime framework. Downstream production ingestion
+in AEGIS must verify detached Ed25519 attestations via verify_real_release().
+
 Demonstrates clean, read-only downstream consumption of ANIE intelligence:
 1. Instantiating AnieIntelligenceClient from SQLite store or exported findings feed.
 2. Streaming cross-vector findings with deterministic cursor pagination.

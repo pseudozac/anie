@@ -109,8 +109,8 @@ class TestM310AuthoritativeAudit(unittest.TestCase):
         """Verify that unauthorized collector source IDs are rejected even with valid hashes."""
         # 1. Authorized sources pass
         self.assertTrue(is_authorized_collector_source("first_party:doh:cloudflare"))
-        self.assertTrue(is_authorized_collector_source("oracle-collector-01:doh"))
-        self.assertTrue(is_authorized_collector_source("anie-collector-01:pilot"))
+        self.assertTrue(is_authorized_collector_source("oracle-collector-01:cloudflare"))
+        self.assertTrue(is_authorized_collector_source("anie-collector-01"))
 
         # 2. Unauthorized sources fail
         self.assertFalse(is_authorized_collector_source("unauthorized_foreign_crawler"))
@@ -134,11 +134,11 @@ class TestM310AuthoritativeAudit(unittest.TestCase):
 
         res = self.store.verify_evidence_authoritativeness(ev.raw_sha256)
         self.assertFalse(res["is_authoritative"])
-        self.assertEqual(res["status"], "UNAUTHORIZED_COLLECTOR_SOURCE")
-        self.assertIn("not an authorized first-party collector", res["reason"])
+        self.assertEqual(res["status"], "UNAUTHENTICATED_COLLECTOR")
+        self.assertIn("not an authorized collector under trusted policy", res["reason"])
 
-    def test_retention_tombstone_zero_credential_leakage_and_integrity(self):
-        """Verify that retention tombstones never leak raw operator credentials and preserve genuine record SHA-256."""
+    def test_retention_tombstone_operator_identity_and_integrity(self):
+        """Verify that retention tombstones record operator audit identity and preserve genuine record SHA-256."""
         now_dt = datetime.now(timezone.utc)
         ev, obs = _make_event_and_obs(
             "prune-target.org",
@@ -147,11 +147,11 @@ class TestM310AuthoritativeAudit(unittest.TestCase):
         )
         self.store.insert_record(ev, obs)
 
-        secret_operator_token = "SUPER_SECRET_OPERATOR_API_KEY_99999"
+        operator_identity = "operator:secops_audit_run_01"
         policy = RetentionPolicy(
             observation_ttl_days=1,
             event_ttl_days=1,
-            operator_authorization=secret_operator_token,
+            operator_authorization=operator_identity,
             allow_destructive_pruning=True,
         )
 
@@ -164,9 +164,7 @@ class TestM310AuthoritativeAudit(unittest.TestCase):
             ).fetchall()
             self.assertEqual(len(rows), 2)
             for r_type, orig_id, orig_sha, auth_val in rows:
-                # Raw credential MUST NOT be in tombstone
-                self.assertNotIn(secret_operator_token, auth_val)
-                self.assertTrue(auth_val.startswith("auth_sha256_"))
+                self.assertEqual(auth_val, operator_identity)
                 # Original SHA-256 MUST be non-empty valid 64-char hex
                 self.assertEqual(len(orig_sha), 64)
 

@@ -34,7 +34,7 @@ REAL_OBSERVATION_SCHEMA = "anie.observation.real.v1"
 REAL_EVENT_SCHEMA = "anie.collection-event.real.v1"
 REAL_REQUEST_SCHEMA = "anie.collection-request.real.v1"
 
-ALLOWED_REAL_METHODS = {"dns", "rdap"}
+ALLOWED_REAL_METHODS = {"dns", "rdap", "http", "tls"}
 DNSSEC_STATUSES = {"secure", "insecure", "bogus", "indeterminate"}
 RESPONSE_AUTHENTICITIES = {"authoritative", "recursive", "unverified"}
 TRANSPORT_SECURITIES = {"tls_pinned", "tls_unpinned", "plain"}
@@ -45,30 +45,56 @@ _HEX_64 = re.compile(r"^[0-9a-f]{64}$")
 _SOURCE = re.compile(r"^[a-zA-Z0-9_.:-]{1,80}$")
 _EVENT_ID = re.compile(r"^event_[0-9a-f]{64}$")
 
-AUTHORIZED_COLLECTOR_PREFIXES: tuple[str, ...] = (
-    "first_party:",
+DEFAULT_TRUSTED_COLLECTORS: frozenset[str] = frozenset({
+    "oracle-collector-01:cloudflare",
+    "oracle-collector-01:google",
+    "oracle-collector-01:quad9",
     "oracle-collector-01",
     "anie-collector-01",
-    "anie_collector",
-    "operator_",
-    "local_test",
-    "test_collector",
-)
+    "first_party:doh:cloudflare",
+    "first_party:doh:google",
+    "first_party:doh:quad9",
+    "first_party:tls:direct",
+    "first_party:http:direct",
+    "first_party:rdap:bootstrap",
+    "first_party:dns:local",
+})
+
+
+@dataclass(frozen=True)
+class TrustedCollectorPolicy:
+    """Explicit policy defining authenticated first-party collectors and verification requirements.
+
+    Strict Epistemic Invariant:
+    A source ID is an identifier, not authentication. Open prefix matching is rejected.
+    Only explicit, policy-trusted collector identities are accepted.
+    """
+    trusted_collector_ids: frozenset[str] = DEFAULT_TRUSTED_COLLECTORS
+    custom_allowed_collectors: frozenset[str] = frozenset()
+    require_retained_raw_payload: bool = True
+    allow_legacy_unauthenticated: bool = False
+
+    def is_trusted_collector(self, source_id: str | None) -> bool:
+        """Validate that a source_id represents an authentic, policy-trusted collector."""
+        if not source_id or not isinstance(source_id, str):
+            return False
+        clean_id = source_id.strip()
+        if clean_id.startswith("synthetic:"):
+            return False
+        return (clean_id in self.trusted_collector_ids) or (clean_id in self.custom_allowed_collectors)
 
 
 def is_authorized_collector_source(
     source_id: str,
     *,
-    custom_allowed_sources: set[str] | None = None,
+    custom_allowed_sources: set[str] | frozenset[str] | None = None,
+    policy: TrustedCollectorPolicy | None = None,
 ) -> bool:
     """Validate that a source_id represents an authentic authorized first-party collector."""
-    if not source_id or not isinstance(source_id, str):
-        return False
-    if source_id.startswith("synthetic:"):
-        return False
-    if custom_allowed_sources and source_id in custom_allowed_sources:
-        return True
-    return any(source_id.startswith(p) for p in AUTHORIZED_COLLECTOR_PREFIXES)
+    pol = policy or TrustedCollectorPolicy(
+        custom_allowed_collectors=frozenset(custom_allowed_sources) if custom_allowed_sources else frozenset()
+    )
+    return pol.is_trusted_collector(source_id)
 
 
 @dataclass(frozen=True)

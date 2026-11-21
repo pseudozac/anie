@@ -13,7 +13,16 @@ import json
 import re
 from typing import Any
 
-KINDS = {"dns_a": "domain", "dns_aaaa": "domain", "dns_ptr": "ip", "rdap_asn": "ip", "rdap_network": "ip"}
+KINDS = {
+    "dns_a": "domain",
+    "dns_aaaa": "domain",
+    "dns_ptr": "ip",
+    "rdap_asn": "ip",
+    "rdap_network": "ip",
+    "http_metadata": "domain",
+    "tls_cert": "domain",
+    "tls_handshake": "domain",
+}
 STATUSES = {"ok", "empty", "error"}
 ERROR_CODES = {"timeout", "unavailable", "invalid_response", "rate_limited", "unknown"}
 _SOURCE = re.compile(r"^[a-zA-Z0-9_.:-]{1,80}$")
@@ -73,6 +82,10 @@ def _normalize_value(kind: str, value: str, subject: str) -> str:
         if ipaddress.ip_address(subject) not in network:
             raise ValueError("RDAP network must contain subject IP")
         return str(network)
+    if kind == "http_metadata":
+        return str(value).strip()
+    if kind in ("tls_cert", "tls_handshake"):
+        return str(value).strip()
     raise ValueError("unsupported kind")
 
 
