@@ -720,3 +720,8 @@ class TemporalIntelligenceEngine:
                 claims.append(claim)
 
         return claims
+
+
+# Canonical alias conforming to M3.6 specification
+EvidenceGraphDetector = TemporalIntelligenceEngine
+

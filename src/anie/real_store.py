@@ -1227,6 +1227,7 @@ class RealObservationStore:
         self,
         event: RealCollectionEvent,
         observation: RealObservation,
+        enrich_rdap: bool = False,
     ) -> tuple[int, int]:
         """Extract graph nodes and edges from observation/event and persist to graph tables.
         
@@ -1235,7 +1236,7 @@ class RealObservationStore:
         from .graph_engine import GraphEngine
         with self._connect() as conn:
             engine = GraphEngine(conn)
-            nodes, edges = engine.extract_from_observation(event, observation)
+            nodes, edges = engine.extract_from_observation(event, observation, enrich_rdap=enrich_rdap)
             for node in nodes:
                 engine.upsert_node(node)
             for edge in edges:
@@ -1343,7 +1344,7 @@ class RealObservationStore:
             ).fetchall()
             return [IntelligenceClaim.from_dict(json.loads(r[0])) for r in rows]
 
-    def rebuild_graph_from_observations(self) -> tuple[int, int]:
+    def rebuild_graph_from_observations(self, enrich_rdap: bool = True) -> tuple[int, int]:
         """Truncate and transactionally rebuild graph tables and search index from authoritative records.
         
         Guarantees that the graph and searchable knowledge can be completely regenerated from authoritative records,
@@ -1407,7 +1408,7 @@ class RealObservationStore:
             for obs_json, ev_json in obs_rows:
                 obs = RealObservation.from_dict(json.loads(obs_json))
                 ev = RealCollectionEvent.from_dict(json.loads(ev_json))
-                nodes, edges = engine.extract_from_observation(ev, obs)
+                nodes, edges = engine.extract_from_observation(ev, obs, enrich_rdap=enrich_rdap)
                 for node in nodes:
                     unique_nodes[node.node_id] = node
                 all_edges.extend(edges)

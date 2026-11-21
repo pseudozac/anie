@@ -163,6 +163,9 @@ def infer_entity_type(raw_value: str) -> str:
     if val.startswith("anie:entity:"):
         val = val[len("anie:entity:"):]
 
+    if val.startswith("prefix:") or val.startswith("cdn_prefix:"):
+        return ENTITY_TYPE_CIDR
+
     if "/" in val:
         try:
             ipaddress.ip_network(val, strict=False)
@@ -192,6 +195,8 @@ def infer_entity_type(raw_value: str) -> str:
 def build_entity_uri(entity_type: str, value: Any) -> str:
     """Build a canonical URI given entity type and raw value."""
     etype = entity_type.strip().lower()
+    if etype in ("prefix", "cdn_prefix"):
+        etype = ENTITY_TYPE_CIDR
     if etype not in SUPPORTED_ENTITY_TYPES:
         raise ValueError(f"unsupported entity type: {entity_type!r}; expected one of {sorted(SUPPORTED_ENTITY_TYPES)}")
 
@@ -275,6 +280,8 @@ def parse_entity_uri(uri: str) -> Tuple[str, str]:
     if ":" in stripped:
         prefix, rest = stripped.split(":", 1)
         prefix_clean = prefix.lower()
+        if prefix_clean in ("prefix", "cdn_prefix"):
+            prefix_clean = ENTITY_TYPE_CIDR
         if prefix_clean in SUPPORTED_ENTITY_TYPES:
             # Re-canonicalize to ensure syntax guarantees
             full_uri = build_entity_uri(prefix_clean, rest)
@@ -332,7 +339,7 @@ def node_id_to_canonical_uri(node_id: str, node_type: str) -> str:
         return canonical_ipv6_uri(node_id)
     elif ntype == "asn":
         return canonical_asn_uri(node_id)
-    elif ntype == "cidr":
+    elif ntype in ("cidr", "cdn_prefix", "prefix"):
         return canonical_cidr_uri(node_id)
     elif ntype == "resolver":
         return canonical_resolver_uri(node_id)
