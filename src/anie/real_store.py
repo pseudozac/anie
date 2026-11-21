@@ -317,6 +317,32 @@ class RealObservationStore:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_claims_subject ON intelligence_claims(subject_uri)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_claims_time ON intelligence_claims(asserted_at)")
 
+        # Competing Hypotheses Table (Milestone M3.8)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS competing_hypotheses (
+                hypothesis_id TEXT PRIMARY KEY,
+                subject_uri TEXT NOT NULL,
+                phenomenon TEXT NOT NULL,
+                hypothesis_label TEXT NOT NULL,
+                status TEXT NOT NULL,
+                heuristic_score REAL NOT NULL,
+                statistically_calibrated INTEGER NOT NULL,
+                explanation TEXT NOT NULL,
+                supporting_evidence_hashes_json TEXT NOT NULL,
+                contradicting_evidence_hashes_json TEXT NOT NULL,
+                falsifiability_condition TEXT NOT NULL,
+                ruleset_version TEXT NOT NULL,
+                asserted_at TEXT NOT NULL,
+                valid_from TEXT NOT NULL,
+                valid_until TEXT,
+                supersedes_hypothesis_id TEXT,
+                payload TEXT NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_competing_hypotheses_subject ON competing_hypotheses(subject_uri)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_competing_hypotheses_phenomenon ON competing_hypotheses(phenomenon)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_competing_hypotheses_time ON competing_hypotheses(asserted_at)")
+
         # 5. Consumer Release Journal (Milestone M3.3.2 & M3.5.1)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS consumer_releases (

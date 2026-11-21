@@ -791,6 +791,8 @@ class GraphEngine:
         prefixes_dir = v_path / "prefixes"
         certs_dir = v_path / "certificates"
         claims_dir = v_path / "claims"
+        techs_dir = v_path / "technologies"
+        hypotheses_dir = v_path / "hypotheses"
 
         domains_dir.mkdir(parents=True, exist_ok=True)
         ips_dir.mkdir(parents=True, exist_ok=True)
@@ -798,6 +800,8 @@ class GraphEngine:
         prefixes_dir.mkdir(parents=True, exist_ok=True)
         certs_dir.mkdir(parents=True, exist_ok=True)
         claims_dir.mkdir(parents=True, exist_ok=True)
+        techs_dir.mkdir(parents=True, exist_ok=True)
+        hypotheses_dir.mkdir(parents=True, exist_ok=True)
 
         exported_domains = 0
         exported_ips = 0
@@ -805,6 +809,8 @@ class GraphEngine:
         exported_prefixes = 0
         exported_certs = 0
         exported_claims = 0
+        exported_techs = 0
+        exported_hypotheses = 0
 
         # 1. Export domains
         domain_rows = self.conn.execute(
@@ -1099,7 +1105,152 @@ class GraphEngine:
             _safe_write_vault_note(claims_dir, v_path, claim.claim_id, "\n".join(c_lines) + "\n")
             exported_claims += 1
 
-        # 7. Vault Readme Index
+        # 7. Export Technologies (Milestone M3.8)
+        tech_rows = self.conn.execute(
+            "SELECT canonical_name, node_id, first_observed_at, last_observed_at, properties_json FROM graph_nodes WHERE node_type = 'technology' ORDER BY canonical_name"
+        ).fetchall()
+        for tech_name, node_id, first_seen, last_seen, props_json in tech_rows:
+            props = json.loads(props_json or "{}")
+            is_spoofable = props.get("is_spoofable", True)
+
+            # Query associated domains
+            linked_domains = [
+                r[0] for r in self.conn.execute(
+                    """
+                    SELECT n.canonical_name
+                    FROM graph_edges e
+                    JOIN graph_nodes n ON n.node_id = e.source_id
+                    WHERE e.target_id = ? AND e.relation_type IN ('USES_TECHNOLOGY', 'PROTECTED_BY_POLICY') AND n.node_type = 'domain'
+                    ORDER BY n.canonical_name ASC
+                    """,
+                    (node_id,),
+                ).fetchall()
+            ]
+
+            # Query associated serving IPs
+            linked_ips = [
+                r[0] for r in self.conn.execute(
+                    """
+                    SELECT n.canonical_name
+                    FROM graph_edges e
+                    JOIN graph_nodes n ON n.node_id = e.source_id
+                    WHERE e.target_id = ? AND e.relation_type = 'USES_TECHNOLOGY' AND n.node_type = 'ip'
+                    ORDER BY n.canonical_name ASC
+                    """,
+                    (node_id,),
+                ).fetchall()
+            ]
+
+            tech_lines = [
+                "---",
+                f'id: "{node_id}"',
+                'type: "technology"',
+                f'canonical_name: "{tech_name}"',
+                f'is_spoofable: {str(is_spoofable).lower()}',
+                f'first_observed_at: "{first_seen}"',
+                f'last_observed_at: "{last_seen}"',
+                "tags:",
+                '  - "anie/technology"',
+                f'  - "anie/technology/{sanitize_vault_filename(tech_name).lower()}"',
+                "---",
+                f"# Technology Indicator: {tech_name}",
+                "> [!WARNING]",
+                "> Derived assertion from passive HTTP telemetry; subject to origin header spoofing.",
+                "",
+                "## Associated Domain Infrastructure",
+            ]
+            if linked_domains:
+                for dom in sorted(set(linked_domains)):
+                    tech_lines.append(f"- [[domains/{sanitize_vault_filename(dom)}|{dom}]]")
+            else:
+                tech_lines.append("*No domains directly linked.*")
+            tech_lines.append("")
+
+            tech_lines.append("## Associated IP Endpoints")
+            if linked_ips:
+                for ip in sorted(set(linked_ips)):
+                    tech_lines.append(f"- [[ips/{sanitize_vault_filename(ip)}|{ip}]]")
+            else:
+                tech_lines.append("*No IP endpoints directly linked.*")
+            tech_lines.append("")
+
+            _safe_write_vault_note(techs_dir, v_path, tech_name, "\n".join(tech_lines) + "\n")
+            exported_techs += 1
+
+        # 8. Export Competing Hypotheses (Milestone M3.8)
+        has_hyp_table = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='competing_hypotheses'"
+        ).fetchone()
+        if has_hyp_table:
+            hyp_rows = self.conn.execute(
+                "SELECT payload FROM competing_hypotheses ORDER BY asserted_at DESC"
+            ).fetchall()
+            for (h_json,) in hyp_rows:
+                h_data = json.loads(h_json)
+                h_id = h_data.get("hypothesis_id", "hyp_unknown")
+                h_label = h_data.get("hypothesis_label", "Unknown Hypothesis")
+                h_subj = h_data.get("subject_uri", "")
+                h_phenom = h_data.get("phenomenon", "")
+                h_status = h_data.get("status", "PLAUSIBLE")
+                h_score = h_data.get("heuristic_score", 0.0)
+                h_expl = h_data.get("explanation", "")
+                h_falsif = h_data.get("falsifiability_condition", "")
+                h_asserted = h_data.get("asserted_at", "")
+                h_supersedes = h_data.get("supersedes_hypothesis_id")
+                supp_hashes = h_data.get("supporting_evidence_hashes", [])
+                cont_hashes = h_data.get("contradicting_evidence_hashes", [])
+
+                h_lines = [
+                    "---",
+                    f'id: "{h_id}"',
+                    'type: "hypothesis"',
+                    f'subject: "{h_subj}"',
+                    f'phenomenon: "{h_phenom}"',
+                    f'status: "{h_status}"',
+                    f'heuristic_score: {h_score}',
+                    'statistically_calibrated: false',
+                    f'asserted_at: "{h_asserted}"',
+                    "tags:",
+                    '  - "anie/hypothesis"',
+                    f'  - "anie/hypothesis/{h_status.lower()}"',
+                    "---",
+                    f"# Competing Hypothesis: {h_label}",
+                    f"**Subject:** [[{h_subj}]]  ",
+                    f"**Phenomenon:** `{h_phenom}`  ",
+                    f"**Status:** `{h_status}`  ",
+                    f"**Heuristic Score:** {h_score} *(Uncalibrated heuristic rating, not a calibrated probability)*",
+                    "",
+                    "## Assessment Explanation",
+                    f"> {h_expl}",
+                    "",
+                    "## Falsifiability Condition",
+                    f"> {h_falsif or 'None specified'}",
+                    "",
+                    "## Evidence Lineage",
+                    "### Supporting Evidence Hashes",
+                ]
+                if supp_hashes:
+                    for sh in supp_hashes:
+                        h_lines.append(f"- SHA-256: `{sh}`")
+                else:
+                    h_lines.append("*None recorded.*")
+                h_lines.append("")
+
+                h_lines.append("### Contradicting Evidence Hashes")
+                if cont_hashes:
+                    for ch in cont_hashes:
+                        h_lines.append(f"- SHA-256: `{ch}`")
+                else:
+                    h_lines.append("*None recorded.*")
+                h_lines.append("")
+
+                if h_supersedes:
+                    h_lines.append(f"## Historical Supersession\n- Supersedes prior hypothesis: [[hypotheses/{h_supersedes}|{h_supersedes}]]\n")
+
+                _safe_write_vault_note(hypotheses_dir, v_path, h_id, "\n".join(h_lines) + "\n")
+                exported_hypotheses += 1
+
+        # 9. Vault Readme Index
         readme = [
             "# ANIE Knowledge Graph Vault",
             "",
@@ -1109,6 +1260,8 @@ class GraphEngine:
             f"- **BGP Allocation Prefixes:** {exported_prefixes}",
             f"- **TLS Certificates:** {exported_certs}",
             f"- **Intelligence Claims:** {exported_claims}",
+            f"- **Technology Indicators:** {exported_techs}",
+            f"- **Competing Hypotheses:** {exported_hypotheses}",
             "",
             "## Exploration Roots",
             "- [[domains/|Domain Infrastructure Notes]]",
@@ -1117,6 +1270,8 @@ class GraphEngine:
             "- [[prefixes/|BGP Allocation Prefixes]]",
             "- [[certificates/|TLS Certificates]]",
             "- [[claims/|Temporal Intelligence Claims]]",
+            "- [[technologies/|Observed Technology Indicators]]",
+            "- [[hypotheses/|Competing Hypotheses & Uncertainty Models]]",
         ]
         _safe_write_vault_note(v_path, v_path, "README", "\n".join(readme) + "\n")
 
@@ -1128,6 +1283,8 @@ class GraphEngine:
             "prefixes_exported": exported_prefixes,
             "certs_exported": exported_certs,
             "claims_exported": exported_claims,
+            "techs_exported": exported_techs,
+            "hypotheses_exported": exported_hypotheses,
         }
 
     def search_intelligence(

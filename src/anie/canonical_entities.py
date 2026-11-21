@@ -28,6 +28,8 @@ ENTITY_TYPE_RESOLVER = "resolver"
 ENTITY_TYPE_CLAIM = "claim"
 ENTITY_TYPE_DISCREPANCY = "discrepancy"
 ENTITY_TYPE_CERT = "cert"
+ENTITY_TYPE_TECHNOLOGY = "technology"
+ENTITY_TYPE_HYPOTHESIS = "hypothesis"
 
 SUPPORTED_ENTITY_TYPES = frozenset({
     ENTITY_TYPE_DOMAIN,
@@ -39,6 +41,8 @@ SUPPORTED_ENTITY_TYPES = frozenset({
     ENTITY_TYPE_CLAIM,
     ENTITY_TYPE_DISCREPANCY,
     ENTITY_TYPE_CERT,
+    ENTITY_TYPE_TECHNOLOGY,
+    ENTITY_TYPE_HYPOTHESIS,
 })
 
 
@@ -52,6 +56,8 @@ class EntityType(str, enum.Enum):
     CLAIM = ENTITY_TYPE_CLAIM
     DISCREPANCY = ENTITY_TYPE_DISCREPANCY
     CERT = ENTITY_TYPE_CERT
+    TECHNOLOGY = ENTITY_TYPE_TECHNOLOGY
+    HYPOTHESIS = ENTITY_TYPE_HYPOTHESIS
 
 
 _ASN_REGEX = re.compile(r"^(?:AS|as)?(\d{1,10})$")
@@ -255,6 +261,10 @@ def build_entity_uri(entity_type: str, value: Any) -> str:
         cval = canonicalize_identifier(val_str)
     elif etype == ENTITY_TYPE_CERT:
         cval = canonicalize_cert_fingerprint(val_str)
+    elif etype == ENTITY_TYPE_TECHNOLOGY:
+        cval = re.sub(r"[^a-z0-9_.-]", "_", val_str.strip().lower())
+    elif etype == ENTITY_TYPE_HYPOTHESIS:
+        cval = val_str.strip().lower()
     else:
         raise ValueError(f"unhandled entity type: {etype!r}")
 
@@ -381,4 +391,21 @@ def node_id_to_canonical_uri(node_id: str, node_type: str) -> str:
         return canonical_discrepancy_uri(node_id)
     elif ntype in ("cert", "certificate"):
         return canonical_cert_uri(node_id)
+    elif ntype == "technology":
+        return canonical_technology_uri(node_id)
+    elif ntype == "hypothesis":
+        return canonical_hypothesis_uri(node_id)
     return build_entity_uri(infer_entity_type(node_id), node_id)
+
+
+def canonical_technology_uri(tech_name: str) -> str:
+    """Canonical URI for a technology indicator entity."""
+    clean = re.sub(r"[^a-z0-9_.-]", "_", tech_name.strip().lower())
+    return build_entity_uri(EntityType.TECHNOLOGY, clean)
+
+
+def canonical_hypothesis_uri(hyp_id: str) -> str:
+    """Canonical URI for a hypothesis entity."""
+    clean = hyp_id.strip().lower()
+    return build_entity_uri(EntityType.HYPOTHESIS, clean)
+
