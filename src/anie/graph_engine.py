@@ -34,6 +34,7 @@ from .graph_models import (
     format_node_id,
 )
 from .observations import canonical_json, normalized_domain, normalized_ip, utc_iso
+from .rdap_enrichment import RdapEnricher
 from .real_models import RealCollectionEvent, RealObservation
 
 
@@ -42,6 +43,7 @@ class GraphEngine:
 
     def __init__(self, conn: sqlite3.Connection):
         self.conn = conn
+        self.rdap_enricher = RdapEnricher()
 
     # --- Extraction from Real Models ---
 
@@ -49,6 +51,7 @@ class GraphEngine:
         self,
         event: RealCollectionEvent,
         observation: RealObservation,
+        enrich_rdap: bool = False,
     ) -> tuple[list[GraphNode], list[GraphEdge]]:
         """Extract typed entity nodes and temporal directed edges from observation + event pair."""
         nodes: list[GraphNode] = []
@@ -133,6 +136,13 @@ class GraphEngine:
                     },
                 )
                 edges.append(edge_resolves)
+
+                if enrich_rdap:
+                    rdap_nodes, rdap_edges = self.rdap_enricher.enrich_ip(
+                        val, obs_time, [event.raw_sha256]
+                    )
+                    nodes.extend(rdap_nodes)
+                    edges.extend(rdap_edges)
             except ValueError:
                 # Value was not an IP (e.g. CNAME target)
                 pass
@@ -414,12 +424,13 @@ class GraphEngine:
             is_truncated_nodes = len(visited_set) > max_nodes
             visited_node_ids = sorted(list(visited_set)[:max_nodes])
             placeholders = ",".join("?" for _ in visited_node_ids)
-            node_query = f"SELECT payload FROM graph_nodes WHERE node_id IN ({placeholders}) ORDER BY node_id ASC"
+            node_query = f"SELECT payload FROM graph_nodes WHERE node_id IN ({placeholders})"
             if layer_filter:
                 l_placeholders = ",".join("?" for _ in layer_filter)
-                node_query += f" AND layer IN ({l_placeholders})"
+                node_query += f" AND layer IN ({l_placeholders}) ORDER BY node_id ASC"
                 node_rows = self.conn.execute(node_query, (*visited_node_ids, *layer_filter)).fetchall()
             else:
+                node_query += " ORDER BY node_id ASC"
                 node_rows = self.conn.execute(node_query, visited_node_ids).fetchall()
 
             nodes = [GraphNode.from_dict(json.loads(r[0])) for r in node_rows]
@@ -479,12 +490,13 @@ class GraphEngine:
             }
 
         placeholders = ",".join("?" for _ in visited_node_ids)
-        node_query = f"SELECT payload FROM graph_nodes WHERE node_id IN ({placeholders}) ORDER BY node_id ASC"
+        node_query = f"SELECT payload FROM graph_nodes WHERE node_id IN ({placeholders})"
         if layer_filter:
             l_placeholders = ",".join("?" for _ in layer_filter)
-            node_query += f" AND layer IN ({l_placeholders})"
+            node_query += f" AND layer IN ({l_placeholders}) ORDER BY node_id ASC"
             node_rows = self.conn.execute(node_query, (*visited_node_ids, *layer_filter)).fetchall()
         else:
+            node_query += " ORDER BY node_id ASC"
             node_rows = self.conn.execute(node_query, visited_node_ids).fetchall()
 
         nodes = [GraphNode.from_dict(json.loads(r[0])) for r in node_rows]
@@ -722,14 +734,20 @@ class GraphEngine:
         v_path = Path(output_dir)
         domains_dir = v_path / "domains"
         ips_dir = v_path / "ips"
+        asns_dir = v_path / "asns"
+        prefixes_dir = v_path / "prefixes"
         claims_dir = v_path / "claims"
 
         domains_dir.mkdir(parents=True, exist_ok=True)
         ips_dir.mkdir(parents=True, exist_ok=True)
+        asns_dir.mkdir(parents=True, exist_ok=True)
+        prefixes_dir.mkdir(parents=True, exist_ok=True)
         claims_dir.mkdir(parents=True, exist_ok=True)
 
         exported_domains = 0
         exported_ips = 0
+        exported_asns = 0
+        exported_prefixes = 0
         exported_claims = 0
 
         # 1. Export domains
@@ -752,6 +770,30 @@ class GraphEngine:
         for ip, node_id, first_seen, last_seen in ip_rows:
             co_hosted = self.find_co_hosted_domains(ip)
             safe_ip = ip.replace(":", "_")
+
+            # Query ASN and Prefix linkages
+            asn_row = self.conn.execute(
+                """
+                SELECT n.canonical_name, n.properties_json
+                FROM graph_edges e
+                JOIN graph_nodes n ON n.node_id = e.target_id
+                WHERE e.source_id = ? AND e.relation_type = 'ANNOUNCED_BY'
+                LIMIT 1
+                """,
+                (node_id,),
+            ).fetchone()
+
+            prefix_row = self.conn.execute(
+                """
+                SELECT n.canonical_name, n.properties_json
+                FROM graph_edges e
+                JOIN graph_nodes n ON n.node_id = e.target_id
+                WHERE e.source_id = ? AND e.relation_type = 'PREFIX_MEMBER'
+                LIMIT 1
+                """,
+                (node_id,),
+            ).fetchone()
+
             ip_lines = [
                 "---",
                 f'id: "{node_id}"',
@@ -764,8 +806,25 @@ class GraphEngine:
                 "---",
                 f"# IP: {ip}",
                 "",
-                "## Co-Hosted Domains",
             ]
+
+            if asn_row or prefix_row:
+                ip_lines.append("## Infrastructure Topology")
+                if asn_row:
+                    asn_name = asn_row[0]
+                    safe_asn = asn_name.replace(":", "_").replace("/", "_")
+                    asn_props = json.loads(asn_row[1] or "{}")
+                    org_name = asn_props.get("as_name", "Unknown Org")
+                    ip_lines.append(f"- **Autonomous System:** [[asns/{safe_asn}|{asn_name}]] ({org_name})")
+                if prefix_row:
+                    pref_name = prefix_row[0]
+                    safe_pref = pref_name.replace("/", "_").replace(":", "_")
+                    pref_props = json.loads(prefix_row[1] or "{}")
+                    reg = pref_props.get("registry", "IANA")
+                    ip_lines.append(f"- **Network Prefix:** [[prefixes/{safe_pref}|{pref_name}]] ({reg})")
+                ip_lines.append("")
+
+            ip_lines.append("## Co-Hosted Domains")
             if co_hosted:
                 for d in co_hosted:
                     ip_lines.append(f"- [[{d}]]")
@@ -775,7 +834,106 @@ class GraphEngine:
             (ips_dir / f"{safe_ip}.md").write_text("\n".join(ip_lines) + "\n", encoding="utf-8")
             exported_ips += 1
 
-        # 3. Export Claims
+        # 3. Export ASNs
+        asn_rows = self.conn.execute(
+            "SELECT canonical_name, node_id, first_observed_at, last_observed_at, properties_json FROM graph_nodes WHERE node_type = 'asn' ORDER BY canonical_name"
+        ).fetchall()
+        for asn_name, node_id, first_seen, last_seen, props_json in asn_rows:
+            safe_asn = asn_name.replace(":", "_").replace("/", "_")
+            props = json.loads(props_json or "{}")
+            as_org = props.get("as_name", "Unknown Autonomous System")
+            registry = props.get("registry", "IANA")
+
+            announced_ips = [
+                r[0] for r in self.conn.execute(
+                    """
+                    SELECT n.canonical_name
+                    FROM graph_edges e
+                    JOIN graph_nodes n ON n.node_id = e.source_id
+                    WHERE e.target_id = ? AND e.relation_type = 'ANNOUNCED_BY'
+                    ORDER BY n.canonical_name ASC
+                    """,
+                    (node_id,),
+                ).fetchall()
+            ]
+
+            asn_lines = [
+                "---",
+                f'id: "{node_id}"',
+                'type: "asn"',
+                f'canonical_name: "{asn_name}"',
+                f'as_name: "{as_org}"',
+                f'registry: "{registry}"',
+                f'first_observed_at: "{first_seen}"',
+                f'last_observed_at: "{last_seen}"',
+                "tags:",
+                '  - "anie/asn"',
+                "---",
+                f"# Autonomous System: {asn_name}",
+                f"**Organization / Network:** {as_org}  ",
+                f"**Regional Internet Registry:** {registry}",
+                "",
+                "## Announced IP Infrastructure",
+            ]
+            if announced_ips:
+                for ip in announced_ips:
+                    s_ip = ip.replace(":", "_")
+                    asn_lines.append(f"- [[ips/{s_ip}|{ip}]]")
+            else:
+                asn_lines.append("*No member IPs directly linked.*")
+            asn_lines.append("")
+            (asns_dir / f"{safe_asn}.md").write_text("\n".join(asn_lines) + "\n", encoding="utf-8")
+            exported_asns += 1
+
+        # 4. Export Prefixes
+        prefix_rows = self.conn.execute(
+            "SELECT canonical_name, node_id, first_observed_at, last_observed_at, properties_json FROM graph_nodes WHERE node_type = 'cdn_prefix' ORDER BY canonical_name"
+        ).fetchall()
+        for pref_name, node_id, first_seen, last_seen, props_json in prefix_rows:
+            safe_pref = pref_name.replace("/", "_").replace(":", "_")
+            props = json.loads(props_json or "{}")
+            registry = props.get("registry", "IANA")
+
+            member_ips = [
+                r[0] for r in self.conn.execute(
+                    """
+                    SELECT n.canonical_name
+                    FROM graph_edges e
+                    JOIN graph_nodes n ON n.node_id = e.source_id
+                    WHERE e.target_id = ? AND e.relation_type = 'PREFIX_MEMBER'
+                    ORDER BY n.canonical_name ASC
+                    """,
+                    (node_id,),
+                ).fetchall()
+            ]
+
+            pref_lines = [
+                "---",
+                f'id: "{node_id}"',
+                'type: "cdn_prefix"',
+                f'canonical_name: "{pref_name}"',
+                f'registry: "{registry}"',
+                f'first_observed_at: "{first_seen}"',
+                f'last_observed_at: "{last_seen}"',
+                "tags:",
+                '  - "anie/prefix"',
+                "---",
+                f"# BGP Allocation Prefix: {pref_name}",
+                f"**Regional Internet Registry:** {registry}",
+                "",
+                "## Member IP Infrastructure",
+            ]
+            if member_ips:
+                for ip in member_ips:
+                    s_ip = ip.replace(":", "_")
+                    pref_lines.append(f"- [[ips/{s_ip}|{ip}]]")
+            else:
+                pref_lines.append("*No member IPs directly linked.*")
+            pref_lines.append("")
+            (prefixes_dir / f"{safe_pref}.md").write_text("\n".join(pref_lines) + "\n", encoding="utf-8")
+            exported_prefixes += 1
+
+        # 5. Export Claims
         claim_rows = self.conn.execute(
             "SELECT payload FROM intelligence_claims ORDER BY asserted_at DESC"
         ).fetchall()
@@ -808,17 +966,21 @@ class GraphEngine:
             (claims_dir / f"{claim.claim_id}.md").write_text("\n".join(c_lines) + "\n", encoding="utf-8")
             exported_claims += 1
 
-        # 4. Vault Readme Index
+        # 6. Vault Readme Index
         readme = [
             "# ANIE Knowledge Graph Vault",
             "",
             f"- **Domains Indexed:** {exported_domains}",
             f"- **IPs Indexed:** {exported_ips}",
+            f"- **Autonomous Systems (ASNs):** {exported_asns}",
+            f"- **BGP Allocation Prefixes:** {exported_prefixes}",
             f"- **Intelligence Claims:** {exported_claims}",
             "",
             "## Exploration Roots",
             "- [[domains/|Domain Infrastructure Notes]]",
             "- [[ips/|IP Infrastructure Notes]]",
+            "- [[asns/|Autonomous Systems (ASN)]]",
+            "- [[prefixes/|BGP Allocation Prefixes]]",
             "- [[claims/|Temporal Intelligence Claims]]",
         ]
         (v_path / "README.md").write_text("\n".join(readme) + "\n", encoding="utf-8")
@@ -827,6 +989,8 @@ class GraphEngine:
             "vault_dir": str(v_path),
             "domains_exported": exported_domains,
             "ips_exported": exported_ips,
+            "asns_exported": exported_asns,
+            "prefixes_exported": exported_prefixes,
             "claims_exported": exported_claims,
         }
 

@@ -82,10 +82,14 @@ def format_node_id(node_type: NodeType | str, canonical_name: str) -> str:
     norm_name = canonical_name.strip()
     if t_val == "domain":
         norm_name = normalized_domain(norm_name)
-    elif t_val == "ip":
+    elif t_val in ("ip", "ipv4", "ipv6"):
         norm_name = normalized_ip(norm_name)
+        t_val = "ip"
     elif t_val == "asn":
         norm_name = str(int(norm_name.lower().removeprefix("as")))
+    elif t_val in ("cdn_prefix", "prefix", "cidr"):
+        norm_name = norm_name.lower()
+        t_val = "cdn_prefix"
     else:
         norm_name = norm_name.lower()
     return f"anie:entity:{t_val}:{norm_name}"

@@ -127,6 +127,26 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("project-storage", help="calculate empirical storage, WAL, backup, and release growth projections")
     p.add_argument("--profile", choices=["pilot", "production", "scale"], default=None, help="filter by workload profile")
     p.add_argument("--days", type=int, choices=[30, 90, 180, 365], default=None, help="filter by projection horizon days")
+    p = sub.add_parser("detect-anomalies", help="detect temporal infrastructure anomalies and generate calibrated hypothesis claims")
+    p.add_argument("--db", required=True, help="path to real intelligence SQLite database")
+    p.add_argument("--as-of", default=None, help="historical point-in-time cutoff (UTC ISO)")
+    p.add_argument("--min-confidence", type=float, default=0.70, help="minimum confidence threshold (default: 0.70)")
+    p.add_argument("--ruleset", default=None, help="optional ruleset version filter")
+    p.add_argument("--store", action="store_true", help="persist detected claims into database")
+    p.add_argument("--out", default=None, help="optional output path to write detection JSON summary")
+    p = sub.add_parser("query-graph", help="query entity neighborhood, edges, and supporting evidence lineage")
+    p.add_argument("--db", required=True, help="path to real intelligence SQLite database")
+    p.add_argument("--entity", required=True, help="target entity identifier (domain, IP, ASN, CIDR, or canonical URI)")
+    p.add_argument("--depth", type=int, default=1, choices=[0, 1, 2, 3, 4, 5], help="neighborhood traversal depth (default: 1)")
+    p.add_argument("--direction", choices=["IN", "OUT", "BOTH"], default="BOTH", help="edge traversal direction (default: BOTH)")
+    p.add_argument("--layer", default=None, help="optional layer filter (e.g. FACT, DERIVED, HYPOTHESIS)")
+    p.add_argument("--as-of", default=None, help="historical point-in-time cutoff (UTC ISO)")
+    p.add_argument("--out", default=None, help="optional output path to write query result JSON")
+    p = sub.add_parser("export-graph-markdown", help="export interconnected Obsidian-compatible Markdown knowledge vault")
+    p.add_argument("--db", required=True, help="path to real intelligence SQLite database")
+    p.add_argument("--out", required=True, help="destination directory for Obsidian vault")
+    p.add_argument("--as-of", default=None, help="historical point-in-time cutoff (UTC ISO)")
+    p.add_argument("--min-confidence", type=float, default=0.0, help="minimum confidence threshold (default: 0.0)")
     args = parser.parse_args(argv)
     try:
         if args.command == "demo":
@@ -410,6 +430,84 @@ def main(argv: list[str] | None = None) -> int:
                 if args.days:
                     projections = [p for p in projections if p.days == args.days]
                 print(json.dumps([p.__dict__ for p in projections], indent=2))
+            return 0
+        elif args.command == "detect-anomalies":
+            from collections import Counter
+            from .real_store import RealObservationStore
+            from .temporal_intelligence import EvidenceGraphDetector
+            store = RealObservationStore(args.db)
+            with store._connect() as conn:
+                detector = EvidenceGraphDetector(conn)
+                claims = detector.analyze_all(as_of=args.as_of)
+
+            filtered = [c for c in claims if c.confidence >= args.min_confidence]
+            if args.ruleset:
+                filtered = [c for c in filtered if c.ruleset_version == args.ruleset]
+
+            stored_count = 0
+            if args.store:
+                for c in filtered:
+                    if store.insert_claim(c):
+                        stored_count += 1
+
+            type_counts = dict(Counter(c.claim_type for c in filtered))
+            summary = {
+                "total_claims": len(filtered),
+                "stored_claims": stored_count,
+                "claims_by_type": type_counts,
+                "claims": [c.to_dict() for c in filtered],
+            }
+            if args.out:
+                Path(args.out).write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+            print(json.dumps({
+                "total_claims": len(filtered),
+                "stored_claims": stored_count,
+                "claims_by_type": type_counts,
+                "sample_claims": [c.to_dict() for c in filtered[:5]],
+            }, indent=2))
+            return 0
+        elif args.command == "query-graph":
+            from .canonical_entities import parse_entity_uri
+            from .graph_engine import GraphEngine
+            from .graph_models import format_node_id
+            from .real_store import RealObservationStore
+
+            entity_in = args.entity.strip()
+            if entity_in.startswith("anie:entity:"):
+                node_id = entity_in
+            else:
+                etype, evalue = parse_entity_uri(entity_in)
+                node_id = format_node_id(etype, evalue)
+
+            store = RealObservationStore(args.db)
+            with store._connect() as conn:
+                engine = GraphEngine(conn)
+                layer_filter = [args.layer.upper()] if args.layer else None
+                hood = engine.get_k_hop_neighborhood(
+                    node_id,
+                    max_depth=args.depth,
+                    layer_filter=layer_filter,
+                )
+                if args.direction == "OUT":
+                    hood["edges"] = [e for e in hood["edges"] if e["source_id"] == node_id]
+                elif args.direction == "IN":
+                    hood["edges"] = [e for e in hood["edges"] if e["target_id"] == node_id]
+
+                evidence = engine.trace_evidence_lineage(node_id)
+                hood["evidence_lineage"] = evidence
+
+            if args.out:
+                Path(args.out).write_text(json.dumps(hood, indent=2) + "\n", encoding="utf-8")
+            print(json.dumps(hood, indent=2))
+            return 0
+        elif args.command == "export-graph-markdown":
+            from .graph_engine import GraphEngine
+            from .real_store import RealObservationStore
+            store = RealObservationStore(args.db)
+            with store._connect() as conn:
+                engine = GraphEngine(conn)
+                res = engine.export_obsidian_vault(args.out)
+            print(json.dumps({"exported": True, **res}, indent=2))
             return 0
         return 0
     except (ValueError, PermissionError, FileNotFoundError, FileExistsError, json.JSONDecodeError) as exc:
